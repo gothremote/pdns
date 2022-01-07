@@ -21,6 +21,8 @@
  */
 
 #include "protozero.hh"
+
+#ifndef DISABLE_PROTOBUF
 #include "dnsparser.hh"
 
 void pdns::ProtoZero::Message::encodeComboAddress(const protozero::pbf_tag_type type, const ComboAddress& ca)
@@ -56,11 +58,11 @@ void pdns::ProtoZero::Message::encodeDNSName(protozero::pbf_writer& pbf, std::st
   // leaving the block will cause the sub writer to compute how much was written based on the new size and update the size accordingly
 }
 
-void pdns::ProtoZero::Message::setRequest(const boost::uuids::uuid& uniqueId, const ComboAddress& requestor, const ComboAddress& local, const DNSName& qname, uint16_t qtype, uint16_t qclass, uint16_t id, bool tcp, size_t len)
+void pdns::ProtoZero::Message::setRequest(const boost::uuids::uuid& uniqueId, const ComboAddress& requestor, const ComboAddress& local, const DNSName& qname, uint16_t qtype, uint16_t qclass, uint16_t id, pdns::ProtoZero::Message::TransportProtocol proto, size_t len)
 {
   setMessageIdentity(uniqueId);
   setSocketFamily(requestor.sin4.sin_family);
-  setSocketProtocol(tcp);
+  setSocketProtocol(proto);
   setFrom(requestor);
   setTo(local);
   setInBytes(len);
@@ -157,3 +159,5 @@ void pdns::ProtoZero::Message::addRR(const DNSName& name, uint16_t uType, uint16
   pbf_rr.add_uint32(static_cast<protozero::pbf_tag_type>(pdns::ProtoZero::Message::RRField::ttl), uTTL);
   pbf_rr.add_string(static_cast<protozero::pbf_tag_type>(pdns::ProtoZero::Message::RRField::rdata), blob);
 }
+
+#endif /* DISABLE_PROTOBUF */

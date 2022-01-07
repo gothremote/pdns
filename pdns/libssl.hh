@@ -4,19 +4,31 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
+#include <optional>
 
 #include "config.h"
 #include "circular_buffer.hh"
 #include "lock.hh"
 
-enum class LibsslTLSVersion { Unknown, TLS10, TLS11, TLS12, TLS13 };
+enum class LibsslTLSVersion : uint8_t { Unknown, TLS10, TLS11, TLS12, TLS13 };
+
+struct TLSCertKeyPair
+{
+  std::string d_cert;
+  std::optional<std::string> d_key;
+  std::optional<std::string> d_password;
+  explicit TLSCertKeyPair(const std::string& cert, std::optional<std::string> key = std::nullopt, std::optional<std::string> password = std::nullopt):
+    d_cert(cert), d_key(key), d_password(password) {
+  }
+};
 
 class TLSConfig
 {
 public:
-  std::vector<std::pair<std::string, std::string>> d_certKeyPairs;
+  std::vector<TLSCertKeyPair> d_certKeyPairs;
   std::vector<std::string> d_ocspFiles;
 
   std::string d_ciphers;
@@ -37,6 +49,8 @@ public:
   bool d_releaseBuffers{true};
   /* whether so-called secure renegotiation should be allowed for TLS < 1.3 */
   bool d_enableRenegotiation{false};
+  /* enable TLS async mode, if supported by any engine */
+  bool d_asyncMode{false};
 };
 
 struct TLSErrorCounters
@@ -99,8 +113,7 @@ public:
   void rotateTicketsKey(time_t now);
 
 private:
-  boost::circular_buffer<std::shared_ptr<OpenSSLTLSTicketKey> > d_ticketKeys;
-  ReadWriteLock d_lock;
+  SharedLockGuarded<boost::circular_buffer<std::shared_ptr<OpenSSLTLSTicketKey> > > d_ticketKeys;
 };
 
 void* libssl_get_ticket_key_callback_data(SSL* s);
@@ -127,6 +140,15 @@ std::unique_ptr<SSL_CTX, void(*)(SSL_CTX*)> libssl_init_server_context(const TLS
 
 std::unique_ptr<FILE, int(*)(FILE*)> libssl_set_key_log_file(std::unique_ptr<SSL_CTX, void(*)(SSL_CTX*)>& ctx, const std::string& logFile);
 
+/* called in a client context, if the client advertised more than one ALPN values and the server returned more than one as well, to select the one to use. */
+void libssl_set_npn_select_callback(SSL_CTX* ctx, int (*cb)(SSL* s, unsigned char** out, unsigned char* outlen, const unsigned char* in, unsigned int inlen, void* arg), void* arg);
+/* called in a server context, to select an ALPN value advertised by the client if any */
+void libssl_set_alpn_select_callback(SSL_CTX* ctx, int (*cb)(SSL* s, const unsigned char** out, unsigned char* outlen, const unsigned char* in, unsigned int inlen, void* arg), void* arg);
+/* set the supported ALPN protos in client context */
+bool libssl_set_alpn_protos(SSL_CTX* ctx, const std::vector<std::vector<uint8_t>>& protos);
+
 std::string libssl_get_error_string();
+
+std::pair<bool, std::string> libssl_load_engine(const std::string& engineName, const std::optional<std::string>& defaultString);
 
 #endif /* HAVE_LIBSSL */

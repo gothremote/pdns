@@ -98,7 +98,41 @@ class PDNSPBConnHandler(object):
         elif polType == dnsmessage_pb2.PBDNSMessage.NSIP:
             return 'NS IP'
 
+    @staticmethod
+    def getEventAsString(event):
+        descr =  dnsmessage_pb2.PBDNSMessage.DESCRIPTOR
+        return descr.EnumValueName('EventType', event);
+
+    @staticmethod
+    def getTransportAsString(transport):
+        descr =  dnsmessage_pb2.PBDNSMessage.DESCRIPTOR
+        return descr.EnumValueName('SocketProtocol', transport);
+
     def printResponse(self, message):
+        if message.trace:
+            print("- Event Trace:")
+            for event in message.trace:
+                ev = self.getEventAsString(event.event)
+                if event.event == dnsmessage_pb2.PBDNSMessage.CustomEvent and event.HasField('custom'):
+                    ev += ":" + event.custom
+                ev += '(' + str(event.ts)
+                valstr = ''
+                if event.HasField('boolVal'):
+                      valstr = str(event.boolVal)
+                elif event.HasField('intVal'):
+                      valstr = str(event.intVal)
+                elif event.HasField('stringVal'):
+                      valstr = event.stringVal
+                elif event.HasField('bytesVal'):
+                      valstr = binascii.hexlify(event.bytesVal)
+                if len(valstr) > 0:
+                    valstr = ',' + valstr
+                if not event.start:
+                    startstr = ',done'
+                else:
+                    startstr = ''
+                print("\t- %s%s%s)" % (ev, valstr, startstr))
+
         if message.HasField('response'):
             response = message.response
 
@@ -173,10 +207,7 @@ class PDNSPBConnHandler(object):
             if msg.HasField('to'):
                 iptostr = '[' + socket.inet_ntop(socket.AF_INET6, msg.to) + ']'
 
-        if msg.socketProtocol == dnsmessage_pb2.PBDNSMessage.UDP:
-            protostr = 'UDP'
-        else:
-            protostr = 'TCP'
+        protostr = self.getTransportAsString(msg.socketProtocol)
 
         if msg.HasField('fromPort'):
             fromportstr = ':' + str(msg.fromPort) + ' '

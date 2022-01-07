@@ -1,10 +1,28 @@
 Upgrade Guide
 =============
 
+1.6.x to 1.7.0
+--------------
+
+Truncated responses received over UDP for DoH clients will now be retried over TCP.
+
+:func:`setTCPUseSinglePipe` has been removed.
+
+Unless set via :func:`setMaxTCPClientThreads` the number of TCP workers now defaults to 10, instead of the number of TCP binds.
+
+Plain-text API keys and passwords for web server authentication are now strongly discouraged. The :func:`hashPassword` method can be used to generate a hashed and salted version of passwords and API keys instead, so that the plain-text version can no longer be found in either the configuration file or the memory of the running process.
+
+In our Docker image, our binaries are no longer granted the ``net_bind_service`` capability, as this is unnecessary in many deployments.
+For more information, see the section `"Privileged ports" in Docker-README <https://github.com/PowerDNS/pdns/blob/master/Docker-README.md#privileged-ports>`__.
+
 1.5.x to 1.6.0
 --------------
 
 The packet cache no longer hashes EDNS Cookies by default, which means that two queries that are identical except for the content of their cookie will now be served the same answer. This only works if the backend is not returning any answer containing EDNS Cookies, otherwise the wrong cookie might be returned to a client. To prevent this, the ``cookieHashing=true`` parameter might be passed to :func:`newPacketCache` so that cookies are hashed, resulting in separate entries in the packet cache.
+
+All TCP worker threads are now created at startup, instead of being created on-demand. The existing behaviour was useful for very small setups but did not scale quickly to a large amount of TCP connections.
+The new behaviour can cause a noticeable increase of TCP connections between dnsdist and its backends, as the TCP connections are not shared between TCP worker threads.
+This is especially true for setups with a large number of frontends (:func:`addLocal`, :func:`addTLSLocal`, and :func:`addDNSCryptBind` directives), as 1.6.0 sets the number of TCP workers to the number of TCP-enabled binds (with a minimum of 10), unless that number has been set explicitely via :func:`setMaxTCPClientThreads`.
 
 Several actions have been renamed so that almost all actions that allow further processing of rules start with 'Set', to prevent mistakes:
 - ``DisableECSAction`` to :func:`SetDisableECSAction`

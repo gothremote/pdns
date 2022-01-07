@@ -98,8 +98,10 @@
 #include "shuffle.hh"
 #ifdef NOD_ENABLED
 #include "nod.hh"
+#include "logging.hh"
 #endif /* NOD_ENABLED */
 #include "query-local-address.hh"
+#include "rec-tcpout.hh"
 
 #include "rec-snmp.hh"
 #include "rec-taskqueue.hh"
@@ -114,6 +116,7 @@
 #include "rec-protozero.hh"
 
 #include "xpf.hh"
+#include "rec-eventtrace.hh"
 
 typedef map<ComboAddress, uint32_t, ComboAddress::addressOnlyLessThan> tcpClientCounts_t;
 
@@ -140,6 +143,8 @@ thread_local FDMultiplexer* t_fdm{nullptr};
 thread_local std::unique_ptr<addrringbuf_t> t_remotes, t_servfailremotes, t_largeanswerremotes, t_bogusremotes;
 thread_local std::unique_ptr<boost::circular_buffer<pair<DNSName, uint16_t> > > t_queryring, t_servfailqueryring, t_bogusqueryring;
 thread_local std::shared_ptr<NetmaskGroup> t_allowFrom;
+thread_local std::shared_ptr<NetmaskGroup> t_allowNotifyFrom;
+thread_local std::shared_ptr<notifyset_t> t_allowNotifyFor;
 #ifdef NOD_ENABLED
 thread_local std::shared_ptr<nod::NODDB> t_nodDBp;
 thread_local std::shared_ptr<nod::UniqueResponseDB> t_udrDBp;
@@ -198,9 +203,11 @@ enum class PaddingMode { Always, PaddedQueries };
 
 static listenSocketsAddresses_t g_listenSocketsAddresses; // is shared across all threads right now
 static set<int> g_fromtosockets; // listen sockets that use 'sendfromto()' mechanism (without actually using sendfromto())
-static AtomicCounter counter;
+static std::atomic<uint32_t> counter;
 static std::shared_ptr<SyncRes::domainmap_t> g_initialDomainMap; // new threads needs this to be setup
 static std::shared_ptr<NetmaskGroup> g_initialAllowFrom; // new thread needs to be setup with this
+static std::shared_ptr<NetmaskGroup> g_initialAllowNotifyFrom; // new threads need this to be setup
+static std::shared_ptr<notifyset_t> g_initialAllowNotifyFor; // new threads need this to be setup
 static NetmaskGroup g_XPFAcl;
 static NetmaskGroup g_proxyProtocolACL;
 static NetmaskGroup g_paddingFrom;
@@ -278,6 +285,12 @@ GlobalStateHolder<SuffixMatchNode> g_DoTToAuthNames;
 #define BAD_NETS   "0.0.0.0/8, 192.0.0.0/24, 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24, 240.0.0.0/4, ::/96, ::ffff:0:0/96, 100::/64, 2001:db8::/32"
 #define DONT_QUERY LOCAL_NETS ", " BAD_NETS
 
+struct ThreadMSG
+{
+  pipefunc_t func;
+  bool wantAnswer;
+};
+
 //! used to send information to a newborn mthread
 struct DNSComboWriter {
   DNSComboWriter(const std::string& query, const struct timeval& now): d_mdp(true, query), d_now(now), d_query(query)
@@ -336,6 +349,7 @@ struct DNSComboWriter {
      d_local holds our own. */
   ComboAddress d_local;
   ComboAddress d_destination;
+  RecEventTrace d_eventTrace;
   boost::uuids::uuid d_uuid;
   string d_requestorId;
   string d_deviceId;
@@ -483,6 +497,9 @@ LWResult::Result arecvtcp(PacketBuffer& data, const size_t len, shared_ptr<TCPIO
       break;
     case IOState::NeedWrite:
       break;
+    case IOState::Async:
+      throw std::runtime_error("TLS async mode not supported");
+      break;
     }
   }
   catch (const std::exception& e) {
@@ -582,34 +599,6 @@ PacketBuffer GenUDPQueryResponse(const ComboAddress& dest, const string& query)
 }
 
 static void handleUDPServerResponse(int fd, FDMultiplexer::funcparam_t&);
-
-static void setSocketBuffer(int fd, int optname, uint32_t size)
-{
-  uint32_t psize=0;
-  socklen_t len=sizeof(psize);
-
-  if(!getsockopt(fd, SOL_SOCKET, optname, (char*)&psize, &len) && psize > size) {
-    g_log<<Logger::Error<<"Not decreasing socket buffer size from "<<psize<<" to "<<size<<endl;
-    return;
-  }
-
-  if (setsockopt(fd, SOL_SOCKET, optname, (char*)&size, sizeof(size)) < 0) {
-    int err = errno;
-    g_log << Logger::Error << "Unable to raise socket buffer size to " << size << ": " << stringerror(err) << endl;
-  }
-}
-
-
-static void setSocketReceiveBuffer(int fd, uint32_t size)
-{
-  setSocketBuffer(fd, SO_RCVBUF, size);
-}
-
-static void setSocketSendBuffer(int fd, uint32_t size)
-{
-  setSocketBuffer(fd, SO_SNDBUF, size);
-}
-
 
 // you can ask this class for a UDP socket to send a query from
 // this socket is not yours, don't even think about deleting it
@@ -853,7 +842,7 @@ TCPConnection::~TCPConnection()
   --s_currentConnections;
 }
 
-AtomicCounter TCPConnection::s_currentConnections;
+std::atomic<uint32_t> TCPConnection::s_currentConnections;
 
 static void terminateTCPConnection(int fd)
 {
@@ -947,7 +936,8 @@ static void finishTCPReply(std::unique_ptr<DNSComboWriter>& dc, bool hadError, b
     return;
   }
   dc->d_tcpConnection->queriesCount++;
-  if (g_tcpMaxQueriesPerConn && dc->d_tcpConnection->queriesCount >= g_tcpMaxQueriesPerConn) {
+  if ((g_tcpMaxQueriesPerConn && dc->d_tcpConnection->queriesCount >= g_tcpMaxQueriesPerConn) ||
+      (dc->d_tcpConnection->isDropOnIdle() && dc->d_tcpConnection->d_requestsInFlight == 0)) {
     try {
       t_fdm->removeReadFD(dc->d_socket);
     }
@@ -991,7 +981,7 @@ static void updateResponseStats(int res, const ComboAddress& remote, unsigned in
     if(t_servfailremotes) {
       t_servfailremotes->push_back(remote);
       if(query && t_servfailqueryring) // packet cache
-	t_servfailqueryring->push_back(make_pair(*query, qtype));
+        t_servfailqueryring->push_back({*query, qtype});
     }
     g_stats.servFails++;
     break;
@@ -1026,7 +1016,7 @@ static void protobufLogQuery(LocalStateHolder<LuaConfigItems>& luaconfsLocal, co
 
   pdns::ProtoZero::RecMessage m{128, std::string::size_type(policyTags.empty() ? 0 : 64)}; // It's a guess
   m.setType(pdns::ProtoZero::Message::MessageType::DNSQueryType);
-  m.setRequest(uniqueId, requestor, local, qname, qtype, qclass, id, tcp, len);
+  m.setRequest(uniqueId, requestor, local, qname, qtype, qclass, id, tcp ? pdns::ProtoZero::Message::TransportProtocol::TCP : pdns::ProtoZero::Message::TransportProtocol::UDP, len);
   m.setServerIdentity(SyncRes::s_serverID);
   m.setEDNSSubnet(ednssubnet, ednssubnet.isIPv4() ? luaconfsLocal->protobufMaskV4 : luaconfsLocal->protobufMaskV6);
   m.setRequestorId(requestorId);
@@ -1063,7 +1053,8 @@ static void protobufLogResponse(const struct dnsheader* dh, LocalStateHolder<Lua
                                 bool tcp, const ComboAddress& source, const ComboAddress& destination,
                                 const EDNSSubnetOpts& ednssubnet,
                                 const boost::uuids::uuid& uniqueId, const string& requestorId, const string& deviceId,
-                                const string& deviceName, const std::map<std::string, RecursorLua4::MetaValue>& meta)
+                                const string& deviceName, const std::map<std::string, RecursorLua4::MetaValue>& meta,
+                                const RecEventTrace& eventTrace)
 {
   pdns::ProtoZero::RecMessage pbMessage(pbData ? pbData->d_message : "", pbData ? pbData->d_response : "", 64, 10); // The extra bytes we are going to add
   // Normally we take the immutable string from the cache and append a few values, but if it's not there (can this happen?)
@@ -1087,7 +1078,7 @@ static void protobufLogResponse(const struct dnsheader* dh, LocalStateHolder<Lua
   pbMessage.setMessageIdentity(uniqueId);
   pbMessage.setFrom(requestor);
   pbMessage.setTo(destination);
-  pbMessage.setSocketProtocol(tcp);
+  pbMessage.setSocketProtocol(tcp ? pdns::ProtoZero::Message::TransportProtocol::TCP : pdns::ProtoZero::Message::TransportProtocol::UDP);
   pbMessage.setId(dh->id);
 
   pbMessage.setTime();
@@ -1105,6 +1096,9 @@ static void protobufLogResponse(const struct dnsheader* dh, LocalStateHolder<Lua
     pbMessage.setNewlyObservedDomain(false);
   }
 #endif
+  if (eventTrace.enabled() && SyncRes::s_event_trace_enabled & SyncRes::event_trace_to_pb) {
+    pbMessage.addEvents(eventTrace);
+  }
   protobufLogResponse(pbMessage);
 }
 
@@ -1154,13 +1148,49 @@ static bool addRecordToPacket(DNSPacketWriter& pw, const DNSRecord& rec, uint32_
   return true;
 }
 
+/**
+ * A helper class that handles the TCP in-flight bookkeeping on
+ * destruct. This class ise used by startDoResolve() to not forget
+ * that. You can also signal that the TCP connection must be closed
+ * once the in-flight connections drop to zero.
+ **/
+class RunningResolveGuard {
+public:
+  RunningResolveGuard(std::unique_ptr<DNSComboWriter>& dc) : d_dc(dc) {
+    if (d_dc->d_tcp && !d_dc->d_tcpConnection) {
+      throw std::runtime_error("incoming TCP case without TCP connection");
+    }
+  }
+  ~RunningResolveGuard() {
+    if (!d_handled && d_dc->d_tcp) {
+      try {
+        finishTCPReply(d_dc, false, true);
+      }
+      catch (const FDMultiplexerException&) {
+      }
+    }
+  }
+  void setHandled() {
+    d_handled = true;
+  }
+  void setDropOnIdle() {
+    if (d_dc->d_tcp) {
+      d_dc->d_tcpConnection->setDropOnIdle();
+    }
+  }
+private:
+  std::unique_ptr<DNSComboWriter>& d_dc;
+  bool d_handled{false};
+};
+
 enum class PolicyResult : uint8_t { NoAction, HaveAnswer, Drop };
 
-static PolicyResult handlePolicyHit(const DNSFilterEngine::Policy& appliedPolicy, const std::unique_ptr<DNSComboWriter>& dc, SyncRes& sr, int& res, vector<DNSRecord>& ret, DNSPacketWriter& pw)
+static PolicyResult handlePolicyHit(const DNSFilterEngine::Policy& appliedPolicy, const std::unique_ptr<DNSComboWriter>& dc, SyncRes& sr, int& res, vector<DNSRecord>& ret, DNSPacketWriter& pw, RunningResolveGuard& tcpGuard)
 {
   /* don't account truncate actions for TCP queries, since they are not applied */
   if (appliedPolicy.d_kind != DNSFilterEngine::PolicyKind::Truncate || !dc->d_tcp) {
     ++g_stats.policyResults[appliedPolicy.d_kind];
+    ++(g_stats.policyHits.lock()->operator[](appliedPolicy.getName()));
   }
 
   if (sr.doLog() &&  appliedPolicy.d_type != DNSFilterEngine::PolicyType::None) {
@@ -1178,6 +1208,7 @@ static PolicyResult handlePolicyHit(const DNSFilterEngine::Policy& appliedPolicy
       return PolicyResult::NoAction;
 
   case DNSFilterEngine::PolicyKind::Drop:
+    tcpGuard.setDropOnIdle();
     ++g_stats.policyDrops;
     return PolicyResult::Drop;
 
@@ -1386,7 +1417,7 @@ static bool checkFrameStreamExport(LocalStateHolder<LuaConfigItems>& luaconfsLoc
 #endif /* HAVE_FSTRM */
 
 #ifdef NOD_ENABLED
-static bool nodCheckNewDomain(const DNSName& dname)
+static bool nodCheckNewDomain(const shared_ptr<Logr::Logger>& nodlogger, const DNSName& dname)
 {
   bool ret = false;
   // First check the (sub)domain isn't ignored for NOD purposes
@@ -1395,7 +1426,8 @@ static bool nodCheckNewDomain(const DNSName& dname)
     if (t_nodDBp && t_nodDBp->isNewDomain(dname)) {
       if (g_nodLog) {
         // This should probably log to a dedicated log file
-        g_log<<Logger::Notice<<"Newly observed domain nod="<<dname<<endl;
+        SLOG(g_log<<Logger::Notice<<"Newly observed domain nod="<<dname<<endl,
+             nodlogger->info(Logr::Notice, "New domain observed"));
       }
       ret = true;
     }
@@ -1403,7 +1435,7 @@ static bool nodCheckNewDomain(const DNSName& dname)
   return ret;
 }
 
-static void sendNODLookup(const DNSName& dname)
+static void sendNODLookup(const shared_ptr<Logr::Logger>& nodlogger, const DNSName& dname)
 {
   if (!(g_nodLookupDomain.isRoot())) {
     // Send a DNS A query to <domain>.g_nodLookupDomain
@@ -1412,15 +1444,17 @@ static void sendNODLookup(const DNSName& dname)
       qname = dname + g_nodLookupDomain;
     }
     catch(const std::range_error &e) {
+      nodlogger->v(10)->error(Logr::Error, "DNSName too long", "Unable to send NOD lookup");
       ++g_stats.nodLookupsDroppedOversize;
       return;
     }
+    nodlogger->v(10)->info(Logr::Debug, "Sending NOD lookup", "nodqname", Logging::Loggable(qname));
     vector<DNSRecord> dummy;
-    directResolve(qname, QType::A, QClass::IN, dummy, false);
+    directResolve(qname, QType::A, QClass::IN, dummy, nullptr, false);
   }
 }
 
-static bool udrCheckUniqueDNSRecord(const DNSName& dname, uint16_t qtype, const DNSRecord& record)
+static bool udrCheckUniqueDNSRecord(const shared_ptr<Logr::Logger>& nodlogger, const DNSName& dname, uint16_t qtype, const DNSRecord& record)
 {
   bool ret = false;
   if (record.d_place == DNSResourceRecord::ANSWER ||
@@ -1430,8 +1464,15 @@ static bool udrCheckUniqueDNSRecord(const DNSName& dname, uint16_t qtype, const 
     ss << dname.toDNSStringLC() << ":" << qtype <<  ":" << qtype << ":" << record.d_type << ":" << record.d_name.toDNSStringLC() << ":" << record.d_content->getZoneRepresentation();
     if (t_udrDBp && t_udrDBp->isUniqueResponse(ss.str())) {
       if (g_udrLog) {  
-        // This should also probably log to a dedicated file. 
-        g_log<<Logger::Notice<<"Unique response observed: qname="<<dname<<" qtype="<<QType(qtype)<< " rrtype=" << QType(record.d_type) << " rrname=" << record.d_name << " rrcontent=" << record.d_content->getZoneRepresentation() << endl;
+        // This should also probably log to a dedicated file.
+        SLOG(g_log<<Logger::Notice<<"Unique response observed: qname="<<dname<<" qtype="<<QType(qtype)<< " rrtype=" << QType(record.d_type) << " rrname=" << record.d_name << " rrcontent=" << record.d_content->getZoneRepresentation() << endl,
+             nodlogger->info(Logr::Debug, "New response observed",
+                             "qtype", Logging::Loggable(qtype),
+                             "rrtype", Logging::Loggable(QType(record.d_type)),
+                             "rrname", Logging::Loggable(record.d_name),
+                             "rrcontent", Logging::Loggable(record.d_content->getZoneRepresentation())
+               );
+          );
       }
       ret = true;
     }
@@ -1458,7 +1499,7 @@ int followCNAMERecords(vector<DNSRecord>& ret, const QType qtype, int rcode)
     return rcode;
   }
 
-  rcode = directResolve(target, qtype, QClass::IN, resolved);
+  rcode = directResolve(target, qtype, QClass::IN, resolved, t_pdl);
 
   for(DNSRecord& rr :  resolved) {
     ret.push_back(std::move(rr));
@@ -1472,7 +1513,7 @@ int getFakeAAAARecords(const DNSName& qname, ComboAddress prefix, vector<DNSReco
      again, possibly encountering the same CNAME(s), and we don't want to trigger the CNAME
      loop detection. */
   vector<DNSRecord> newRecords;
-  int rcode = directResolve(qname, QType::A, QClass::IN, newRecords);
+  int rcode = directResolve(qname, QType::A, QClass::IN, newRecords, t_pdl);
 
   ret.reserve(ret.size() + newRecords.size());
   for (auto& record : newRecords) {
@@ -1524,6 +1565,7 @@ int getFakeAAAARecords(const DNSName& qname, ComboAddress prefix, vector<DNSReco
           }),
         ret.end());
   }
+  g_stats.dns64prefixanswers++;
   return rcode;
 }
 
@@ -1552,8 +1594,9 @@ int getFakePTRRecords(const DNSName& qname, vector<DNSRecord>& ret)
   rr.d_content = std::make_shared<CNAMERecordContent>(newquery);
   ret.push_back(rr);
 
-  int rcode = directResolve(DNSName(newquery), QType::PTR, QClass::IN, ret);
+  int rcode = directResolve(DNSName(newquery), QType::PTR, QClass::IN, ret, t_pdl);
 
+  g_stats.dns64prefixanswers++;
   return rcode;
 }
 
@@ -1575,12 +1618,27 @@ static bool answerIsNOData(uint16_t requestedType, int rcode, const std::vector<
   return true;
 }
 
+static bool isAllowNotifyForZone(DNSName qname)
+{
+  if (t_allowNotifyFor->empty()) {
+    return false;
+  }
+
+  notifyset_t::const_iterator ret;
+  do {
+    ret = t_allowNotifyFor->find(qname);
+    if (ret != t_allowNotifyFor->end())
+      return true;
+  } while (qname.chopOff());
+  return false;
+}
+
 static void startDoResolve(void *p)
 {
   auto dc=std::unique_ptr<DNSComboWriter>(reinterpret_cast<DNSComboWriter*>(p));
   try {
     if (t_queryring)
-      t_queryring->push_back(make_pair(dc->d_mdp.d_qname, dc->d_mdp.d_qtype));
+      t_queryring->push_back({dc->d_mdp.d_qname, dc->d_mdp.d_qtype});
 
     uint16_t maxanswersize = dc->d_tcp ? 65535 : min(static_cast<uint16_t>(512), g_udpTruncationThreshold);
     EDNSOpts edo;
@@ -1591,6 +1649,10 @@ static void startDoResolve(void *p)
     bool addPaddingToResponse = false;
 #ifdef NOD_ENABLED
     bool hasUDR = false;
+    std::shared_ptr<Logr::Logger> nodlogger{nullptr};
+    if (g_udrEnabled || g_nodEnabled) {
+      nodlogger = g_slog->withName("nod")->v(1)->withValues("qname", Logging::Loggable(dc->d_mdp.d_qname));
+    }
 #endif /* NOD_ENABLED */
     DNSPacketWriter::optvect_t returnedEdnsOptions; // Here we stuff all the options for the return packet
     uint8_t ednsExtRCode = 0;
@@ -1623,7 +1685,7 @@ static void startDoResolve(void *p)
           const static string mode_server_id = ::arg()["server-id"];
           if (mode_server_id != "disabled" && !mode_server_id.empty() &&
               maxanswersize > (EDNSOptionCodeSize + EDNSOptionLengthSize + mode_server_id.size())) {
-            returnedEdnsOptions.push_back(make_pair(EDNSOptionCode::NSID, mode_server_id));
+            returnedEdnsOptions.emplace_back(EDNSOptionCode::NSID, mode_server_id);
             variableAnswer = true; // Can't packetcache an answer with NSID
             maxanswersize -= EDNSOptionCodeSize + EDNSOptionLengthSize + mode_server_id.size();
           }
@@ -1662,7 +1724,7 @@ static void startDoResolve(void *p)
     checkFrameStreamExport(luaconfsLocal);
 #endif
 
-    DNSPacketWriter pw(packet, dc->d_mdp.d_qname, dc->d_mdp.d_qtype, dc->d_mdp.d_qclass);
+    DNSPacketWriter pw(packet, dc->d_mdp.d_qname, dc->d_mdp.d_qtype, dc->d_mdp.d_qclass, dc->d_mdp.d_header.opcode);
 
     pw.getHeader()->aa=0;
     pw.getHeader()->ra=1;
@@ -1679,6 +1741,7 @@ static void startDoResolve(void *p)
     uint32_t minTTL = dc->d_ttlCap;
 
     SyncRes sr(dc->d_now);
+    sr.d_eventTrace = std::move(dc->d_eventTrace);
     sr.setId(MT->getTid());
 
     bool DNSSECOK=false;
@@ -1746,8 +1809,11 @@ static void startDoResolve(void *p)
     dq.extendedErrorCode = &dc->d_extendedErrorCode;
     dq.extendedErrorExtra = &dc->d_extendedErrorExtra;
     dq.meta = std::move(dc->d_meta);
+    dq.fromAuthIP = &sr.d_fromAuthIP;
 
-    if(ednsExtRCode != 0) {
+    RunningResolveGuard tcpGuard(dc);
+
+    if(ednsExtRCode != 0 || dc->d_mdp.d_header.opcode == Opcode::Notify) {
       goto sendit;
     }
 
@@ -1777,7 +1843,7 @@ static void startDoResolve(void *p)
     }
 
     if (t_pdl) {
-      t_pdl->prerpz(dq, res);
+      t_pdl->prerpz(dq, res, sr.d_eventTrace);
     }
 
     // Check if the client has a policy attached to it
@@ -1824,7 +1890,7 @@ static void startDoResolve(void *p)
     }
 
     // if there is a RecursorLua active, and it 'took' the query in preResolve, we don't launch beginResolve
-    if (!t_pdl || !t_pdl->preresolve(dq, res)) {
+    if (!t_pdl || !t_pdl->preresolve(dq, res, sr.d_eventTrace)) {
 
       if (!g_dns64PrefixReverse.empty() && dq.qtype == QType::PTR && dq.qname.isPartOf(g_dns64PrefixReverse)) {
         res = getFakePTRRecords(dq.qname, ret);
@@ -1840,7 +1906,7 @@ static void startDoResolve(void *p)
           appliedPolicy = DNSFilterEngine::Policy();
         }
         else {
-          auto policyResult = handlePolicyHit(appliedPolicy, dc, sr, res, ret, pw);
+          auto policyResult = handlePolicyHit(appliedPolicy, dc, sr, res, ret, pw, tcpGuard);
           if (policyResult == PolicyResult::HaveAnswer) {
             if (g_dns64Prefix && dq.qtype == QType::AAAA && answerIsNOData(dc->d_mdp.d_qtype, res, ret)) {
               res = getFakeAAAARecords(dq.qname, *g_dns64Prefix, ret);
@@ -1901,7 +1967,7 @@ static void startDoResolve(void *p)
         if (appliedPolicy.d_kind == DNSFilterEngine::PolicyKind::NoAction) {
           throw PDNSException("NoAction policy returned while a NSDNAME or NSIP trigger was hit");
         }
-        auto policyResult = handlePolicyHit(appliedPolicy, dc, sr, res, ret, pw);
+        auto policyResult = handlePolicyHit(appliedPolicy, dc, sr, res, ret, pw, tcpGuard);
         if (policyResult == PolicyResult::HaveAnswer) {
           goto haveAnswer;
         }
@@ -1913,8 +1979,15 @@ static void startDoResolve(void *p)
       if (t_pdl || (g_dns64Prefix && dq.qtype == QType::AAAA && !vStateIsBogus(dq.validationState))) {
         if (res == RCode::NoError) {
           if (answerIsNOData(dc->d_mdp.d_qtype, res, ret)) {
-            if (t_pdl && t_pdl->nodata(dq, res)) {
+            if (t_pdl && t_pdl->nodata(dq, res, sr.d_eventTrace)) {
               shouldNotValidate = true;
+              auto policyResult = handlePolicyHit(appliedPolicy, dc, sr, res, ret, pw, tcpGuard);
+              if (policyResult == PolicyResult::HaveAnswer) {
+                goto haveAnswer;
+              }
+              else if (policyResult == PolicyResult::Drop) {
+                return;
+              }
             }
             else if (g_dns64Prefix && dq.qtype == QType::AAAA && !vStateIsBogus(dq.validationState)) {
               res = getFakeAAAARecords(dq.qname, *g_dns64Prefix, ret);
@@ -1922,18 +1995,50 @@ static void startDoResolve(void *p)
             }
           }
 	}
-	else if (res == RCode::NXDomain && t_pdl && t_pdl->nxdomain(dq, res)) {
+	else if (res == RCode::NXDomain && t_pdl && t_pdl->nxdomain(dq, res, sr.d_eventTrace)) {
           shouldNotValidate = true;
-        }
-
-	if (t_pdl && t_pdl->postresolve(dq, res)) {
-          shouldNotValidate = true;
-          auto policyResult = handlePolicyHit(appliedPolicy, dc, sr, res, ret, pw);
-          // haveAnswer case redundant
-          if (policyResult == PolicyResult::Drop) {
+          auto policyResult = handlePolicyHit(appliedPolicy, dc, sr, res, ret, pw, tcpGuard);
+          if (policyResult == PolicyResult::HaveAnswer) {
+            goto haveAnswer;
+          }
+          else if (policyResult == PolicyResult::Drop) {
             return;
           }
         }
+
+        if (t_pdl) {
+          if (t_pdl->d_postresolve_ffi) {
+            RecursorLua4::PostResolveFFIHandle handle(dq);
+            sr.d_eventTrace.add(RecEventTrace::LuaPostResolveFFI);
+            bool pr = t_pdl->postresolve_ffi(handle);
+            sr.d_eventTrace.add(RecEventTrace::LuaPostResolveFFI, pr, false);
+            if (pr) {
+              shouldNotValidate = true;
+              auto policyResult = handlePolicyHit(appliedPolicy, dc, sr, res, ret, pw, tcpGuard);
+              // haveAnswer case redundant
+              if (policyResult == PolicyResult::Drop) {
+                return;
+              }
+            }
+          }
+          else if (t_pdl->postresolve(dq, res, sr.d_eventTrace)) {
+            shouldNotValidate = true;
+            auto policyResult = handlePolicyHit(appliedPolicy, dc, sr, res, ret, pw, tcpGuard);
+            // haveAnswer case redundant
+            if (policyResult == PolicyResult::Drop) {
+              return;
+            }
+          }
+        }
+      }
+    }
+    else if (t_pdl) {
+      // preresolve returned true
+      shouldNotValidate = true;
+      auto policyResult = handlePolicyHit(appliedPolicy, dc, sr, res, ret, pw, tcpGuard);
+      // haveAnswer case redundant
+      if (policyResult == PolicyResult::Drop) {
+        return;
       }
     }
 
@@ -1992,7 +2097,7 @@ static void startDoResolve(void *p)
             if(t_bogusremotes)
               t_bogusremotes->push_back(dc->d_source);
             if(t_bogusqueryring)
-              t_bogusqueryring->push_back(make_pair(dc->d_mdp.d_qname, dc->d_mdp.d_qtype));
+              t_bogusqueryring->push_back({dc->d_mdp.d_qname, dc->d_mdp.d_qtype});
             if(g_dnssecLogBogus || sr.doLog() || g_dnssecmode == DNSSECMode::ValidateForLog) {
                g_log<<Logger::Warning<<"Answer to "<<dc->d_mdp.d_qname<<"|"<<QType(dc->d_mdp.d_qtype)<<x_marker<<" for "<<dc->getRemote()<<" validates as "<<vStateToString(state)<<endl;
             }
@@ -2053,7 +2158,7 @@ static void startDoResolve(void *p)
 	bool udr = false;
 #ifdef NOD_ENABLED
 	if (g_udrEnabled) {
-	  udr = udrCheckUniqueDNSRecord(dc->d_mdp.d_qname, dc->d_mdp.d_qtype, *i);
+	  udr = udrCheckUniqueDNSRecord(nodlogger, dc->d_mdp.d_qname, dc->d_mdp.d_qtype, *i);
           if (!hasUDR && udr)
             hasUDR = true;
 	}
@@ -2083,7 +2188,7 @@ static void startDoResolve(void *p)
 
         maxanswersize -= EDNSOptionCodeSize + EDNSOptionLengthSize + ecsPayload.size();
 
-        returnedEdnsOptions.push_back(make_pair(EDNSOptionCode::ECS, std::move(ecsPayload)));
+        returnedEdnsOptions.emplace_back(EDNSOptionCode::ECS, std::move(ecsPayload));
       }
     }
 
@@ -2107,7 +2212,7 @@ static void startDoResolve(void *p)
         if (modulo > 0) {
           padSize = std::min(blockSize - modulo, remaining);
         }
-        returnedEdnsOptions.push_back(make_pair(EDNSOptionCode::PADDING, makeEDNSPaddingOptString(padSize)));
+        returnedEdnsOptions.emplace_back(EDNSOptionCode::PADDING, makeEDNSPaddingOptString(padSize));
       }
     }
 
@@ -2178,7 +2283,7 @@ static void startDoResolve(void *p)
         eee.extraText = std::move(extra);
 
         if (pw.size() < maxanswersize && (maxanswersize - pw.size()) >= (EDNSOptionCodeSize + EDNSOptionLengthSize + sizeof(eee.infoCode) + eee.extraText.size())) {
-          returnedEdnsOptions.push_back(make_pair(EDNSOptionCode::EXTENDEDERROR, makeEDNSExtendedErrorOptString(eee)));
+          returnedEdnsOptions.emplace_back(EDNSOptionCode::EXTENDEDERROR, makeEDNSExtendedErrorOptString(eee));
         }
       }
 
@@ -2197,11 +2302,16 @@ static void startDoResolve(void *p)
 #ifdef NOD_ENABLED
     bool nod = false;
     if (g_nodEnabled) {
-      if (nodCheckNewDomain(dc->d_mdp.d_qname)) {
+      if (nodCheckNewDomain(nodlogger, dc->d_mdp.d_qname)) {
         nod = true;
       }
     }
 #endif /* NOD_ENABLED */
+
+    if (variableAnswer || sr.wasVariable()) {
+      g_stats.variableResponses++;
+    }
+
     if (t_protobufServers && !(luaconfsLocal->protobufExportConfig.taggedOnly && appliedPolicy.getName().empty() && dc->d_policyTags.empty())) {
       // Start constructing embedded DNSResponse object
       pbMessage.setResponseCode(pw.getHeader()->rcode);
@@ -2225,55 +2335,15 @@ static void startDoResolve(void *p)
       // if (g_udrEnabled) ??
       pbMessage.clearUDR(pbDataForCache->d_response);
 #endif
-      // Below are the fields that are not stored in the packet cache and will be appended here and on a cache hit
-      if (g_useKernelTimestamp && dc->d_kernelTimestamp.tv_sec) {
-        pbMessage.setQueryTime(dc->d_kernelTimestamp.tv_sec, dc->d_kernelTimestamp.tv_usec);
-      }
-      else {
-        pbMessage.setQueryTime(dc->d_now.tv_sec, dc->d_now.tv_usec);
-      }
-      pbMessage.setMessageIdentity(dc->d_uuid);
-      pbMessage.setSocketFamily(dc->d_source.sin4.sin_family);
-      pbMessage.setSocketProtocol(dc->d_tcp);
-      Netmask requestorNM(dc->d_source, dc->d_source.sin4.sin_family == AF_INET ? luaconfsLocal->protobufMaskV4 : luaconfsLocal->protobufMaskV6);
-      ComboAddress requestor = requestorNM.getMaskedNetwork();
-      pbMessage.setFrom(requestor);
-      pbMessage.setTo(dc->d_destination);
-      pbMessage.setId(dc->d_mdp.d_header.id);
-
-      pbMessage.setTime();
-      pbMessage.setEDNSSubnet(dc->d_ednssubnet.source, dc->d_ednssubnet.source.isIPv4() ? luaconfsLocal->protobufMaskV4 : luaconfsLocal->protobufMaskV6);
-      pbMessage.setRequestorId(dq.requestorId);
-      pbMessage.setDeviceId(dq.deviceId);
-      pbMessage.setDeviceName(dq.deviceName);
-      pbMessage.setFromPort(dc->d_source.getPort());
-      pbMessage.setToPort(dc->d_destination.getPort());
-
-      for (const auto& m : dq.meta) {
-        pbMessage.setMeta(m.first, m.second.stringVal, m.second.intVal);
-      }
-#ifdef NOD_ENABLED
-      if (g_nodEnabled) {
-        if (nod) {
-	  pbMessage.setNewlyObservedDomain(true);
-          pbMessage.addPolicyTag(g_nod_pbtag);
-        }
-        if (hasUDR) {
-          pbMessage.addPolicyTag(g_udr_pbtag);
-        }
-      }
-#endif /* NOD_ENABLED */
-      if (dc->d_logResponse) {
-        protobufLogResponse(pbMessage);
-      }
     }
 
-    if (variableAnswer || sr.wasVariable()) {
-      g_stats.variableResponses++;
-    }
     if (!SyncRes::s_nopacketcache && !variableAnswer && !sr.wasVariable()) {
-      minTTL = min(minTTL, pw.getHeader()->rcode == RCode::ServFail ? SyncRes::s_packetcacheservfailttl :
-                   SyncRes::s_packetcachettl);
+      const auto& hdr = pw.getHeader();
+      if ((hdr->rcode != RCode::NoError && hdr->rcode != RCode::NXDomain) ||
+          (hdr->ancount == 0 && hdr->nscount == 0)) {
+        minTTL = min(minTTL, SyncRes::s_packetcacheservfailttl);
+      }
+      minTTL = min(minTTL, SyncRes::s_packetcachettl);
       t_packetCache->insertResponsePacket(dc->d_tag, dc->d_qhash, std::move(dc->d_query), dc->d_mdp.d_qname,
                                           dc->d_mdp.d_qtype, dc->d_mdp.d_qclass,
                                           string((const char*)&*packet.begin(), packet.size()),
@@ -2302,6 +2372,61 @@ static void startDoResolve(void *p)
     else {
       bool hadError = sendResponseOverTCP(dc, packet);
       finishTCPReply(dc, hadError, true);
+      tcpGuard.setHandled();
+    }
+
+    sr.d_eventTrace.add(RecEventTrace::AnswerSent);
+
+    // Now do the per query changing part ot the protobuf message
+    if (t_protobufServers && !(luaconfsLocal->protobufExportConfig.taggedOnly && appliedPolicy.getName().empty() && dc->d_policyTags.empty())) {
+      // Below are the fields that are not stored in the packet cache and will be appended here and on a cache hit
+      if (g_useKernelTimestamp && dc->d_kernelTimestamp.tv_sec) {
+        pbMessage.setQueryTime(dc->d_kernelTimestamp.tv_sec, dc->d_kernelTimestamp.tv_usec);
+      }
+      else {
+        pbMessage.setQueryTime(dc->d_now.tv_sec, dc->d_now.tv_usec);
+      }
+      pbMessage.setMessageIdentity(dc->d_uuid);
+      pbMessage.setSocketFamily(dc->d_source.sin4.sin_family);
+      pbMessage.setSocketProtocol(dc->d_tcp ? pdns::ProtoZero::Message::TransportProtocol::TCP : pdns::ProtoZero::Message::TransportProtocol::UDP);
+      Netmask requestorNM(dc->d_source, dc->d_source.sin4.sin_family == AF_INET ? luaconfsLocal->protobufMaskV4 : luaconfsLocal->protobufMaskV6);
+      ComboAddress requestor = requestorNM.getMaskedNetwork();
+      pbMessage.setFrom(requestor);
+      pbMessage.setTo(dc->d_destination);
+      pbMessage.setId(dc->d_mdp.d_header.id);
+
+      pbMessage.setTime();
+      pbMessage.setEDNSSubnet(dc->d_ednssubnet.source, dc->d_ednssubnet.source.isIPv4() ? luaconfsLocal->protobufMaskV4 : luaconfsLocal->protobufMaskV6);
+      pbMessage.setRequestorId(dq.requestorId);
+      pbMessage.setDeviceId(dq.deviceId);
+      pbMessage.setDeviceName(dq.deviceName);
+      pbMessage.setFromPort(dc->d_source.getPort());
+      pbMessage.setToPort(dc->d_destination.getPort());
+
+      for (const auto& m : dq.meta) {
+        pbMessage.setMeta(m.first, m.second.stringVal, m.second.intVal);
+      }
+#ifdef NOD_ENABLED
+      if (g_nodEnabled) {
+        if (nod) {
+	  pbMessage.setNewlyObservedDomain(true);
+          pbMessage.addPolicyTag(g_nod_pbtag);
+        }
+        if (hasUDR) {
+          pbMessage.addPolicyTag(g_udr_pbtag);
+        }
+      }
+#endif /* NOD_ENABLED */
+      if (sr.d_eventTrace.enabled() && SyncRes::s_event_trace_enabled & SyncRes::event_trace_to_pb) {
+        pbMessage.addEvents(sr.d_eventTrace);
+      }
+      if (dc->d_logResponse) {
+        protobufLogResponse(pbMessage);
+      }
+    }
+
+    if (sr.d_eventTrace.enabled() && SyncRes::s_event_trace_enabled & SyncRes::event_trace_to_log) {
+      g_log << Logger::Info << sr.d_eventTrace.toString() << endl;
     }
 
     // Originally this code used a mix of floats, doubles, uint64_t with different units.
@@ -2319,11 +2444,13 @@ static void startDoResolve(void *p)
       g_log<<endl;
     }
 
-    if (sr.d_outqueries || sr.d_authzonequeries) {
-      g_recCache->cacheMisses++;
-    }
-    else {
-      g_recCache->cacheHits++;
+    if (dc->d_mdp.d_header.opcode == Opcode::Query) {
+      if (sr.d_outqueries || sr.d_authzonequeries) {
+        g_recCache->cacheMisses++;
+      }
+      else {
+        g_recCache->cacheHits++;
+      }
     }
 
     g_stats.answers(spentUsec);
@@ -2343,7 +2470,7 @@ static void startDoResolve(void *p)
 
 #ifdef NOD_ENABLED
     if (nod) {
-      sendNODLookup(dc->d_mdp.d_qname);
+      sendNODLookup(nodlogger, dc->d_mdp.d_qname);
     }
 #endif /* NOD_ENABLED */
 
@@ -2478,23 +2605,6 @@ static void getQNameAndSubnet(const std::string& question, DNSName* dnsname, uin
   }
 }
 
-static bool handleTCPReadResult(int fd, ssize_t bytes)
-{
-  if (bytes == 0) {
-    /* EOF */
-    terminateTCPConnection(fd);
-    return false;
-  }
-  else if (bytes < 0) {
-    if (errno != EAGAIN && errno != EWOULDBLOCK) {
-      terminateTCPConnection(fd);
-      return false;
-    }
-  }
-
-  return true;
-}
-
 static bool checkForCacheHit(bool qnameParsed, unsigned int tag, const string& data,
                              DNSName& qname, uint16_t& qtype, uint16_t& qclass,
                              const struct timeval& now,
@@ -2517,7 +2627,7 @@ static bool checkForCacheHit(bool qnameParsed, unsigned int tag, const string& d
         t_bogusremotes->push_back(source);
       }
       if (t_bogusqueryring) {
-        t_bogusqueryring->push_back(make_pair(qname, qtype));
+        t_bogusqueryring->push_back({qname, qtype});
       }
     }
 
@@ -2540,14 +2650,77 @@ static bool checkForCacheHit(bool qnameParsed, unsigned int tag, const string& d
   return cacheHit;
 }
 
+static void* pleaseWipeCaches(const DNSName& canon, bool subtree, uint16_t qtype)
+{
+  auto res = wipeCaches(canon, subtree, qtype);
+  g_log<<Logger::Info<<"Wiped caches for "<<canon<<": "<<res.record_count<<" records; "<<res.negative_record_count<<" negative records; "<<res.packet_count<<" packets"<<endl;
+  return nullptr;
+}
+
+static void requestWipeCaches(const DNSName& canon)
+{
+  // send a message to the handler thread asking it
+  // to wipe all of the caches
+  ThreadMSG* tmsg = new ThreadMSG();
+  tmsg->func = [=]{ return pleaseWipeCaches(canon, true, 0xffff); };
+  tmsg->wantAnswer = false;
+  if(write(s_threadInfos[0].pipes.writeToThread, &tmsg, sizeof(tmsg)) != sizeof(tmsg)) {
+    delete tmsg;
+
+    unixDie("write to thread pipe returned wrong size or error");
+  }
+}
+
+/*
+ * A helper class that by default closes the incoming TCP connection on destruct
+ * If you want to keep the connection alive, call keep() on the guard object
+ */
+class RunningTCPQuestionGuard {
+public:
+  RunningTCPQuestionGuard(int fd)
+  {
+    d_fd = fd;
+  }
+  ~RunningTCPQuestionGuard()
+  {
+    if (d_fd != -1) {
+      terminateTCPConnection(d_fd);
+      d_fd = -1;
+    }
+  }
+  void keep()
+  {
+    d_fd = -1;
+  }
+  bool handleTCPReadResult(int fd, ssize_t bytes)
+  {
+    if (bytes == 0) {
+      /* EOF */
+      return false;
+    }
+    else if (bytes < 0) {
+      if (errno != EAGAIN && errno != EWOULDBLOCK) {
+        return false;
+      }
+    }
+    keep();
+    return true;
+  }
+
+private:
+  int d_fd{-1};
+};
+
 static void handleRunningTCPQuestion(int fd, FDMultiplexer::funcparam_t& var)
 {
   shared_ptr<TCPConnection> conn=boost::any_cast<shared_ptr<TCPConnection> >(var);
 
+  RunningTCPQuestionGuard tcpGuard{fd};
+
   if (conn->state == TCPConnection::PROXYPROTOCOLHEADER) {
     ssize_t bytes = recv(conn->getFD(), &conn->data.at(conn->proxyProtocolGot), conn->proxyProtocolNeed, 0);
     if (bytes <= 0) {
-      handleTCPReadResult(fd, bytes);
+      tcpGuard.handleTCPReadResult(fd, bytes);
       return;
     }
 
@@ -2559,12 +2732,12 @@ static void handleRunningTCPQuestion(int fd, FDMultiplexer::funcparam_t& var)
         g_log<<Logger::Error<<"Unable to consume proxy protocol header in packet from TCP client "<< conn->d_remote.toStringWithPort() <<endl;
       }
       ++g_stats.proxyProtocolInvalidCount;
-      terminateTCPConnection(fd);
       return;
     }
     else if (remaining < 0) {
       conn->proxyProtocolNeed = -remaining;
       conn->data.resize(conn->proxyProtocolGot + conn->proxyProtocolNeed);
+      tcpGuard.keep();
       return;
     }
     else {
@@ -2579,7 +2752,6 @@ static void handleRunningTCPQuestion(int fd, FDMultiplexer::funcparam_t& var)
           g_log<<Logger::Error<<"Unable to parse proxy protocol header in packet from TCP client "<< conn->d_remote.toStringWithPort() <<endl;
         }
         ++g_stats.proxyProtocolInvalidCount;
-        terminateTCPConnection(fd);
         return;
       }
       else if (static_cast<size_t>(used) > g_proxyProtocolMaximumSize) {
@@ -2587,7 +2759,6 @@ static void handleRunningTCPQuestion(int fd, FDMultiplexer::funcparam_t& var)
           g_log<<Logger::Error<<"Proxy protocol header in packet from TCP client "<< conn->d_remote.toStringWithPort() << " is larger than proxy-protocol-maximum-size (" << used << "), dropping"<< endl;
         }
         ++g_stats.proxyProtocolInvalidCount;
-        terminateTCPConnection(fd);
         return;
       }
 
@@ -2600,7 +2771,6 @@ static void handleRunningTCPQuestion(int fd, FDMultiplexer::funcparam_t& var)
         }
 
         ++g_stats.unauthorizedTCP;
-        terminateTCPConnection(fd);
         return;
       }
 
@@ -2620,7 +2790,7 @@ static void handleRunningTCPQuestion(int fd, FDMultiplexer::funcparam_t& var)
       conn->state=TCPConnection::GETQUESTION;
     }
     if (bytes <= 0) {
-      handleTCPReadResult(fd, bytes);
+      tcpGuard.handleTCPReadResult(fd, bytes);
       return;
     }
   }
@@ -2634,7 +2804,7 @@ static void handleRunningTCPQuestion(int fd, FDMultiplexer::funcparam_t& var)
       conn->bytesread=0;
     }
     if (bytes <= 0) {
-      if (!handleTCPReadResult(fd, bytes)) {
+      if (!tcpGuard.handleTCPReadResult(fd, bytes)) {
         if(g_logCommonErrors) {
           g_log<<Logger::Error<<"TCP client "<< conn->d_remote.toStringWithPort() <<" disconnected after first byte"<<endl;
         }
@@ -2646,7 +2816,7 @@ static void handleRunningTCPQuestion(int fd, FDMultiplexer::funcparam_t& var)
   if(conn->state==TCPConnection::GETQUESTION) {
     ssize_t bytes=recv(conn->getFD(), &conn->data[conn->bytesread], conn->qlen - conn->bytesread, 0);
     if (bytes <= 0) {
-      if (!handleTCPReadResult(fd, bytes)) {
+      if (!tcpGuard.handleTCPReadResult(fd, bytes)) {
         if(g_logCommonErrors) {
           g_log<<Logger::Error<<"TCP client "<< conn->d_remote.toStringWithPort() <<" disconnected while reading question body"<<endl;
         }
@@ -2657,7 +2827,6 @@ static void handleRunningTCPQuestion(int fd, FDMultiplexer::funcparam_t& var)
       if(g_logCommonErrors) {
         g_log<<Logger::Error<<"TCP client "<< conn->d_remote.toStringWithPort() <<" sent an invalid question size while reading question body"<<endl;
       }
-      terminateTCPConnection(fd);
       return;
     }
     conn->bytesread+=(uint16_t)bytes;
@@ -2665,14 +2834,13 @@ static void handleRunningTCPQuestion(int fd, FDMultiplexer::funcparam_t& var)
       conn->state = TCPConnection::BYTE0;
       std::unique_ptr<DNSComboWriter> dc;
       try {
-        dc=std::unique_ptr<DNSComboWriter>(new DNSComboWriter(conn->data, g_now));
+        dc = std::make_unique<DNSComboWriter>(conn->data, g_now);
       }
       catch(const MOADNSException &mde) {
         g_stats.clientParseError++;
         if (g_logCommonErrors) {
           g_log<<Logger::Error<<"Unable to parse packet from TCP client "<< conn->d_remote.toStringWithPort() <<endl;
         }
-        terminateTCPConnection(fd);
         return;
       }
       dc->d_tcpConnection = conn; // carry the torch
@@ -2705,6 +2873,8 @@ static void handleRunningTCPQuestion(int fd, FDMultiplexer::funcparam_t& var)
       bool logQuery = false;
       bool qnameParsed = false;
 
+      dc->d_eventTrace.setEnabled(SyncRes::s_event_trace_enabled);
+      dc->d_eventTrace.add(RecEventTrace::ReqRecv);
       auto luaconfsLocal = g_luaconfs.getLocal();
       if (checkProtobufExport(luaconfsLocal)) {
         needECS = true;
@@ -2716,7 +2886,7 @@ static void handleRunningTCPQuestion(int fd, FDMultiplexer::funcparam_t& var)
       checkFrameStreamExport(luaconfsLocal);
 #endif
 
-      if(needECS || needXPF || (t_pdl && (t_pdl->d_gettag_ffi || t_pdl->d_gettag))) {
+      if(needECS || needXPF || (t_pdl && (t_pdl->d_gettag_ffi || t_pdl->d_gettag)) || dc->d_mdp.d_header.opcode == Opcode::Notify) {
 
         try {
           EDNSOptionViewMap ednsOptions;
@@ -2732,10 +2902,14 @@ static void handleRunningTCPQuestion(int fd, FDMultiplexer::funcparam_t& var)
             try {
               if (t_pdl->d_gettag_ffi) {
                 RecursorLua4::FFIParams params(qname, qtype, dc->d_destination, dc->d_source, dc->d_ednssubnet.source, dc->d_data, dc->d_policyTags, dc->d_records, ednsOptions, dc->d_proxyProtocolValues, requestorId, deviceId, deviceName, dc->d_routingTag, dc->d_rcode, dc->d_ttlCap, dc->d_variable, true, logQuery, dc->d_logResponse, dc->d_followCNAMERecords, dc->d_extendedErrorCode, dc->d_extendedErrorExtra, dc->d_responsePaddingDisabled, dc->d_meta);
+                dc->d_eventTrace.add(RecEventTrace::LuaGetTagFFI);
                 dc->d_tag = t_pdl->gettag_ffi(params);
+                dc->d_eventTrace.add(RecEventTrace::LuaGetTagFFI, dc->d_tag, false);
               }
               else if (t_pdl->d_gettag) {
+                dc->d_eventTrace.add(RecEventTrace::LuaGetTag);
                 dc->d_tag = t_pdl->gettag(dc->d_source, dc->d_ednssubnet.source, dc->d_destination, qname, qtype, &dc->d_policyTags, dc->d_data, ednsOptions, true, requestorId, deviceId, deviceName, dc->d_routingTag, dc->d_proxyProtocolValues);
+                dc->d_eventTrace.add(RecEventTrace::LuaGetTag, dc->d_tag, false);
               }
             }
             catch(const std::exception& e)  {
@@ -2781,12 +2955,12 @@ static void handleRunningTCPQuestion(int fd, FDMultiplexer::funcparam_t& var)
       }
 
       if (t_pdl) {
-        if (t_pdl->ipfilter(dc->d_source, dc->d_destination, *dh)) {
+        bool ipf = t_pdl->ipfilter(dc->d_source, dc->d_destination, *dh, dc->d_eventTrace);
+        if (ipf) {
           if (!g_quiet) {
             g_log<<Logger::Notice<<t_id<<" ["<<MT->getTid()<<"/"<<MT->numProcesses()<<"] DROPPED TCP question from "<<dc->d_source.toStringWithPort()<<(dc->d_source != dc->d_remote ? " (via "+dc->d_remote.toStringWithPort()+")" : "")<<" based on policy"<<endl;
           }
           g_stats.policyDrops++;
-          terminateTCPConnection(fd);
           return;
         }
       }
@@ -2796,15 +2970,15 @@ static void handleRunningTCPQuestion(int fd, FDMultiplexer::funcparam_t& var)
         if (g_logCommonErrors) {
           g_log<<Logger::Error<<"Ignoring answer from TCP client "<< dc->getRemote() <<" on server socket!"<<endl;
         }
-        terminateTCPConnection(fd);
         return;
       }
-      if (dc->d_mdp.d_header.opcode) {
+      if (dc->d_mdp.d_header.opcode != Opcode::Query && dc->d_mdp.d_header.opcode != Opcode::Notify) {
         g_stats.ignoredCount++;
         if (g_logCommonErrors) {
-          g_log<<Logger::Error<<"Ignoring non-query opcode from TCP client "<< dc->getRemote() <<" on server socket!"<<endl;
+          g_log<<Logger::Error<<"Ignoring unsupported opcode "<<Opcode::to_s(dc->d_mdp.d_header.opcode)<<" from TCP client "<< dc->getRemote() <<" on server socket!"<<endl;
         }
         sendErrorOverTCP(dc, RCode::NotImp);
+        tcpGuard.keep();
         return;
       }
       else if (dh->qdcount == 0) {
@@ -2813,6 +2987,7 @@ static void handleRunningTCPQuestion(int fd, FDMultiplexer::funcparam_t& var)
           g_log<<Logger::Error<<"Ignoring empty (qdcount == 0) query from "<< dc->getRemote() <<" on server socket!"<<endl;
         }
         sendErrorOverTCP(dc, RCode::NotImp);
+        tcpGuard.keep();
         return;
       }
       else {
@@ -2820,45 +2995,94 @@ static void handleRunningTCPQuestion(int fd, FDMultiplexer::funcparam_t& var)
         ++g_stats.qcounter;
         ++g_stats.tcpqcounter;
 
+        if(dc->d_mdp.d_header.opcode == Opcode::Notify) {
+          if(!t_allowNotifyFrom || !t_allowNotifyFrom->match(dc->d_source)) {
+            if(!g_quiet) {
+              g_log<<Logger::Error<<"["<<MT->getTid()<<"] dropping TCP NOTIFY from "<<dc->d_source.toString()<<", address not matched by allow-notify-from"<<endl;
+            }
+
+            g_stats.sourceDisallowedNotify++;
+            return;
+          }
+
+          if(!isAllowNotifyForZone(qname)) {
+            if(!g_quiet) {
+              g_log<<Logger::Error<<"["<<MT->getTid()<<"] dropping TCP NOTIFY from "<<dc->d_source.toString()<<", for "<<qname.toLogString()<<", zone not matched by allow-notify-for"<<endl;
+            }
+
+            g_stats.zoneDisallowedNotify++;
+            return;
+          }
+        }
+
         string response;
         RecursorPacketCache::OptPBData pbData{boost::none};
 
-        /* It might seem like a good idea to skip the packet cache lookup if we know that the answer is not cacheable,
-           but it means that the hash would not be computed. If some script decides at a later time to mark back the answer
-           as cacheable we would cache it with a wrong tag, so better safe than sorry. */
-        bool cacheHit = checkForCacheHit(qnameParsed, dc->d_tag, conn->data, qname, qtype, qclass, g_now, response, dc->d_qhash, pbData, true, dc->d_source);
+        if(dc->d_mdp.d_header.opcode == Opcode::Query) {
+          /* It might seem like a good idea to skip the packet cache lookup if we know that the answer is not cacheable,
+             but it means that the hash would not be computed. If some script decides at a later time to mark back the answer
+             as cacheable we would cache it with a wrong tag, so better safe than sorry. */
+          dc->d_eventTrace.add(RecEventTrace::PCacheCheck);
+          bool cacheHit = checkForCacheHit(qnameParsed, dc->d_tag, conn->data, qname, qtype, qclass, g_now, response, dc->d_qhash, pbData, true, dc->d_source);
+          dc->d_eventTrace.add(RecEventTrace::PCacheCheck, cacheHit, false);
 
-        if (cacheHit) {
-          if (t_protobufServers && dc->d_logResponse && !(luaconfsLocal->protobufExportConfig.taggedOnly && pbData && !pbData->d_tagged)) {
-            struct timeval tv{0, 0};
-            protobufLogResponse(dh, luaconfsLocal, pbData, tv, true, dc->d_source, dc->d_destination, dc->d_ednssubnet, dc->d_uuid, dc->d_requestorId, dc->d_deviceId, dc->d_deviceName, dc->d_meta);
-          }
+          if (cacheHit) {
+            if (!g_quiet) {
+              g_log<<Logger::Notice<<t_id<< " TCP question answered from packet cache tag="<<dc->d_tag<<" from "<<dc->d_source.toStringWithPort()<<(dc->d_source != dc->d_remote ? " (via "+dc->d_remote.toStringWithPort()+")" : "")<<endl;
+            }
 
+            bool hadError = sendResponseOverTCP(dc, response);
+            finishTCPReply(dc, hadError, false);
+            struct timeval now;
+            Utility::gettimeofday(&now, nullptr);
+            uint64_t spentUsec = uSec(now - start);
+            g_stats.cumulativeAnswers(spentUsec);
+            dc->d_eventTrace.add(RecEventTrace::AnswerSent);
+
+            if (t_protobufServers && dc->d_logResponse && !(luaconfsLocal->protobufExportConfig.taggedOnly && pbData && !pbData->d_tagged)) {
+              struct timeval tv{0, 0};
+              protobufLogResponse(dh, luaconfsLocal, pbData, tv, true, dc->d_source, dc->d_destination, dc->d_ednssubnet, dc->d_uuid, dc->d_requestorId, dc->d_deviceId, dc->d_deviceName, dc->d_meta, dc->d_eventTrace);
+            }
+
+            if (dc->d_eventTrace.enabled() && SyncRes::s_event_trace_enabled & SyncRes::event_trace_to_log) {
+              g_log << Logger::Info << dc->d_eventTrace.toString() << endl;
+            }
+            tcpGuard.keep();
+            return;
+          } // cache hit
+        } // query opcode
+
+        if(dc->d_mdp.d_header.opcode == Opcode::Notify) {
           if (!g_quiet) {
-            g_log<<Logger::Notice<<t_id<< " TCP question answered from packet cache tag="<<dc->d_tag<<" from "<<dc->d_source.toStringWithPort()<<(dc->d_source != dc->d_remote ? " (via "+dc->d_remote.toStringWithPort()+")" : "")<<endl;
+            g_log<<Logger::Notice<<t_id<< " got NOTIFY for "<<qname.toLogString()<<" from "<<dc->d_source.toStringWithPort()<<(dc->d_source != dc->d_remote ? " (via "+dc->d_remote.toStringWithPort()+")" : "")<<endl;
           }
 
-          bool hadError = sendResponseOverTCP(dc, response);
-          finishTCPReply(dc, hadError, false);
-          struct timeval now;
-          Utility::gettimeofday(&now, nullptr);
-          uint64_t spentUsec = uSec(now - start);
-          g_stats.cumulativeAnswers(spentUsec);
+          requestWipeCaches(qname);
+
+          // the operation will now be treated as a Query, generating
+          // a normal response, as the rest of the code does not
+          // check dh->opcode, but we need to ensure that the response
+          // to this request does not get put into the packet cache
+          dc->d_variable = true;
+        }
+
+        // setup for startDoResolve() in an mthread
+        ++conn->d_requestsInFlight;
+        if (conn->d_requestsInFlight >= TCPConnection::s_maxInFlight) {
+          t_fdm->removeReadFD(fd); // should no longer awake ourselves when there is data to read
         } else {
-          // No cache hit, setup for startDoResolve() in an mthread
-          ++conn->d_requestsInFlight;
-          if (conn->d_requestsInFlight >= TCPConnection::s_maxInFlight) {
-            t_fdm->removeReadFD(fd); // should no longer awake ourselves when there is data to read
-          } else {
-            Utility::gettimeofday(&g_now, nullptr); // needed?
-            struct timeval ttd = g_now;
-            t_fdm->setReadTTD(fd, ttd, g_tcpTimeout);
-          }
-          MT->makeThread(startDoResolve, dc.release()); // deletes dc
-        } // Cache hit or not
+          Utility::gettimeofday(&g_now, nullptr); // needed?
+          struct timeval ttd = g_now;
+          t_fdm->setReadTTD(fd, ttd, g_tcpTimeout);
+        }
+        tcpGuard.keep();
+        MT->makeThread(startDoResolve, dc.release()); // deletes dc
       } // good query
     } // read full query
   } // reading query
+
+  // more to come
+  tcpGuard.keep();
 }
 
 static bool expectProxyProtocol(const ComboAddress& from)
@@ -2939,8 +3163,9 @@ static void handleNewTCPQuestion(int fd, FDMultiplexer::funcparam_t& )
   }
 }
 
-static string* doProcessUDPQuestion(const std::string& question, const ComboAddress& fromaddr, const ComboAddress& destaddr, ComboAddress source, ComboAddress destination, struct timeval tv, int fd, std::vector<ProxyProtocolValue>& proxyProtocolValues)
+static string* doProcessUDPQuestion(const std::string& question, const ComboAddress& fromaddr, const ComboAddress& destaddr, ComboAddress source, ComboAddress destination, struct timeval tv, int fd, std::vector<ProxyProtocolValue>& proxyProtocolValues, RecEventTrace& eventTrace)
 {
+  ++s_threadInfos[t_id].numberOfDistributedQueries;
   gettimeofday(&g_now, nullptr);
   if (tv.tv_sec) {
     struct timeval diff = g_now - tv;
@@ -2995,8 +3220,8 @@ static string* doProcessUDPQuestion(const std::string& question, const ComboAddr
   bool variable = false;
   bool followCNAMEs = false;
   bool responsePaddingDisabled = false;
+  DNSName qname;
   try {
-    DNSName qname;
     uint16_t qtype=0;
     uint16_t qclass=0;
     bool qnameParsed=false;
@@ -3012,7 +3237,7 @@ static string* doProcessUDPQuestion(const std::string& question, const ComboAddr
     */
 #endif
 
-    if(needECS || needXPF || (t_pdl && (t_pdl->d_gettag || t_pdl->d_gettag_ffi))) {
+    if(needECS || needXPF || (t_pdl && (t_pdl->d_gettag || t_pdl->d_gettag_ffi)) || dh->opcode == Opcode::Notify) {
       try {
         EDNSOptionViewMap ednsOptions;
         bool xpfFound = false;
@@ -3031,10 +3256,14 @@ static string* doProcessUDPQuestion(const std::string& question, const ComboAddr
             if (t_pdl->d_gettag_ffi) {
               RecursorLua4::FFIParams params(qname, qtype, destination, source, ednssubnet.source, data, policyTags, records, ednsOptions, proxyProtocolValues, requestorId, deviceId, deviceName, routingTag, rcode, ttlCap, variable, false, logQuery, logResponse, followCNAMEs, extendedErrorCode, extendedErrorExtra, responsePaddingDisabled, meta);
 
+              eventTrace.add(RecEventTrace::LuaGetTagFFI);
               ctag = t_pdl->gettag_ffi(params);
+              eventTrace.add(RecEventTrace::LuaGetTagFFI, ctag, false);
             }
             else if (t_pdl->d_gettag) {
+              eventTrace.add(RecEventTrace::LuaGetTag);
               ctag = t_pdl->gettag(source, ednssubnet.source, destination, qname, qtype, &policyTags, data, ednsOptions, false, requestorId, deviceId, deviceName, routingTag, proxyProtocolValues);
+              eventTrace.add(RecEventTrace::LuaGetTag, ctag, false);
             }
           }
           catch (const std::exception& e)  {
@@ -3062,38 +3291,48 @@ static string* doProcessUDPQuestion(const std::string& question, const ComboAddr
     if (ctag == 0 && !responsePaddingDisabled && g_paddingFrom.match(fromaddr)) {
       ctag = g_paddingTag;
     }
-    /* It might seem like a good idea to skip the packet cache lookup if we know that the answer is not cacheable,
-       but it means that the hash would not be computed. If some script decides at a later time to mark back the answer
-       as cacheable we would cache it with a wrong tag, so better safe than sorry. */
-    bool cacheHit = checkForCacheHit(qnameParsed, ctag, question, qname, qtype, qclass, g_now, response, qhash, pbData, false, source);
-    if (cacheHit) {
-      if (t_protobufServers && logResponse && !(luaconfsLocal->protobufExportConfig.taggedOnly && pbData && !pbData->d_tagged)) {
-        protobufLogResponse(dh, luaconfsLocal, pbData, tv, false, source, destination, ednssubnet, uniqueId, requestorId, deviceId, deviceName, meta);
-      }
 
-      if (!g_quiet) {
-        g_log<<Logger::Notice<<t_id<< " question answered from packet cache tag="<<ctag<<" from "<<source.toStringWithPort()<<(source != fromaddr ? " (via "+fromaddr.toStringWithPort()+")" : "")<<endl;
-      }
-      struct msghdr msgh;
-      struct iovec iov;
-      cmsgbuf_aligned cbuf;
-      fillMSGHdr(&msgh, &iov, &cbuf, 0, (char*)response.c_str(), response.length(), const_cast<ComboAddress*>(&fromaddr));
-      msgh.msg_control=NULL;
+    if(dh->opcode == Opcode::Query) {
+      /* It might seem like a good idea to skip the packet cache lookup if we know that the answer is not cacheable,
+         but it means that the hash would not be computed. If some script decides at a later time to mark back the answer
+         as cacheable we would cache it with a wrong tag, so better safe than sorry. */
+      eventTrace.add(RecEventTrace::PCacheCheck);
+      bool cacheHit = checkForCacheHit(qnameParsed, ctag, question, qname, qtype, qclass, g_now, response, qhash, pbData, false, source);
+      eventTrace.add(RecEventTrace::PCacheCheck, cacheHit, false);
+      if (cacheHit) {
+        if (!g_quiet) {
+          g_log<<Logger::Notice<<t_id<< " question answered from packet cache tag="<<ctag<<" from "<<source.toStringWithPort()<<(source != fromaddr ? " (via "+fromaddr.toStringWithPort()+")" : "")<<endl;
+        }
+        struct msghdr msgh;
+        struct iovec iov;
+        cmsgbuf_aligned cbuf;
+        fillMSGHdr(&msgh, &iov, &cbuf, 0, (char*)response.c_str(), response.length(), const_cast<ComboAddress*>(&fromaddr));
+        msgh.msg_control=NULL;
 
-      if(g_fromtosockets.count(fd)) {
-        addCMsgSrcAddr(&msgh, &cbuf, &destaddr, 0);
+        if(g_fromtosockets.count(fd)) {
+          addCMsgSrcAddr(&msgh, &cbuf, &destaddr, 0);
+        }
+        int sendErr = sendOnNBSocket(fd, &msgh);
+        eventTrace.add(RecEventTrace::AnswerSent);
+
+        if (t_protobufServers && logResponse && !(luaconfsLocal->protobufExportConfig.taggedOnly && pbData && !pbData->d_tagged)) {
+          protobufLogResponse(dh, luaconfsLocal, pbData, tv, false, source, destination, ednssubnet, uniqueId, requestorId, deviceId, deviceName, meta, eventTrace);
+        }
+
+        if (eventTrace.enabled() && SyncRes::s_event_trace_enabled & SyncRes::event_trace_to_log) {
+          g_log << Logger::Info << eventTrace.toString() << endl;
+        }
+        if (sendErr && g_logCommonErrors) {
+          g_log << Logger::Warning << "Sending UDP reply to client " << source.toStringWithPort()
+                << (source != fromaddr ? " (via " + fromaddr.toStringWithPort() + ")" : "") << " failed with: "
+                << strerror(sendErr) << endl;
+        }
+        struct timeval now;
+        Utility::gettimeofday(&now, nullptr);
+        uint64_t spentUsec = uSec(now - tv);
+        g_stats.cumulativeAnswers(spentUsec);
+        return 0;
       }
-      int sendErr = sendOnNBSocket(fd, &msgh);
-      if (sendErr && g_logCommonErrors) {
-        g_log << Logger::Warning << "Sending UDP reply to client " << source.toStringWithPort()
-              << (source != fromaddr ? " (via " + fromaddr.toStringWithPort() + ")" : "") << " failed with: "
-              << strerror(sendErr) << endl;
-      }
-      struct timeval now;
-      Utility::gettimeofday(&now, nullptr);
-      uint64_t spentUsec = uSec(now - tv);
-      g_stats.cumulativeAnswers(spentUsec);
-      return 0;
     }
   }
   catch (const std::exception& e) {
@@ -3104,13 +3343,37 @@ static string* doProcessUDPQuestion(const std::string& question, const ComboAddr
   }
 
   if (t_pdl) {
-    if (t_pdl->ipfilter(source, destination, *dh)) {
+    bool ipf = t_pdl->ipfilter(source, destination, *dh, eventTrace);
+    if (ipf) {
       if (!g_quiet) {
-	g_log<<Logger::Notice<<t_id<<" ["<<MT->getTid()<<"/"<<MT->numProcesses()<<"] DROPPED question from "<<source.toStringWithPort()<<(source != fromaddr ? " (via "+fromaddr.toStringWithPort()+")" : "")<<" based on policy"<<endl;
+        g_log<<Logger::Notice<<t_id<<" ["<<MT->getTid()<<"/"<<MT->numProcesses()<<"] DROPPED question from "<<source.toStringWithPort()<<(source != fromaddr ? " (via "+fromaddr.toStringWithPort()+")" : "")<<" based on policy"<<endl;
       }
       g_stats.policyDrops++;
       return 0;
     }
+  }
+
+  if(dh->opcode == Opcode::Notify) {
+    if(!isAllowNotifyForZone(qname)) {
+      if(!g_quiet) {
+        g_log<<Logger::Error<<"["<<MT->getTid()<<"] dropping UDP NOTIFY from "<<source.toStringWithPort()<<(source != fromaddr ? " (via "+fromaddr.toStringWithPort()+")" : "")<<", for "<<qname.toLogString()<<", zone not matched by allow-notify-for"<<endl;
+      }
+
+      g_stats.zoneDisallowedNotify++;
+      return 0;
+    }
+
+    if (!g_quiet) {
+      g_log<<Logger::Notice<<t_id<< " got NOTIFY for "<<qname.toLogString()<<" from "<<source.toStringWithPort()<<(source != fromaddr ? " (via "+fromaddr.toStringWithPort()+")" : "")<<endl;
+    }
+
+    requestWipeCaches(qname);
+
+    // the operation will now be treated as a Query, generating
+    // a normal response, as the rest of the code does not
+    // check dh->opcode, but we need to ensure that the response
+    // to this request does not get put into the packet cache
+    variable = true;
   }
 
   if(MT->numProcesses() > g_maxMThreads) {
@@ -3121,7 +3384,7 @@ static string* doProcessUDPQuestion(const std::string& question, const ComboAddr
     return 0;
   }
 
-  auto dc = std::unique_ptr<DNSComboWriter>(new DNSComboWriter(question, g_now, std::move(policyTags), std::move(data), std::move(records)));
+  auto dc = std::make_unique<DNSComboWriter>(question, g_now, std::move(policyTags), std::move(data), std::move(records));
   dc->setSocket(fd);
   dc->d_tag=ctag;
   dc->d_qhash=qhash;
@@ -3152,7 +3415,9 @@ static string* doProcessUDPQuestion(const std::string& question, const ComboAddr
   dc->d_responsePaddingDisabled = responsePaddingDisabled;
   dc->d_meta = std::move(meta);
 
+  dc->d_eventTrace = std::move(eventTrace);
   MT->makeThread(startDoResolve, (void*) dc.release()); // deletes dc
+
   return 0;
 }
 
@@ -3170,6 +3435,7 @@ static void handleNewUDPQuestion(int fd, FDMultiplexer::funcparam_t& var)
   cmsgbuf_aligned cbuf;
   bool firstQuery = true;
   std::vector<ProxyProtocolValue> proxyProtocolValues;
+  RecEventTrace eventTrace;
 
   for(size_t queriesCounter = 0; queriesCounter < s_maxUDPQueriesPerRound; queriesCounter++) {
     bool proxyProto = false;
@@ -3179,6 +3445,9 @@ static void handleNewUDPQuestion(int fd, FDMultiplexer::funcparam_t& var)
     fillMSGHdr(&msgh, &iov, &cbuf, sizeof(cbuf), &data[0], data.size(), &fromaddr);
 
     if((len=recvmsg(fd, &msgh, 0)) >= 0) {
+      eventTrace.clear();
+      eventTrace.setEnabled(SyncRes::s_event_trace_enabled);
+      eventTrace.add(RecEventTrace::ReqRecv);
 
       firstQuery = false;
 
@@ -3264,10 +3533,10 @@ static void handleNewUDPQuestion(int fd, FDMultiplexer::funcparam_t& var)
             g_log<<Logger::Error<<"Ignoring answer from "<<fromaddr.toString()<<" on server socket!"<<endl;
           }
         }
-        else if(dh->opcode) {
+        else if(dh->opcode != Opcode::Query && dh->opcode != Opcode::Notify) {
           g_stats.ignoredCount++;
           if(g_logCommonErrors) {
-            g_log<<Logger::Error<<"Ignoring non-query opcode "<<dh->opcode<<" from "<<fromaddr.toString()<<" on server socket!"<<endl;
+            g_log<<Logger::Error<<"Ignoring unsupported opcode "<<Opcode::to_s(dh->opcode)<<" from "<<fromaddr.toString()<<" on server socket!"<<endl;
           }
         }
         else if (dh->qdcount == 0) {
@@ -3277,6 +3546,17 @@ static void handleNewUDPQuestion(int fd, FDMultiplexer::funcparam_t& var)
           }
         }
         else {
+          if(dh->opcode == Opcode::Notify) {
+            if(!t_allowNotifyFrom || !t_allowNotifyFrom->match(&source)) {
+              if(!g_quiet) {
+                g_log<<Logger::Error<<"["<<MT->getTid()<<"] dropping UDP NOTIFY from "<<source.toString()<<", address not matched by allow-notify-from"<<endl;
+              }
+
+              g_stats.sourceDisallowedNotify++;
+              return;
+            }
+          }
+
           struct timeval tv={0,0};
           HarvestTimestamp(&msgh, &tv);
           ComboAddress dest;
@@ -3304,12 +3584,12 @@ static void handleNewUDPQuestion(int fd, FDMultiplexer::funcparam_t& var)
 
           if(g_weDistributeQueries) {
             std::string localdata = data;
-            distributeAsyncFunction(data, [localdata, fromaddr, dest, source, destination, tv, fd, proxyProtocolValues]() mutable
-              { return doProcessUDPQuestion(localdata, fromaddr, dest, source, destination, tv, fd, proxyProtocolValues); });
+            distributeAsyncFunction(data, [localdata, fromaddr, dest, source, destination, tv, fd, proxyProtocolValues, eventTrace]() mutable {
+              return doProcessUDPQuestion(localdata, fromaddr, dest, source, destination, tv, fd, proxyProtocolValues, eventTrace);
+            });
           }
           else {
-            ++s_threadInfos[t_id].numberOfDistributedQueries;
-            doProcessUDPQuestion(data, fromaddr, dest, source, destination, tv, fd, proxyProtocolValues);
+            doProcessUDPQuestion(data, fromaddr, dest, source, destination, tv, fd, proxyProtocolValues, eventTrace);
           }
         }
       }
@@ -3456,9 +3736,15 @@ static void makeTCPServerSockets(deferredAdd_t& deferredAdds, std::set<int>& tcp
       throw PDNSException("Binding TCP server socket for "+ st.host +": "+stringerror());
 
     setNonBlocking(fd);
-    setSocketSendBuffer(fd, 65000);
+    try {
+      setSocketSendBuffer(fd, 65000);
+    }
+    catch (const std::exception& e) {
+      g_log<<Logger::Error<<e.what()<<endl;
+    }
+
     listen(fd, 128);
-    deferredAdds.push_back(make_pair(fd, handleNewTCPQuestion));
+    deferredAdds.emplace_back(fd, handleNewTCPQuestion);
     tcpSockets.insert(fd);
 
     // we don't need to update g_listenSocketsAddresses since it doesn't work for TCP/IP:
@@ -3520,7 +3806,12 @@ static void makeUDPServerSockets(deferredAdd_t& deferredAdds)
 
     setCloseOnExec(fd);
 
-    setSocketReceiveBuffer(fd, 250000);
+    try {
+      setSocketReceiveBuffer(fd, 250000);
+    }
+    catch (const std::exception& e) {
+      g_log<<Logger::Error<<e.what()<<endl;
+    }
     sin.sin4.sin_port = htons(st.port);
 
   
@@ -3555,7 +3846,7 @@ static void makeUDPServerSockets(deferredAdd_t& deferredAdds)
 
     setNonBlocking(fd);
 
-    deferredAdds.push_back(make_pair(fd, handleNewUDPQuestion));
+    deferredAdds.emplace_back(fd, handleNewUDPQuestion);
     g_listenSocketsAddresses[fd]=sin;  // this is written to only from the startup thread, not from the workers
     if(sin.sin4.sin_family == AF_INET)
       g_log<<Logger::Info<<"Listening for UDP queries on "<< sin.toString() <<":"<<st.port<<endl;
@@ -3636,8 +3927,8 @@ static void doStats(void)
       <<broadcastAccFunction<uint64_t>(pleaseGetEDNSStatusesSize)<<endl;
     g_log<<Logger::Notice<<"stats: outpacket/query ratio "<<ratePercentage(SyncRes::s_outqueries, SyncRes::s_queries)<<"%";
     g_log<<Logger::Notice<<", "<<ratePercentage(SyncRes::s_throttledqueries, SyncRes::s_outqueries+SyncRes::s_throttledqueries)<<"% throttled"<<endl;
-    g_log<<Logger::Notice<<"stats: "<<SyncRes::s_tcpoutqueries<<"/"<<SyncRes::s_dotoutqueries << " outgoing tcp/dot connections, "<<
-      broadcastAccFunction<uint64_t>(pleaseGetConcurrentQueries)<<" queries running, "<<SyncRes::s_outgoingtimeouts<<" outgoing timeouts"<<endl;
+    g_log<<Logger::Notice<<"stats: "<<SyncRes::s_tcpoutqueries<<"/"<<SyncRes::s_dotoutqueries << "/" << getCurrentIdleTCPConnections() << " outgoing tcp/dot/idle connections, "<<
+      broadcastAccFunction<uint64_t>(pleaseGetConcurrentQueries)<<" queries running, "<<SyncRes::s_outgoingtimeouts<<" outgoing timeouts "<<endl;
 
     uint64_t pcSize = broadcastAccFunction<uint64_t>(pleaseGetPacketCacheSize);
     uint64_t pcHits = broadcastAccFunction<uint64_t>(pleaseGetPacketCacheHits);
@@ -3708,6 +3999,7 @@ static void houseKeeping(void *)
       SyncRes::pruneThrottledServers();
       SyncRes::pruneNonResolving(now.tv_sec - SyncRes::s_nonresolvingnsthrottletime);
       Utility::gettimeofday(&last_prune, nullptr);
+      t_tcp_manager.cleanup(now);
     }
 
     if(isHandlerThread()) {
@@ -3810,8 +4102,8 @@ static void makeThreadPipes()
     g_log<<Logger::Info<<"Resizing the buffer of the distribution pipe to "<<pipeBufferSize<<endl;
   }
 
-  /* thread 0 is the handler / SNMP, we start at 1 */
-  for(unsigned int n = 1; n <= (g_numWorkerThreads + g_numDistributorThreads); ++n) {
+  /* thread 0 is the handler / SNMP, worker threads start at 1 */
+  for(unsigned int n = 0; n <= (g_numWorkerThreads + g_numDistributorThreads); ++n) {
     auto& threadInfos = s_threadInfos.at(n);
 
     int fd[2];
@@ -3820,6 +4112,11 @@ static void makeThreadPipes()
 
     threadInfos.pipes.readToThread = fd[0];
     threadInfos.pipes.writeToThread = fd[1];
+
+    // handler thread only gets first pipe, not the others
+    if(n==0) {
+      continue;
+    }
 
     if(pipe(fd) < 0)
       unixDie("Creating pipe for inter-thread communications");
@@ -3849,12 +4146,6 @@ static void makeThreadPipes()
     }
   }
 }
-
-struct ThreadMSG
-{
-  pipefunc_t func;
-  bool wantAnswer;
-};
 
 void broadcastFunction(const pipefunc_t& func)
 {
@@ -3925,8 +4216,6 @@ static bool trySendingQueryToWorker(unsigned int target, ThreadMSG* tmsg)
     }
   }
 
-  ++targetInfo.numberOfDistributedQueries;
-
   return true;
 }
 
@@ -3979,7 +4268,7 @@ void distributeAsyncFunction(const string& packet, const pipefunc_t& func)
     _exit(1);
   }
 
-  unsigned int hash = hashQuestion(packet.c_str(), packet.length(), g_disthashseed);
+  unsigned int hash = hashQuestion(reinterpret_cast<const uint8_t*>(packet.data()), packet.length(), g_disthashseed);
   unsigned int target = selectWorker(hash);
 
   ThreadMSG* tmsg = new ThreadMSG();
@@ -4100,21 +4389,18 @@ template ThreadTimes broadcastAccFunction(const boost::function<ThreadTimes*()>&
 static void handleRCC(int fd, FDMultiplexer::funcparam_t& var)
 {
   try {
-    string remote;
-    string msg = s_rcc.recv(&remote).d_str;
+    FDWrapper clientfd = accept(fd, nullptr, nullptr);
+    if (clientfd == -1) {
+      throw PDNSException("accept failed");
+    }
+    string msg = s_rcc.recv(clientfd).d_str;
+    g_log << Logger::Info << "Received rec_control command '" << msg << "' via controlsocket" << endl;
+
     RecursorControlParser rcp;
     RecursorControlParser::func_t* command;
+    auto answer = rcp.getAnswer(clientfd, msg, &command);
 
-    g_log << Logger::Info << "Received rec_control command '" << msg << "' from control socket" << endl;
-    auto answer = rcp.getAnswer(fd, msg, &command);
-
-    // If we are inside a chroot, we need to strip
-    if (!arg()["chroot"].empty()) {
-      size_t len = arg()["chroot"].length();
-      remote = remote.substr(len);
-    }
-
-    s_rcc.send(answer, &remote);
+    s_rcc.send(clientfd, answer);
     command();
   }
   catch(const std::exception& e) {
@@ -4146,6 +4432,9 @@ static void TCPIOHandlerStateChange(IOState oldstate, IOState newstate, std::sha
       TCPLOG(pid->tcpsock, "Done -> removeReadFD" << endl);
       t_fdm->removeReadFD(pid->tcpsock);
       break;
+    case IOState::Async:
+      throw std::runtime_error("TLS async mode not supported");
+      break;
     }
     break;
 
@@ -4162,6 +4451,9 @@ static void TCPIOHandlerStateChange(IOState oldstate, IOState newstate, std::sha
       TCPLOG(pid->tcpsock, "Done -> removeWriteFD" << endl);
       t_fdm->removeWriteFD(pid->tcpsock);
       break;
+    case IOState::Async:
+      throw std::runtime_error("TLS async mode not supported");
+      break;
     }
     break;
 
@@ -4177,7 +4469,14 @@ static void TCPIOHandlerStateChange(IOState oldstate, IOState newstate, std::sha
       break;
     case IOState::Done:
       break;
+    case IOState::Async:
+      throw std::runtime_error("TLS async mode not supported");
+      break;
     }
+    break;
+
+  case IOState::Async:
+    throw std::runtime_error("TLS async mode not supported");
     break;
   }
 
@@ -4217,6 +4516,9 @@ static void TCPIOHandlerIO(int fd, FDMultiplexer::funcparam_t& var)
         break;
       case IOState::NeedWrite:
         break;
+      case IOState::Async:
+        throw std::runtime_error("TLS async mode not supported");
+        break;
       }
     }
     catch (const std::exception& e) {
@@ -4247,6 +4549,9 @@ static void TCPIOHandlerIO(int fd, FDMultiplexer::funcparam_t& var)
         break;
       case IOState::NeedWrite:
         TCPLOG(pid->tcpsock, "tryWrite: NeedWrite" << endl);
+        break;
+      case IOState::Async:
+        throw std::runtime_error("TLS async mode not supported");
         break;
       }
     }
@@ -4478,6 +4783,7 @@ static void checkOrFixFDS()
 {
   unsigned int availFDs=getFilenumLimit(); 
   unsigned int wantFDs = g_maxMThreads * g_numWorkerThreads +25; // even healthier margin then before
+  wantFDs += g_numWorkerThreads * TCPOutConnectionManager::s_maxIdlePerThread;
 
   if(wantFDs > availFDs) {
     unsigned int hardlimit= getFilenumLimit(true);
@@ -4486,7 +4792,7 @@ static void checkOrFixFDS()
       g_log<<Logger::Warning<<"Raised soft limit on number of filedescriptors to "<<wantFDs<<" to match max-mthreads and threads settings"<<endl;
     }
     else {
-      int newval = (hardlimit - 25) / g_numWorkerThreads;
+      int newval = (hardlimit - 25 - TCPOutConnectionManager::s_maxIdlePerThread) / g_numWorkerThreads;
       g_log<<Logger::Warning<<"Insufficient number of filedescriptors available for max-mthreads*threads setting! ("<<hardlimit<<" < "<<wantFDs<<"), reducing max-mthreads to "<<newval<<endl;
       g_maxMThreads = newval;
       setFilenumLimit(hardlimit);
@@ -4496,14 +4802,71 @@ static void checkOrFixFDS()
 
 static void* recursorThread(unsigned int tid, const string& threadName);
 
-static void* pleaseSupplantACLs(std::shared_ptr<NetmaskGroup> ng)
+static void* pleaseSupplantAllowFrom(std::shared_ptr<NetmaskGroup> ng)
 {
   t_allowFrom = ng;
   return nullptr;
 }
 
+static void* pleaseSupplantAllowNotifyFrom(std::shared_ptr<NetmaskGroup> ng)
+{
+  t_allowNotifyFrom = ng;
+  return nullptr;
+}
+
+void* pleaseSupplantAllowNotifyFor(std::shared_ptr<notifyset_t> ns)
+{
+  t_allowNotifyFor = ns;
+  return nullptr;
+}
+
 int g_argc;
 char** g_argv;
+
+static std::shared_ptr<NetmaskGroup> parseACL(const std::string& aclFile, const std::string& aclSetting)
+{
+  auto result = std::make_shared<NetmaskGroup>();
+
+  if(!::arg()[aclFile].empty()) {
+    string line;
+    ifstream ifs(::arg()[aclFile].c_str());
+    if(!ifs) {
+      throw runtime_error("Could not open '"+::arg()[aclFile]+"': "+stringerror());
+    }
+
+    string::size_type pos;
+    while(getline(ifs,line)) {
+      pos=line.find('#');
+      if(pos!=string::npos)
+        line.resize(pos);
+      boost::trim(line);
+      if(line.empty())
+        continue;
+
+      result->addMask(line);
+    }
+    g_log<<Logger::Info<<"Done parsing "<<result->size()<<" "<<aclSetting<<" ranges from file '"<<::arg()[aclFile]<<"' - overriding '"<<aclSetting<<"' setting"<<endl;
+
+    return result;
+  }
+  else if(!::arg()[aclSetting].empty()) {
+    vector<string> ips;
+    stringtok(ips, ::arg()[aclSetting], ", ");
+
+    g_log<<Logger::Info<<aclSetting<<": ";
+    for(vector<string>::const_iterator i = ips.begin(); i!= ips.end(); ++i) {
+      result->addMask(*i);
+      if(i!=ips.begin())
+        g_log<<Logger::Info<<", ";
+      g_log<<Logger::Info<<*i;
+    }
+    g_log<<Logger::Info<<endl;
+
+    return result;
+  }
+
+  return nullptr;
+}
 
 void parseACLs()
 {
@@ -4519,6 +4882,11 @@ void parseACLs()
     if(!::arg().preParseFile(configname.c_str(), "allow-from-file"))
       throw runtime_error("Unable to re-parse configuration file '"+configname+"'");
     ::arg().preParseFile(configname.c_str(), "allow-from", LOCAL_NETS);
+
+    if(!::arg().preParseFile(configname.c_str(), "allow-notify-from-file"))
+      throw runtime_error("Unable to re-parse configuration file '"+configname+"'");
+    ::arg().preParseFile(configname.c_str(), "allow-notify-from");
+
     ::arg().preParseFile(configname.c_str(), "include-dir");
     ::arg().preParse(g_argc, g_argv, "include-dir");
 
@@ -4528,60 +4896,38 @@ void parseACLs()
 
     for(const std::string& fn : extraConfigs) {
       if(!::arg().preParseFile(fn.c_str(), "allow-from-file", ::arg()["allow-from-file"]))
-	throw runtime_error("Unable to re-parse configuration file include '"+fn+"'");
+        throw runtime_error("Unable to re-parse configuration file include '"+fn+"'");
       if(!::arg().preParseFile(fn.c_str(), "allow-from", ::arg()["allow-from"]))
-	throw runtime_error("Unable to re-parse configuration file include '"+fn+"'");
+        throw runtime_error("Unable to re-parse configuration file include '"+fn+"'");
+
+      if(!::arg().preParseFile(fn.c_str(), "allow-notify-from-file", ::arg()["allow-notify-from-file"]))
+        throw runtime_error("Unable to re-parse configuration file include '"+fn+"'");
+      if(!::arg().preParseFile(fn.c_str(), "allow-notify-from", ::arg()["allow-notify-from"]))
+        throw runtime_error("Unable to re-parse configuration file include '"+fn+"'");
     }
 
     ::arg().preParse(g_argc, g_argv, "allow-from-file");
     ::arg().preParse(g_argc, g_argv, "allow-from");
+
+    ::arg().preParse(g_argc, g_argv, "allow-notify-from-file");
+    ::arg().preParse(g_argc, g_argv, "allow-notify-from");
   }
 
-  std::shared_ptr<NetmaskGroup> oldAllowFrom = t_allowFrom;
-  std::shared_ptr<NetmaskGroup> allowFrom = std::make_shared<NetmaskGroup>();
+  auto allowFrom = parseACL("allow-from-file", "allow-from");
 
-  if(!::arg()["allow-from-file"].empty()) {
-    string line;
-    ifstream ifs(::arg()["allow-from-file"].c_str());
-    if(!ifs) {
-      throw runtime_error("Could not open '"+::arg()["allow-from-file"]+"': "+stringerror());
-    }
-
-    string::size_type pos;
-    while(getline(ifs,line)) {
-      pos=line.find('#');
-      if(pos!=string::npos)
-        line.resize(pos);
-      boost::trim(line);
-      if(line.empty())
-        continue;
-
-      allowFrom->addMask(line);
-    }
-    g_log<<Logger::Warning<<"Done parsing " << allowFrom->size() <<" allow-from ranges from file '"<<::arg()["allow-from-file"]<<"' - overriding 'allow-from' setting"<<endl;
-  }
-  else if(!::arg()["allow-from"].empty()) {
-    vector<string> ips;
-    stringtok(ips, ::arg()["allow-from"], ", ");
-
-    g_log<<Logger::Warning<<"Only allowing queries from: ";
-    for(vector<string>::const_iterator i = ips.begin(); i!= ips.end(); ++i) {
-      allowFrom->addMask(*i);
-      if(i!=ips.begin())
-        g_log<<Logger::Warning<<", ";
-      g_log<<Logger::Warning<<*i;
-    }
-    g_log<<Logger::Warning<<endl;
-  }
-  else {
+  if(allowFrom->size() == 0) {
     if(::arg()["local-address"]!="127.0.0.1" && ::arg().asNum("local-port")==53)
       g_log<<Logger::Warning<<"WARNING: Allowing queries from all IP addresses - this can be a security risk!"<<endl;
     allowFrom = nullptr;
   }
 
   g_initialAllowFrom = allowFrom;
-  broadcastFunction([=]{ return pleaseSupplantACLs(allowFrom); });
-  oldAllowFrom = nullptr;
+  broadcastFunction([=]{ return pleaseSupplantAllowFrom(allowFrom); });
+
+  auto allowNotifyFrom = parseACL("allow-notify-from-file", "allow-notify-from");
+
+  g_initialAllowNotifyFrom = allowNotifyFrom;
+  broadcastFunction([=]{ return pleaseSupplantAllowNotifyFrom(allowNotifyFrom); });
 
   l_initialized = true;
 }
@@ -4733,13 +5079,39 @@ static void checkSocketDir(void)
   } else {
     return;
   }
-  g_log << Logger::Error << "Problem with socket directory " << dir << ": " << msg << "; see https://docs.powerdns.com/recursor/upgrade.html#x-to-4-3-0-or-master" << endl;
+  g_log << Logger::Error << "Problem with socket directory " << dir << ": " << msg << "; see https://docs.powerdns.com/recursor/upgrade.html#x-to-4-3-0" << endl;
   _exit(1);
+}
+
+static uint64_t* pleaseWipePacketCache(const DNSName& canon, bool subtree, uint16_t qtype)
+{
+  return new uint64_t(t_packetCache->doWipePacketCache(canon, qtype, subtree));
+}
+
+struct WipeCacheResult wipeCaches(const DNSName& canon, bool subtree, uint16_t qtype)
+{
+  struct WipeCacheResult res;
+
+  try {
+    res.record_count = g_recCache->doWipeCache(canon, subtree, qtype);
+    res.packet_count = broadcastAccFunction<uint64_t>([=]{ return pleaseWipePacketCache(canon, subtree, qtype);});
+    res.negative_record_count = g_negCache->wipe(canon, subtree);
+    if (g_aggressiveNSECCache) {
+      g_aggressiveNSECCache->removeZoneInfo(canon, subtree);
+    }
+  }
+  catch (const std::exception& e) {
+    g_log<<Logger::Warning<<", failed: "<<e.what()<<endl;
+  }
+
+  return res;
 }
 
 static int serviceMain(int argc, char*argv[])
 {
   int ret = EXIT_SUCCESS;
+
+  g_slogStructured = ::arg().mustDo("structured-logging");
 
   g_log.setName(s_programname);
   g_log.disableSyslog(::arg().mustDo("disable-syslog"));
@@ -4895,6 +5267,7 @@ static int serviceMain(int argc, char*argv[])
   SyncRes::s_tcp_fast_open_connect = ::arg().mustDo("tcp-fast-open-connect");
 
   SyncRes::s_dot_to_port_853 = ::arg().mustDo("dot-to-port-853");
+  SyncRes::s_event_trace_enabled = ::arg().asNum("event-trace-enabled");
 
   if (SyncRes::s_tcp_fast_open_connect) {
     checkFastOpenSysctl(true);
@@ -4992,7 +5365,7 @@ static int serviceMain(int argc, char*argv[])
 
   g_networkTimeoutMsec = ::arg().asNum("network-timeout");
 
-  g_initialDomainMap = parseAuthAndForwards();
+  std::tie(g_initialDomainMap, g_initialAllowNotifyFor) = parseZoneConfiguration();
 
   g_latencyStatSize=::arg().asNum("latency-statistic-size");
 
@@ -5035,6 +5408,12 @@ static int serviceMain(int argc, char*argv[])
   } else {
     TCPConnection::s_maxInFlight = maxInFlight;
   }
+
+  int64_t millis = ::arg().asNum("tcp-out-max-idle-ms");
+  TCPOutConnectionManager::s_maxIdleTime = timeval{millis / 1000, (static_cast<suseconds_t>(millis) % 1000) * 1000 };
+  TCPOutConnectionManager::s_maxIdlePerAuth = ::arg().asNum("tcp-out-max-idle-per-auth");
+  TCPOutConnectionManager::s_maxQueries = ::arg().asNum("tcp-out-max-queries");
+  TCPOutConnectionManager::s_maxIdlePerThread = ::arg().asNum("tcp-out-max-idle-per-thread");
 
   g_gettagNeedsEDNSOptions = ::arg().mustDo("gettag-needs-edns-options");
 
@@ -5092,6 +5471,15 @@ static int serviceMain(int argc, char*argv[])
       dotauthNames.add(DNSName(p));
     }
     g_DoTToAuthNames.setState(std::move(dotauthNames));
+  }
+
+  {
+    CarbonConfig config;
+    stringtok(config.servers, arg()["carbon-server"], ", ");
+    config.hostname = arg()["carbon-ourname"];
+    config.instance_name = arg()["carbon-instance"];
+    config.namespace_name = arg()["carbon-namespace"];
+    g_carbonConfig.setState(std::move(config));
   }
 
   s_balancingFactor = ::arg().asDouble("distribution-load-factor");
@@ -5254,6 +5642,8 @@ static int serviceMain(int argc, char*argv[])
   }
 
   startLuaConfigDelayedThreads(delayedLuaThreads, g_luaconfs.getCopy().generation);
+  delayedLuaThreads.rpzPrimaryThreads.clear(); // no longer needed
+  delayedLuaThreads.ztcConfigs.clear(); // no longer needed
 
   makeThreadPipes();
 
@@ -5319,7 +5709,7 @@ static int serviceMain(int argc, char*argv[])
     /* This thread handles the web server, carbon, statistics and the control channel */
     auto& handlerInfos = s_threadInfos.at(0);
     handlerInfos.isHandler = true;
-    handlerInfos.thread = std::thread(recursorThread, 0, "main");
+    handlerInfos.thread = std::thread(recursorThread, 0, "web+stat");
 
     setCPUMap(cpusMap, currentThreadId, pthread_self());
 
@@ -5397,8 +5787,10 @@ try
   SyncRes tmp(g_now); // make sure it allocates tsstorage before we do anything, like primeHints or so..
   SyncRes::setDomainMap(g_initialDomainMap);
   t_allowFrom = g_initialAllowFrom;
-  t_udpclientsocks = std::unique_ptr<UDPClientSocks>(new UDPClientSocks());
-  t_tcpClientCounts = std::unique_ptr<tcpClientCounts_t>(new tcpClientCounts_t());
+  t_allowNotifyFrom = g_initialAllowNotifyFrom;
+  t_allowNotifyFor = g_initialAllowNotifyFor;
+  t_udpclientsocks = std::make_unique<UDPClientSocks>();
+  t_tcpClientCounts = std::make_unique<tcpClientCounts_t>();
 
   if (threadInfo.isHandler) {
     if (!primeHints()) {
@@ -5410,8 +5802,7 @@ try
     g_log<<Logger::Warning<<"Done priming cache with root hints"<<endl;
   }
 
-  t_packetCache = std::unique_ptr<RecursorPacketCache>(new RecursorPacketCache());
-
+  t_packetCache = std::make_unique<RecursorPacketCache>();
 
 #ifdef NOD_ENABLED
   if (threadInfo.isWorker)
@@ -5435,25 +5826,25 @@ try
 
   unsigned int ringsize=::arg().asNum("stats-ringbuffer-entries") / g_numWorkerThreads;
   if(ringsize) {
-    t_remotes = std::unique_ptr<addrringbuf_t>(new addrringbuf_t());
+    t_remotes = std::make_unique<addrringbuf_t>();
     if(g_weDistributeQueries)
       t_remotes->set_capacity(::arg().asNum("stats-ringbuffer-entries") / g_numDistributorThreads);
     else
       t_remotes->set_capacity(ringsize);
-    t_servfailremotes = std::unique_ptr<addrringbuf_t>(new addrringbuf_t());
+    t_servfailremotes = std::make_unique<addrringbuf_t>();
     t_servfailremotes->set_capacity(ringsize);
-    t_bogusremotes = std::unique_ptr<addrringbuf_t>(new addrringbuf_t());
+    t_bogusremotes = std::make_unique<addrringbuf_t>();
     t_bogusremotes->set_capacity(ringsize);
-    t_largeanswerremotes = std::unique_ptr<addrringbuf_t>(new addrringbuf_t());
+    t_largeanswerremotes = std::make_unique<addrringbuf_t>();
     t_largeanswerremotes->set_capacity(ringsize);
-    t_timeouts = std::unique_ptr<addrringbuf_t>(new addrringbuf_t());
+    t_timeouts = std::make_unique<addrringbuf_t>();
     t_timeouts->set_capacity(ringsize);
 
-    t_queryring = std::unique_ptr<boost::circular_buffer<pair<DNSName, uint16_t> > >(new boost::circular_buffer<pair<DNSName, uint16_t> >());
+    t_queryring = std::make_unique<boost::circular_buffer<pair<DNSName, uint16_t>>>();
     t_queryring->set_capacity(ringsize);
-    t_servfailqueryring = std::unique_ptr<boost::circular_buffer<pair<DNSName, uint16_t> > >(new boost::circular_buffer<pair<DNSName, uint16_t> >());
+    t_servfailqueryring = std::make_unique<boost::circular_buffer<pair<DNSName, uint16_t>>>();
     t_servfailqueryring->set_capacity(ringsize);
-    t_bogusqueryring = std::unique_ptr<boost::circular_buffer<pair<DNSName, uint16_t> > >(new boost::circular_buffer<pair<DNSName, uint16_t> >());
+    t_bogusqueryring = std::make_unique<boost::circular_buffer<pair<DNSName, uint16_t>>>();
     t_bogusqueryring->set_capacity(ringsize);
   }
   MT = std::make_unique<MT_t>(::arg().asNum("stack-size"));
@@ -5472,7 +5863,9 @@ try
   t_fdm=getMultiplexer();
 
   RecursorWebServer *rws = nullptr;
-  
+
+  t_fdm->addReadFD(threadInfo.pipes.readToThread, handlePipeRequest);
+
   if(threadInfo.isHandler) {
     if(::arg().mustDo("webserver")) {
       g_log<<Logger::Warning << "Enabling web server" << endl;
@@ -5487,8 +5880,6 @@ try
     g_log<<Logger::Info<<"Enabled '"<< t_fdm->getName() << "' multiplexer"<<endl;
   }
   else {
-
-    t_fdm->addReadFD(threadInfo.pipes.readToThread, handlePipeRequest);
     t_fdm->addReadFD(threadInfo.pipes.readQueriesToThread, handlePipeRequest);
 
     if (threadInfo.isListener) {
@@ -5618,10 +6009,10 @@ static const char* toTimestampStringMilli(const struct timeval& tv, char *buf, s
   struct tm tm;
   size_t len = strftime(buf, sz, s_timestampFormat.c_str(), localtime_r(&tv.tv_sec, &tm));
   if (len == 0) {
-    len = snprintf(buf, sz, "%lld", (long long) tv.tv_sec);
+    len = snprintf(buf, sz, "%lld", static_cast<long long>(tv.tv_sec));
   }
 
-  snprintf(buf + len, sz - len, ".%03ld", tv.tv_usec / 1000);
+  snprintf(buf + len, sz - len, ".%03ld", static_cast<long>(tv.tv_usec) / 1000);
   return buf;
 }
 
@@ -5711,6 +6102,7 @@ int main(int argc, char **argv)
     ::arg().set("webserver-password", "Password required for accessing the webserver") = "";
     ::arg().set("webserver-allow-from","Webserver access is only allowed from these subnets")="127.0.0.1,::1";
     ::arg().set("webserver-loglevel", "Amount of logging in the webserver (none, normal, detailed)") = "normal";
+    ::arg().setSwitch("webserver-hash-plaintext-credentials","Whether to hash passwords and api keys supplied in plaintext, to prevent keeping the plaintext version in memory at runtime")="no";
     ::arg().set("carbon-ourname", "If set, overrides our reported hostname for carbon stats")="";
     ::arg().set("carbon-server", "If set, send metrics in carbon (graphite) format to this server IP address")="";
     ::arg().set("carbon-interval", "Number of seconds between carbon (graphite) updates")="30";
@@ -5760,6 +6152,10 @@ int main(int argc, char **argv)
     ::arg().set("version-string", "string reported on version.pdns or version.bind")=fullVersionString();
     ::arg().set("allow-from", "If set, only allow these comma separated netmasks to recurse")=LOCAL_NETS;
     ::arg().set("allow-from-file", "If set, load allowed netmasks from this file")="";
+    ::arg().set("allow-notify-for", "If set, NOTIFY requests for these zones will be allowed")="";
+    ::arg().set("allow-notify-for-file", "If set, load NOTIFY-allowed zones from this file")="";
+    ::arg().set("allow-notify-from", "If set, NOTIFY requests from these comma separated netmasks will be allowed")="";
+    ::arg().set("allow-notify-from-file", "If set, load NOTIFY-allowed netmasks from this file")="";
     ::arg().set("entropy-source", "If set, read entropy from this file")="/dev/urandom";
     ::arg().set("dont-query", "If set, do not query these netmasks for DNS data")=DONT_QUERY;
     ::arg().set("max-tcp-per-client", "If set, maximum number of TCP sessions per client (IP address)")="0";
@@ -5826,7 +6222,7 @@ int main(int argc, char **argv)
     for (size_t idx = 0; idx < 128; idx++) {
       defaultAPIDisabledStats += ", ecs-v6-response-bits-" + std::to_string(idx + 1);
     }
-    std::string defaultDisabledStats = defaultAPIDisabledStats + ", cumul-answers, cumul-auth4answers, cumul-auth6answers";
+    std::string defaultDisabledStats = defaultAPIDisabledStats + ", cumul-clientanswers, cumul-authanswers, policy-hits";
 
     ::arg().set("stats-api-blacklist", "List of statistics that are disabled when retrieving the complete list of statistics via the API (deprecated)")=defaultAPIDisabledStats;
     ::arg().set("stats-carbon-blacklist", "List of statistics that are prevented from being exported via Carbon (deprecated)")=defaultDisabledStats;
@@ -5864,6 +6260,7 @@ int main(int argc, char **argv)
     ::arg().setSwitch("qname-minimization", "Use Query Name Minimization")="yes";
     ::arg().setSwitch("nothing-below-nxdomain", "When an NXDOMAIN exists in cache for a name with fewer labels than the qname, send NXDOMAIN without doing a lookup (see RFC 8020)")="dnssec";
     ::arg().set("max-generate-steps", "Maximum number of $GENERATE steps when loading a zone from a file")="0";
+    ::arg().set("max-include-depth", "Maximum nested $INCLUDE depth when loading a zone from a file")="20";
     ::arg().set("record-cache-shards", "Number of shards in the record cache")="1024";
     ::arg().set("refresh-on-ttl-perc", "If a record is requested from the cache and only this % of original TTL remains, refetch") = "0";
 
@@ -5893,8 +6290,15 @@ int main(int argc, char **argv)
     ::arg().set("edns-padding-mode", "Whether to add EDNS padding to all responses ('always') or only to responses for queries containing the EDNS padding option ('padded-queries-only', the default). In both modes, padding will only be added to responses for queries coming from `edns-padding-from`_ sources")="padded-queries-only";
     ::arg().set("edns-padding-tag", "Packetcache tag associated to responses sent with EDNS padding, to prevent sending these to clients for which padding is not enabled.")="7830";
 
-    ::arg().set("dot-to-port-853", "Force DoT connection to target port 853 if DoT compiled in")="yes";
+    ::arg().setSwitch("dot-to-port-853", "Force DoT connection to target port 853 if DoT compiled in")="yes";
     ::arg().set("dot-to-auth-names", "Use DoT to authoritative servers with these names or suffixes")="";
+    ::arg().set("event-trace-enabled", "If set, event traces are collected and send out via protobuf logging (1), logfile (2) or both(3)")="0";
+
+    ::arg().set("tcp-out-max-idle-ms", "Time TCP/DoT connections are left idle in milliseconds or 0 if no limit") = "10000";
+    ::arg().set("tcp-out-max-idle-per-auth", "Maximum number of idle TCP/DoT connections to a specific IP per thread, 0 means do not keep idle connections open") = "10";
+    ::arg().set("tcp-out-max-queries", "Maximum total number of queries per TCP/DoT connection, 0 means no limit") = "0";
+    ::arg().set("tcp-out-max-idle-per-thread", "Maximum number of idle TCP/DoT connections per thread") = "100";
+    ::arg().setSwitch("structured-logging", "Prefer structured logging") = "yes";
 
     ::arg().setCmd("help","Provide a helpful message");
     ::arg().setCmd("version","Print version string");
@@ -5943,13 +6347,15 @@ int main(int argc, char **argv)
     auto startupLog = g_slog->withName("startup");
 
     if(!::arg().file(configname.c_str())) {
-      startupLog->error("No such file", "Unable to parse configuration file", "config_file", Logging::Loggable(configname));
+      SLOG(g_log<<Logger::Warning<<"Unable to parse configuration file '"<<configname<<"'"<<endl,
+           startupLog->error("No such file", "Unable to parse configuration file", "config_file", Logging::Loggable(configname)));
     }
 
     ::arg().parse(argc,argv);
 
     if( !::arg()["chroot"].empty() && !::arg()["api-config-dir"].empty() ) {
-      startupLog->info("Cannot use chroot and enable the API at the same time");
+      SLOG(g_log<<Logger::Error<<"Using chroot and enabling the API is not possible"<<endl,
+           startupLog->info("Cannot use chroot and enable the API at the same time"));
       exit(EXIT_FAILURE);
     }
 
@@ -5962,13 +6368,15 @@ int main(int argc, char **argv)
 
     if(::arg().asNum("threads")==1) {
       if (::arg().mustDo("pdns-distributes-queries")) {
-        startupLog->v(1)->info("Only one thread, no need to distribute queries ourselves");
+        SLOG(g_log<<Logger::Warning<<"Asked to run with pdns-distributes-queries set but no distributor threads, raising to 1"<<endl,
+             startupLog->v(1)->info("Only one thread, no need to distribute queries ourselves"));
         ::arg().set("pdns-distributes-queries")="no";
       }
     }
 
     if(::arg().mustDo("pdns-distributes-queries") && ::arg().asNum("distributor-threads") <= 0) {
-      startupLog->v(1)->info("Asked to run with pdns-distributes-queries set but no distributor threads, raising to 1");
+      SLOG(g_log<<Logger::Warning<<"Asked to run with pdns-distributes-queries set but no distributor threads, raising to 1"<<endl,
+           startupLog->v(1)->info("Asked to run with pdns-distributes-queries set but no distributor threads, raising to 1"));
       ::arg().set("distributor-threads")="1";
     }
 
@@ -5981,8 +6389,8 @@ int main(int argc, char **argv)
       cout<<::arg().helpstring(::arg()["help"])<<endl;
       exit(0);
     }
-    g_recCache = std::unique_ptr<MemRecursorCache>(new MemRecursorCache(::arg().asNum("record-cache-shards")));
-    g_negCache = std::unique_ptr<NegCache>(new NegCache(::arg().asNum("record-cache-shards")));
+    g_recCache = std::make_unique<MemRecursorCache>(::arg().asNum("record-cache-shards"));
+    g_negCache = std::make_unique<NegCache>(::arg().asNum("record-cache-shards"));
 
     g_quiet=::arg().mustDo("quiet");
     Logger::Urgency logUrgency = (Logger::Urgency)::arg().asNum("loglevel");

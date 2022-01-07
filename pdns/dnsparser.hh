@@ -34,6 +34,7 @@
 #include "dns.hh"
 #include "dnswriter.hh"
 #include "dnsname.hh"
+#include "noinitvector.hh"
 #include "pdnsexception.hh"
 #include "iputils.hh"
 #include "svc-records.hh"
@@ -233,17 +234,17 @@ public:
   static void regist(uint16_t cl, uint16_t ty, makerfunc_t* f, zmakerfunc_t* z, const char* name)
   {
     if(f)
-      getTypemap()[make_pair(cl,ty)]=f;
+      getTypemap()[pair(cl,ty)]=f;
     if(z)
-      getZmakermap()[make_pair(cl,ty)]=z;
+      getZmakermap()[pair(cl,ty)]=z;
 
-    getT2Namemap().insert(make_pair(make_pair(cl,ty), name));
-    getN2Typemap().insert(make_pair(name, make_pair(cl,ty)));
+    getT2Namemap().emplace(pair(cl, ty), name);
+    getN2Typemap().emplace(name, pair(cl, ty));
   }
 
   static void unregist(uint16_t cl, uint16_t ty) 
   {
-    pair<uint16_t, uint16_t> key=make_pair(cl, ty);
+    auto key = pair(cl, ty);
     getTypemap().erase(key);
     getZmakermap().erase(key);
   }
@@ -267,7 +268,7 @@ public:
 
   static const string NumberToType(uint16_t num, uint16_t classnum=1)
   {
-    t2namemap_t::const_iterator iter = getT2Namemap().find(make_pair(classnum, num));
+    auto iter = getT2Namemap().find(pair(classnum, num));
     if(iter == getT2Namemap().end()) 
       return "TYPE" + std::to_string(num);
       //      throw runtime_error("Unknown DNS type with numerical id "+std::to_string(num));
@@ -434,6 +435,9 @@ string simpleCompress(const string& label, const string& root="");
 void ageDNSPacket(char* packet, size_t length, uint32_t seconds);
 void ageDNSPacket(std::string& packet, uint32_t seconds);
 void editDNSPacketTTL(char* packet, size_t length, const std::function<uint32_t(uint8_t, uint16_t, uint16_t, uint32_t)>& visitor);
+void clearDNSPacketRecordTypes(vector<uint8_t>& packet, const std::set<QType>& qtypes);
+void clearDNSPacketRecordTypes(PacketBuffer& packet, const std::set<QType>& qtypes);
+void clearDNSPacketRecordTypes(char* packet, size_t& length, const std::set<QType>& qtypes);
 uint32_t getDNSPacketMinTTL(const char* packet, size_t length, bool* seenAuthSOA=nullptr);
 uint32_t getDNSPacketLength(const char* packet, size_t length);
 uint16_t getRecordsOfTypeCount(const char* packet, size_t length, uint8_t section, uint16_t type);
@@ -451,7 +455,7 @@ class DNSPacketMangler
 {
 public:
   explicit DNSPacketMangler(std::string& packet)
-    : d_packet((char*) packet.c_str()), d_length(packet.length()), d_notyouroffset(12), d_offset(d_notyouroffset)
+    : d_packet(packet.data()), d_length(packet.length()), d_notyouroffset(12), d_offset(d_notyouroffset)
   {}
   DNSPacketMangler(char* packet, size_t length)
     : d_packet(packet), d_length(length), d_notyouroffset(12), d_offset(d_notyouroffset)
@@ -486,7 +490,7 @@ public:
     const char* p = d_packet + d_offset;
     moveOffset(4);
     uint32_t ret;
-    memcpy(&ret, (void*)p, sizeof(ret));
+    memcpy(&ret, p, sizeof(ret));
     return ntohl(ret);
   }
   uint16_t get16BitInt()
@@ -494,7 +498,7 @@ public:
     const char* p = d_packet + d_offset;
     moveOffset(2);
     uint16_t ret;
-    memcpy(&ret, (void*)p, sizeof(ret));
+    memcpy(&ret, p, sizeof(ret));
     return ntohs(ret);
   }
 
@@ -517,7 +521,7 @@ public:
     moveOffset(4);
 
     uint32_t tmp;
-    memcpy(&tmp, (void*) p, sizeof(tmp));
+    memcpy(&tmp, p, sizeof(tmp));
     tmp = ntohl(tmp);
     if (tmp > decrease) {
       tmp -= decrease;

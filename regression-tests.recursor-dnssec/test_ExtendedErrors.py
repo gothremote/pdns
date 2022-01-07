@@ -7,21 +7,10 @@ from recursortests import RecursorTest
 class ExtendedErrorsRecursorTest(RecursorTest):
 
     _confdir = 'ExtendedErrors'
-    _config_template_default = """
-dnssec=validate
-daemon=no
-trace=yes
-packetcache-ttl=0
-packetcache-servfail-ttl=0
-max-cache-ttl=15
-threads=1
-loglevel=9
-disable-syslog=yes
-log-common-errors=yes
-"""
     _config_template = """
-    extended-resolution-errors=yes
-    """
+dnssec=validate
+extended-resolution-errors=yes
+"""
     _lua_config_file = """
     rpzFile('configs/%s/zone.rpz', { policyName="zone.rpz.", extendedErrorCode=15, extendedErrorExtra='Blocked by RPZ!'})
     """ % (_confdir)
@@ -119,6 +108,19 @@ log-common-errors=yes
             self.assertEqual(res.options[0].otype, 15)
             self.assertEqual(res.options[0], extendederrors.ExtendedErrorOption(7, b''))
 
+    def testAllExpired(self):
+        qname = 'servfail.nl.'
+        query = dns.message.make_query(qname, 'AAAA', want_dnssec=True)
+
+        for method in ("sendUDPQuery", "sendTCPQuery"):
+            sender = getattr(self, method)
+            res = sender(query, timeout=5.0)
+            self.assertRcodeEqual(res, dns.rcode.SERVFAIL)
+            self.assertEqual(res.edns, 0)
+            self.assertEqual(len(res.options), 1)
+            self.assertEqual(res.options[0].otype, 15)
+            self.assertEqual(res.options[0], extendederrors.ExtendedErrorOption(7, b''))
+
     def testBogus(self):
         qname = 'bogussig.ok.bad-dnssec.wb.sidnlabs.nl.'
         query = dns.message.make_query(qname, 'A', want_dnssec=True)
@@ -206,20 +208,9 @@ log-common-errors=yes
 class NoExtendedErrorsRecursorTest(RecursorTest):
 
     _confdir = 'ExtendedErrorsDisabled'
-    _config_template_default = """
-dnssec=validate
-daemon=no
-trace=yes
-packetcache-ttl=0
-packetcache-servfail-ttl=0
-max-cache-ttl=15
-threads=1
-loglevel=9
-disable-syslog=yes
-log-common-errors=yes
-"""
     _config_template = """
-    extended-resolution-errors=no
+dnssec=validate
+extended-resolution-errors=no
     """
     _roothints = None
 

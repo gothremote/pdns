@@ -45,13 +45,14 @@ typedef std::function<bool(dnsdist_ffi_stat_node_t*)> dnsdist_ffi_stat_node_visi
 
 struct dnsdist_ffi_stat_node_t
 {
-  dnsdist_ffi_stat_node_t(const StatNode& node_, const StatNode::Stat& self_, const StatNode::Stat& children_): node(node_), self(self_), children(children_)
+  dnsdist_ffi_stat_node_t(const StatNode& node_, const StatNode::Stat& self_, const StatNode::Stat& children_, std::optional<std::string>& reason_): node(node_), self(self_), children(children_), reason(reason_)
   {
   }
 
   const StatNode& node;
   const StatNode::Stat& self;
   const StatNode::Stat& children;
+  std::optional<std::string>& reason;
 };
 
 class DynBlockRulesGroup
@@ -107,6 +108,10 @@ private:
 
     bool warningRateExceeded(unsigned int count, const struct timespec& now) const
     {
+      if (!d_enabled) {
+        return false;
+      }
+
       if (d_warningRate == 0) {
         return false;
       }
@@ -176,7 +181,11 @@ private:
 
     bool warningRatioExceeded(unsigned int total, unsigned int count) const
     {
-      if (d_warningRate == 0) {
+      if (!d_enabled) {
+        return false;
+      }
+
+      if (d_warningRatio == 0.0) {
         return false;
       }
 
@@ -211,7 +220,7 @@ private:
     double d_warningRatio{0.0};
   };
 
-  typedef std::unordered_map<ComboAddress, Counts, ComboAddress::addressOnlyHash, ComboAddress::addressOnlyEqual> counts_t;
+  typedef std::unordered_map<AddressAndPortRange, Counts, AddressAndPortRange::hash> counts_t;
 
 public:
   DynBlockRulesGroup()
@@ -247,7 +256,7 @@ public:
     entry = DynBlockRule(reason, blockDuration, rate, warningRate, seconds, action);
   }
 
-  typedef std::function<bool(const StatNode&, const StatNode::Stat&, const StatNode::Stat&)> smtVisitor_t;
+  typedef std::function<std::tuple<bool, boost::optional<std::string>>(const StatNode&, const StatNode::Stat&, const StatNode::Stat&)> smtVisitor_t;
 
   void setSuffixMatchRule(unsigned int seconds, std::string reason, unsigned int blockDuration, DNSAction::Action action, smtVisitor_t visitor)
   {
@@ -259,6 +268,13 @@ public:
   {
     d_suffixMatchRule = DynBlockRule(reason, blockDuration, 0, 0, seconds, action);
     d_smtVisitorFFI = visitor;
+  }
+
+  void setMasks(uint8_t v4, uint8_t v6, uint8_t port)
+  {
+    d_v4Mask = v4;
+    d_v6Mask = v6;
+    d_portMask = port;
   }
 
   void apply()
@@ -329,15 +345,15 @@ private:
 
   bool checkIfQueryTypeMatches(const Rings::Query& query);
   bool checkIfResponseCodeMatches(const Rings::Response& response);
-  void addOrRefreshBlock(boost::optional<NetmaskTree<DynBlock> >& blocks, const struct timespec& now, const ComboAddress& requestor, const DynBlockRule& rule, bool& updated, bool warning);
+  void addOrRefreshBlock(boost::optional<NetmaskTree<DynBlock, AddressAndPortRange> >& blocks, const struct timespec& now, const AddressAndPortRange& requestor, const DynBlockRule& rule, bool& updated, bool warning);
   void addOrRefreshBlockSMT(SuffixMatchTree<DynBlock>& blocks, const struct timespec& now, const DNSName& name, const DynBlockRule& rule, bool& updated);
 
-  void addBlock(boost::optional<NetmaskTree<DynBlock> >& blocks, const struct timespec& now, const ComboAddress& requestor, const DynBlockRule& rule, bool& updated)
+  void addBlock(boost::optional<NetmaskTree<DynBlock, AddressAndPortRange> >& blocks, const struct timespec& now, const AddressAndPortRange& requestor, const DynBlockRule& rule, bool& updated)
   {
     addOrRefreshBlock(blocks, now, requestor, rule, updated, false);
   }
 
-  void handleWarning(boost::optional<NetmaskTree<DynBlock> >& blocks, const struct timespec& now, const ComboAddress& requestor, const DynBlockRule& rule, bool& updated)
+  void handleWarning(boost::optional<NetmaskTree<DynBlock, AddressAndPortRange> >& blocks, const struct timespec& now, const AddressAndPortRange& requestor, const DynBlockRule& rule, bool& updated)
   {
     addOrRefreshBlock(blocks, now, requestor, rule, updated, true);
   }
@@ -375,6 +391,9 @@ private:
   SuffixMatchNode d_excludedDomains;
   smtVisitor_t d_smtVisitor;
   dnsdist_ffi_stat_node_visitor_t d_smtVisitorFFI;
+  uint8_t d_v6Mask{128};
+  uint8_t d_v4Mask{32};
+  uint8_t d_portMask{0};
   bool d_beQuiet{false};
 };
 
@@ -384,11 +403,11 @@ public:
   static void run();
 
   /* return the (cached) number of hits per second for the top offenders, averaged over 60s */
-  static std::map<std::string, std::list<std::pair<Netmask, unsigned int>>> getHitsForTopNetmasks();
+  static std::map<std::string, std::list<std::pair<AddressAndPortRange, unsigned int>>> getHitsForTopNetmasks();
   static std::map<std::string, std::list<std::pair<DNSName, unsigned int>>> getHitsForTopSuffixes();
 
   /* get the the top offenders based on the current value of the counters */
-  static std::map<std::string, std::list<std::pair<Netmask, unsigned int>>> getTopNetmasks(size_t topN);
+  static std::map<std::string, std::list<std::pair<AddressAndPortRange, unsigned int>>> getTopNetmasks(size_t topN);
   static std::map<std::string, std::list<std::pair<DNSName, unsigned int>>> getTopSuffixes(size_t topN);
   static void purgeExpired(const struct timespec& now);
 
@@ -400,16 +419,19 @@ private:
 
   struct MetricsSnapshot
   {
-    std::map<std::string, std::list<std::pair<Netmask, unsigned int>>> nmgData;
+    std::map<std::string, std::list<std::pair<AddressAndPortRange, unsigned int>>> nmgData;
     std::map<std::string, std::list<std::pair<DNSName, unsigned int>>> smtData;
   };
 
-  /* Protects s_topNMGsByReason and s_topSMTsByReason. s_metricsData should only be accessed
-     by the dynamic blocks maintenance thread so it does not need a lock. */
-  static std::mutex s_topsMutex;
+  struct Tops
+  {
+    std::map<std::string, std::list<std::pair<AddressAndPortRange, unsigned int>>> topNMGsByReason;
+    std::map<std::string, std::list<std::pair<DNSName, unsigned int>>> topSMTsByReason;
+  };
+
+  static LockGuarded<Tops> s_tops;
+  /* s_metricsData should only be accessed by the dynamic blocks maintenance thread so it does not need a lock */
   // need N+1 datapoints to be able to do the diff after a collection point has been reached
   static std::list<MetricsSnapshot> s_metricsData;
-  static std::map<std::string, std::list<std::pair<Netmask, unsigned int>>> s_topNMGsByReason;
-  static std::map<std::string, std::list<std::pair<DNSName, unsigned int>>> s_topSMTsByReason;
   static size_t s_topN;
 };

@@ -104,7 +104,7 @@ try {
         queryTime.tv_sec = pr.d_pheader.ts.tv_sec;
         queryTime.tv_usec = pr.d_pheader.ts.tv_usec;
         uniqueId = getUniqueID();
-        ids[dh->id] = std::make_pair(uniqueId, queryTime);
+        ids[dh->id] = {uniqueId, queryTime};
       }
       else {
         const auto& it = ids.find(dh->id);
@@ -126,7 +126,7 @@ try {
       pbBuffer.clear();
       pdns::ProtoZero::Message pbMessage(pbBuffer);
       pbMessage.setType(dh->qr ? pdns::ProtoZero::Message::MessageType::DNSResponseType : pdns::ProtoZero::Message::MessageType::DNSQueryType);
-      pbMessage.setRequest(uniqueId, requestor, responder, qname, qtype, qclass, dh->id, false, pr.d_len);
+      pbMessage.setRequest(uniqueId, requestor, responder, qname, qtype, qclass, dh->id, pdns::ProtoZero::Message::TransportProtocol::UDP, pr.d_len);
       pbMessage.setTime(pr.d_pheader.ts.tv_sec, pr.d_pheader.ts.tv_usec);
 
       if (dh->qr) {

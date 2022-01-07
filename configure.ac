@@ -107,6 +107,8 @@ AS_IF([test "x$enable_dns_over_tls" != "xno"], [
   ])
 ])
 
+PDNS_ENABLE_IPCIPHER
+
 PDNS_CHECK_RAGEL([pdns/dnslabeltext.cc], [www.powerdns.com])
 PDNS_CHECK_CLOCK_GETTIME
 
@@ -170,9 +172,9 @@ AC_ARG_WITH([socketdir],
   [socketdir="$withval"]
 )
 
-modules="bind gmysql random"
+modules="bind gmysql"
 AC_ARG_WITH([modules],
-  [AS_HELP_STRING([--with-modules], [which backends to compile with @<:@default=bind gmysql random@:>@])],
+  [AS_HELP_STRING([--with-modules], [which backends to compile with @<:@default=bind gmysql@:>@])],
   [modules="$withval"]
 )
 
@@ -351,7 +353,6 @@ AC_CONFIG_FILES([
   modules/lmdbbackend/Makefile
   modules/lua2backend/Makefile
   modules/pipebackend/Makefile
-  modules/randombackend/Makefile
   modules/remotebackend/Makefile
   modules/tinydnsbackend/Makefile
 ])

@@ -58,6 +58,71 @@ Note that specifying an IP address without a netmask uses an implicit netmask of
 Like `allow-from`_, except reading from file.
 Overrides the `allow-from`_ setting. To use this feature, supply one netmask per line, with optional comments preceded by a "#".
 
+.. _setting-allow-notify-for:
+
+``allow-notify-for``
+---------------------
+.. versionadded:: 4.6.0
+
+-  Comma separated list of domain-names
+-  Default: (empty)
+
+Domain names specified in this list are used to permit incoming
+NOTIFY operations to wipe any cache entries that match the domain
+name. If this list is empty, all NOTIFY operations will be ignored.
+
+.. _setting-allow-notify-for-file:
+
+``allow-notify-for-file``
+-------------------------
+.. versionadded:: 4.6.0
+
+-  Path
+
+Like `allow-notify-for`_, except reading from file. To use this
+feature, supply one domain name per line, with optional comments
+preceded by a "#".
+
+NOTIFY-allowed zones can also be specified using `forward-zones-file`_.
+
+.. _setting-allow-notify-from:
+
+``allow-notify-from``
+---------------------
+.. versionadded:: 4.6.0
+
+-  IP addresses or netmasks, separated by commas
+-  Default: unset
+
+Netmasks (both IPv4 and IPv6) that are allowed to issue NOTIFY operations
+to the server.  NOTIFY operations from IP addresses not listed here are
+ignored and do not get an answer.
+
+When the Proxy Protocol is enabled (see `proxy-protocol-from`_), the
+recursor will check the address of the client IP advertised in the
+Proxy Protocol header instead of the one of the proxy.
+
+Note that specifying an IP address without a netmask uses an implicit
+netmask of /32 or /128.
+
+NOTIFY operations received from a client listed in one of these netmasks
+will be accepted and used to wipe any cache entries whose zones match
+the zone specified in the NOTIFY operation, but only if that zone (or
+one of its parents) is included in `allow-notify-for`_,
+`allow-notify-for-file`_, or `forward-zones-file`_ with a '^' prefix.
+
+.. _setting-allow-notify-from-file:
+
+``allow-notify-from-file``
+--------------------------
+.. versionadded:: 4.6.0
+
+-  Path
+
+Like `allow-notify-from`_, except reading from file. To use this
+feature, supply one netmask per line, with optional comments preceded
+by a "#".
+
 .. _setting-any-to-tcp:
 
 ``any-to-tcp``
@@ -95,11 +160,13 @@ Directory where the REST API stores its configuration and zones.
 ``api-key``
 -----------
 .. versionadded:: 4.0.0
+.. versionchanged:: 4.6.0
+  This setting now accepts a hashed and salted version.
 
 -  String
 -  Default: unset
 
-Static pre-shared authentication key for access to the REST API.
+Static pre-shared authentication key for access to the REST API. Since 4.6.0 the key can be hashed and salted using ``rec_control hash-password`` instead of being stored in the configuration in plaintext, but the plaintext version is still supported.
 
 .. _setting-api-readonly:
 
@@ -208,7 +275,8 @@ See :doc:`metrics`.
 -  Path to a Directory
 
 If set, chroot to this directory for more security.
-See :doc:`security`
+This is not recommended; instead, we recommend containing PowerDNS using operating system features.
+We ship systemd unit files with our packages to make this easy.
 
 Make sure that ``/dev/log`` is available from within the chroot.
 Logging will silently fail over time otherwise (on logrotate).
@@ -386,7 +454,7 @@ If `pdns-distributes-queries`_ is set, spawn this number of distributor threads 
 handle incoming queries and distribute them to other threads based on a hash of the query, to maximize the cache hit
 ratio.
 
-.. _settings-dot-to-auth-names:
+.. _setting-dot-to-auth-names:
 
 ``dot-to-auth-names``
 ---------------------
@@ -398,7 +466,7 @@ ratio.
 Force DoT to the listed authoritative nameservers. For this to work, DoT support has to be compiled in.
 Currently, the certificate is not checked for validity in any way.
 
-.. _settings-dot-to-port-853:
+.. _setting-dot-to-port-853:
 
 ``dot-to-port-853``
 -------------------
@@ -418,8 +486,8 @@ Enable DoT to forwarders that specify port 853.
 -  Netmask, as a string
 -  Default: None
 
-Enable DNS64 (:rfc:`6147`) support using the supplied /96 IPv6 prefix. This will generate 'fake' AAAA records for names
-with only `A` records, as well as 'fake' PTR records to make sure that reverse lookup of DNS64-generated IPv6 addresses
+Enable DNS64 (:rfc:`6147`) support using the supplied /96 IPv6 prefix. This will generate 'fake' ``AAAA`` records for names
+with only ``A`` records, as well as 'fake' ``PTR`` records to make sure that reverse lookup of DNS64-generated IPv6 addresses
 generate the right name.
 See :doc:`dns64` for more flexible but slower alternatives using Lua.
 
@@ -474,7 +542,7 @@ This can have odd effects, depending on your network, and may even be a security
 Therefore, the PowerDNS Recursor by default does not query private space IP addresses.
 This setting can be used to expand or reduce the limitations.
 
-Queries to addresses for zones as configured in any of the settings `forward-zones`_, `forward-zones-file`_ or `forward-zones-recurse`_ are performed regardless of these limitations.
+Queries for names in forward zones and to addresses as configured in any of the settings `forward-zones`_, `forward-zones-file`_ or `forward-zones-recurse`_ are performed regardless of these limitations.
 
 .. _setting-ecs-add-for:
 
@@ -704,6 +772,18 @@ Change to ``/dev/random`` if PowerDNS should block waiting for enough entropy to
 The path to the /etc/hosts file, or equivalent.
 This file can be used to serve data authoritatively using `export-etc-hosts`_.
 
+.. _setting-event-trace-enabled:
+
+``event-trace-enabled``
+-----------------------
+.. versionadded:: 4.6.0
+
+- Integer
+- Default: 0
+
+Enable the recording and logging of ref:`event traces`. This is an experimental feature subject to change.
+Possible values are 0: (disabled), 1 (add information to protobuf logging messages) and 2 (write to log) and 3 (both).
+
 .. _setting-export-etc-hosts:
 
 ``export-etc-hosts``
@@ -771,14 +851,20 @@ Same as `forward-zones`_, parsed from a file. Only 1 zone is allowed per line, s
 
     example.org=203.0.113.210, 192.0.2.4:5300
 
-Zones prefixed with a '+' are forwarded with the recursion-desired bit set, for which see `forward-zones-recurse`_.
-Default behaviour without '+' is as with `forward-zones`_.
+Zones prefixed with a '+' are treated as with
+`forward-zones-recurse`_.  Default behaviour without '+' is as with
+`forward-zones`_.
 
 .. versionchanged:: 4.0.0
 
   Comments are allowed, everything behind '#' is ignored.
 
 The DNSSEC notes from `forward-zones`_ apply here as well.
+
+.. versionchanged:: 4.6.0
+
+Zones prefixed with a '^' are added to the `allow-notify-for`_
+list. Both prefix characters can be used if desired, in any order.
 
 .. _setting-forward-zones-recurse:
 
@@ -788,7 +874,7 @@ The DNSSEC notes from `forward-zones`_ apply here as well.
 
 Like regular `forward-zones`_, but forwarded queries have the 'recursion desired' bit set to 1, meaning that this setting is intended to forward queries to other recursive servers.
 
-The DNSSEC notes from `forward-zones`_ apply here as well.
+See `forward-zones`_ for additional options (such as supplying multiple recursive servers) and an important note about DNSSEC.
 
 .. _setting-gettag-needs-edns-options:
 
@@ -1029,6 +1115,19 @@ Maximum number of seconds to cache an item in the DNS cache, no matter what the 
 Maximum number of incoming requests handled concurrently per tcp
 connection. This number must be larger than 0 and smaller than 65536
 and also smaller than `max-mthreads`.
+
+.. _setting-max-include-depth:
+
+``max-include-depth``
+----------------------
+
+.. versionadded:: 4.6.0
+
+-  Integer
+-  Default: 20
+
+Maximum number of nested ``$INCLUDE`` directives while processing a zone file.
+Zero mean no ``$INCLUDE`` directives will be accepted.
 
 .. _setting-max-generate-steps:
 
@@ -1411,7 +1510,8 @@ Maximum number of seconds to cache an item in the packet cache, no matter what t
 -  Integer
 -  Default: 60
 
-Maximum number of seconds to cache a 'server failure' answer in the packet cache.
+Maximum number of seconds to cache an answer indicating a failure to resolve in the packet cache.
+Before version 4.6.0 only ``ServFail`` answers were considered as such. Starting with 4.6.0, all responses with a code other than ``NoError`` and ``NXDomain``, or without records in the answer and authority sections, are considered as a failure to resolve.
 
 .. versionchanged:: 4.0.0
 
@@ -1454,6 +1554,8 @@ Ranges that are required to send a Proxy Protocol version 2 header in front of U
 Queries that are not prefixed with such a header will not be accepted from clients in these ranges. Queries prefixed by headers from clients that are not listed in these ranges will be dropped.
 
 Note that once a Proxy Protocol header has been received, the source address from the proxy header instead of the address of the proxy will be checked against the `allow-from`_ ACL.
+
+The dnsdist docs have `more information about the PROXY protocol <https://dnsdist.org/advanced/passing-source-address.html#proxy-protocol>`_.
 
 .. _setting-proxy-protocol-maximum-size:
 
@@ -1862,6 +1964,17 @@ Can be read out using ``rec_control top-remotes``.
 
 A list of comma-separated statistic names, that are prevented from being exported via SNMP, for performance reasons.
 
+.. _setting-structured-logging:
+
+``structured-logging``
+----------------------
+.. versionadded:: 4.6.0
+
+- Boolean
+- Default: yes
+
+Prefer structured logging when both an old style and a structured log messages is available.
+
 .. _setting-tcp-fast-open:
 
 ``tcp-fast-open``
@@ -1884,6 +1997,51 @@ The numerical value supplied is used as the queue size, 0 meaning disabled. See 
 -  Default: no (disabled)
 
 Enable TCP Fast Open Connect support, if available, on the outgoing connections to authoritative servers. See :ref:`tcp-fast-open-support`.
+
+.. _setting-tcp-out-max-idle-ms:
+
+``tcp-out-max-idle-ms``
+-----------------------
+.. versionadded:: 4.6.0
+
+-  Integer
+-  Default : 10000
+
+Time outgoing TCP/DoT connections are left idle in milliseconds or 0 if no limit. After having been idle for this time, the connection is eligible for closing.
+
+.. _setting-tcp-out-max-idle-per-auth:
+
+``tcp-out-max-idle-per-auth``
+-----------------------------
+.. versionadded:: 4.6.0
+
+-  Integer
+-  Default : 10
+
+Maximum number of idle outgoing TCP/DoT connections to a specific IP per thread, 0 means do not keep idle connections open.
+
+.. _setting-tcp-out-max-queries:
+
+``tcp-out-max-queries``
+-----------------------
+-  Integer
+-  Default : 0
+
+Maximum total number of queries per outgoing TCP/DoT connection, 0 means no limit. After this number of queries, the connection is
+closed and a new one will be created if needed.
+
+.. versionadded:: 4.6.0
+
+.. _setting-tcp-out-max-idle-per-thread:
+
+``tcp-out-max-idle-per-thread``
+-------------------------------
+.. versionadded:: 4.6.0
+
+-  Integer
+-  Default : 100
+
+Maximum number of idle outgoing TCP/DoT connections per thread, 0 means do not keep idle connections open.
 
 .. _setting-threads:
 
@@ -2108,6 +2266,18 @@ These IPs and subnets are allowed to access the webserver. Note that
 specifying an IP address without a netmask uses an implicit netmask
 of /32 or /128.
 
+.. _setting-webserver-hash-plaintext-credentials:
+
+``webserver-hash-plaintext-credentials``
+----------------------------------------
+..versionadded:: 4.6.0
+
+-  Boolean
+-  Default: no
+
+Whether passwords and API keys supplied in the configuration as plaintext should be hashed during startup, to prevent the plaintext versions from staying in memory. Doing so increases significantly the cost of verifying credentials and is thus disabled by default.
+Note that this option only applies to credentials stored in the configuration as plaintext, but hashed credentials are supported without enabling this option.
+
 .. _setting-webserver-loglevel:
 
 ``webserver-loglevel``
@@ -2153,10 +2323,13 @@ The value between the hooks is a UUID that is generated for each request. This c
 
 ``webserver-password``
 ----------------------
+.. versionchanged:: 4.6.0
+  This setting now accepts a hashed and salted version.
+
 -  String
 -  Default: unset
 
-Password required to access the webserver.
+Password required to access the webserver. Since 4.6.0 the password can be hashed and salted using ``rec_control hash-password`` instead of being present in the configuration in plaintext, but the plaintext version is still supported.
 
 .. _setting-webserver-port:
 

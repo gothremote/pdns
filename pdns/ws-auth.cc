@@ -58,6 +58,10 @@ static void patchZone(UeberBackend& B, HttpRequest* req, HttpResponse* resp);
 static const std::set<uint16_t> onlyOneEntryTypes = { QType::CNAME, QType::DNAME, QType::SOA };
 // QTypes that MUST NOT be used with any other QType on the same name.
 static const std::set<uint16_t> exclusiveEntryTypes = { QType::CNAME };
+// QTypes that MUST be at apex.
+static const std::set<uint16_t> atApexTypes = {QType::SOA, QType::DNSKEY};
+// QTypes that are NOT allowed at apex.
+static const std::set<uint16_t> nonApexTypes = {QType::DS};
 
 AuthWebServer::AuthWebServer() :
   d_start(time(nullptr)),
@@ -65,10 +69,10 @@ AuthWebServer::AuthWebServer() :
   d_min5(0),
   d_min1(0)
 {
-  if(arg().mustDo("webserver") || arg().mustDo("api")) {
-    d_ws = unique_ptr<WebServer>(new WebServer(arg()["webserver-address"], arg().asNum("webserver-port")));
-    d_ws->setApiKey(arg()["api-key"]);
-    d_ws->setPassword(arg()["webserver-password"]);
+  if (arg().mustDo("webserver") || arg().mustDo("api")) {
+    d_ws = std::make_unique<WebServer>(arg()["webserver-address"], arg().asNum("webserver-port"));
+    d_ws->setApiKey(arg()["api-key"], arg().mustDo("webserver-hash-plaintext-credentials"));
+    d_ws->setPassword(arg()["webserver-password"], arg().mustDo("webserver-hash-plaintext-credentials"));
     d_ws->setLogLevel(arg()["webserver-loglevel"]);
 
     NetmaskGroup acl;
@@ -1385,6 +1389,7 @@ static void gatherRecordsFromZone(const std::string& zonestring, vector<DNSResou
 
   ZoneParserTNG zpt(zonedata, zonename);
   zpt.setMaxGenerateSteps(::arg().asNum("max-generate-steps"));
+  zpt.setMaxIncludes(::arg().asNum("max-include-depth"));
 
   bool seenSOA=false;
 
@@ -1414,7 +1419,8 @@ static void gatherRecordsFromZone(const std::string& zonestring, vector<DNSResou
  *   *) no duplicates for QTypes that can only be present once per RRset
  *   *) hostnames are hostnames
  */
-static void checkNewRecords(vector<DNSResourceRecord>& records) {
+static void checkNewRecords(vector<DNSResourceRecord>& records, const DNSName& zone)
+{
   sort(records.begin(), records.end(),
     [](const DNSResourceRecord& rec_a, const DNSResourceRecord& rec_b) -> bool {
       /* we need _strict_ weak ordering */
@@ -1435,6 +1441,15 @@ static void checkNewRecords(vector<DNSResourceRecord>& records) {
       } else if (exclusiveEntryTypes.count(rec.qtype.getCode()) != 0 || exclusiveEntryTypes.count(previous.qtype.getCode()) != 0) {
         throw ApiException("RRset "+rec.qname.toString()+" IN "+rec.qtype.toString()+": Conflicts with another RRset");
       }
+    }
+
+    if (rec.qname == zone) {
+      if (nonApexTypes.count(rec.qtype.getCode()) != 0) {
+        throw ApiException("Record " + rec.qname.toString() + " IN " + rec.qtype.toString() + " is not allowed at apex");
+      }
+    }
+    else if (atApexTypes.count(rec.qtype.getCode()) != 0) {
+      throw ApiException("Record " + rec.qname.toString() + " IN " + rec.qtype.toString() + " is only allowed at apex");
     }
 
     // Check if the DNSNames that should be hostnames, are hostnames
@@ -1704,7 +1719,7 @@ static void apiServerZones(HttpRequest* req, HttpResponse* resp) {
       }
     }
 
-    checkNewRecords(new_records);
+    checkNewRecords(new_records, zonename);
 
     if (boolFromJson(document, "dnssec", false)) {
       checkDefaultDNSSECAlgos();
@@ -1773,7 +1788,7 @@ static void apiServerZones(HttpRequest* req, HttpResponse* resp) {
     }
   } else {
     try {
-      B.getAllDomains(&domains, true); // incl. disabled
+      B.getAllDomains(&domains, true, true); // incl. serial and disabled
     } catch(const PDNSException &e) {
       throw HttpInternalServerErrorException("Could not retrieve all domain information: " + e.reason);
     }
@@ -2032,7 +2047,7 @@ static void patchZone(UeberBackend& B, HttpRequest* req, HttpResponse* resp) {
               soa_edit_done = increaseSOARecord(rr, soa_edit_api_kind, soa_edit_kind);
             }
           }
-          checkNewRecords(new_records);
+          checkNewRecords(new_records, zonename);
         }
 
         if (replace_comments) {
@@ -2190,7 +2205,7 @@ static void apiServerSearchData(HttpRequest* req, HttpResponse* resp) {
   map<int,DomainInfo>::iterator val;
   Json::array doc;
 
-  B.getAllDomains(&domains, true);
+  B.getAllDomains(&domains, false, true);
 
   for(const DomainInfo& di: domains)
   {
@@ -2255,7 +2270,18 @@ static void apiServerCacheFlush(HttpRequest* req, HttpResponse* resp) {
 
   DNSName canon = apiNameToDNSName(req->getvars["domain"]);
 
-  uint64_t count = purgeAuthCachesExact(canon);
+  if (g_zoneCache.isEnabled()) {
+    DomainInfo di;
+    UeberBackend B;
+    if (B.getDomainInfo(canon, di, false)) {
+      // zone exists (uncached), add/update it in the zone cache.
+      // Handle this first, to avoid concurrent queries re-populating the other caches.
+      g_zoneCache.add(di.zone, di.id);
+    }
+  }
+
+  // purge entire zone from cache, not just zone-level records.
+  uint64_t count = purgeAuthCaches(canon.toString() + "$");
   resp->setJsonBody(Json::object {
       { "count", (int) count },
       { "result", "Flushed cache." }
@@ -2336,26 +2362,27 @@ void AuthWebServer::webThread()
   try {
     setThreadName("pdns/webserver");
     if(::arg().mustDo("api")) {
-      d_ws->registerApiHandler("/api/v1/servers/localhost/cache/flush", &apiServerCacheFlush);
-      d_ws->registerApiHandler("/api/v1/servers/localhost/config", &apiServerConfig);
-      d_ws->registerApiHandler("/api/v1/servers/localhost/search-data", &apiServerSearchData);
-      d_ws->registerApiHandler("/api/v1/servers/localhost/statistics", &apiServerStatistics);
-      d_ws->registerApiHandler("/api/v1/servers/localhost/tsigkeys/<id>", &apiServerTSIGKeyDetail);
-      d_ws->registerApiHandler("/api/v1/servers/localhost/tsigkeys", &apiServerTSIGKeys);
-      d_ws->registerApiHandler("/api/v1/servers/localhost/zones/<id>/axfr-retrieve", &apiServerZoneAxfrRetrieve);
-      d_ws->registerApiHandler("/api/v1/servers/localhost/zones/<id>/cryptokeys/<key_id>", &apiZoneCryptokeys);
-      d_ws->registerApiHandler("/api/v1/servers/localhost/zones/<id>/cryptokeys", &apiZoneCryptokeys);
-      d_ws->registerApiHandler("/api/v1/servers/localhost/zones/<id>/export", &apiServerZoneExport);
-      d_ws->registerApiHandler("/api/v1/servers/localhost/zones/<id>/metadata/<kind>", &apiZoneMetadataKind);
-      d_ws->registerApiHandler("/api/v1/servers/localhost/zones/<id>/metadata", &apiZoneMetadata);
-      d_ws->registerApiHandler("/api/v1/servers/localhost/zones/<id>/notify", &apiServerZoneNotify);
-      d_ws->registerApiHandler("/api/v1/servers/localhost/zones/<id>/rectify", &apiServerZoneRectify);
-      d_ws->registerApiHandler("/api/v1/servers/localhost/zones/<id>", &apiServerZoneDetail);
-      d_ws->registerApiHandler("/api/v1/servers/localhost/zones", &apiServerZones);
-      d_ws->registerApiHandler("/api/v1/servers/localhost", &apiServerDetail);
-      d_ws->registerApiHandler("/api/v1/servers", &apiServer);
-      d_ws->registerApiHandler("/api/docs", &apiDocs);
-      d_ws->registerApiHandler("/api", &apiDiscovery);
+      d_ws->registerApiHandler("/api/v1/servers/localhost/cache/flush", apiServerCacheFlush);
+      d_ws->registerApiHandler("/api/v1/servers/localhost/config", apiServerConfig);
+      d_ws->registerApiHandler("/api/v1/servers/localhost/search-data", apiServerSearchData);
+      d_ws->registerApiHandler("/api/v1/servers/localhost/statistics", apiServerStatistics);
+      d_ws->registerApiHandler("/api/v1/servers/localhost/tsigkeys/<id>", apiServerTSIGKeyDetail);
+      d_ws->registerApiHandler("/api/v1/servers/localhost/tsigkeys", apiServerTSIGKeys);
+      d_ws->registerApiHandler("/api/v1/servers/localhost/zones/<id>/axfr-retrieve", apiServerZoneAxfrRetrieve);
+      d_ws->registerApiHandler("/api/v1/servers/localhost/zones/<id>/cryptokeys/<key_id>", apiZoneCryptokeys);
+      d_ws->registerApiHandler("/api/v1/servers/localhost/zones/<id>/cryptokeys", apiZoneCryptokeys);
+      d_ws->registerApiHandler("/api/v1/servers/localhost/zones/<id>/export", apiServerZoneExport);
+      d_ws->registerApiHandler("/api/v1/servers/localhost/zones/<id>/metadata/<kind>", apiZoneMetadataKind);
+      d_ws->registerApiHandler("/api/v1/servers/localhost/zones/<id>/metadata", apiZoneMetadata);
+      d_ws->registerApiHandler("/api/v1/servers/localhost/zones/<id>/notify", apiServerZoneNotify);
+      d_ws->registerApiHandler("/api/v1/servers/localhost/zones/<id>/rectify", apiServerZoneRectify);
+      d_ws->registerApiHandler("/api/v1/servers/localhost/zones/<id>", apiServerZoneDetail);
+      d_ws->registerApiHandler("/api/v1/servers/localhost/zones", apiServerZones);
+      d_ws->registerApiHandler("/api/v1/servers/localhost", apiServerDetail);
+      d_ws->registerApiHandler("/api/v1/servers", apiServer);
+      d_ws->registerApiHandler("/api/v1", apiDiscoveryV1);
+      d_ws->registerApiHandler("/api/docs", apiDocs);
+      d_ws->registerApiHandler("/api", apiDiscovery);
     }
     if (::arg().mustDo("webserver")) {
       d_ws->registerWebHandler("/style.css", [this](HttpRequest *req, HttpResponse *resp){cssfunction(req, resp);});

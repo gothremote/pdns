@@ -395,7 +395,6 @@ SSqlStatement* SODBCStatement::nextRow(row_t& row)
 
   SQLFreeStmt(d_statement, SQL_CLOSE);
   throw SSqlException("Should not get here.");
-  return this;
 }
 
 // Constructor.
@@ -479,7 +478,7 @@ SSqlException SODBC::sPerrorException(const std::string& reason)
 
 std::unique_ptr<SSqlStatement> SODBC::prepare(const string& query, int nparams)
 {
-  return std::unique_ptr<SSqlStatement>(new SODBCStatement(query, m_log, nparams, m_connection));
+  return std::make_unique<SODBCStatement>(query, m_log, nparams, m_connection);
 }
 
 void SODBC::startTransaction()

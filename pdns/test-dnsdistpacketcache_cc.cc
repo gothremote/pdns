@@ -50,7 +50,7 @@ BOOST_AUTO_TEST_CASE(test_PacketCacheSimple) {
 
       uint32_t key = 0;
       boost::optional<Netmask> subnet;
-      DNSQuestion dq(&a, QType::A, QClass::IN, &remote, &remote, query, DNSQuestion::Protocol::DoUDP, &queryTime);
+      DNSQuestion dq(&a, QType::A, QClass::IN, &remote, &remote, query, dnsdist::Protocol::DoUDP, &queryTime);
       bool found = PC.get(dq, 0, &key, subnet, dnssecOK, receivedOverUDP);
       BOOST_CHECK_EQUAL(found, false);
       BOOST_CHECK(!subnet);
@@ -81,7 +81,7 @@ BOOST_AUTO_TEST_CASE(test_PacketCacheSimple) {
       pwQ.getHeader()->rd = 1;
       uint32_t key = 0;
       boost::optional<Netmask> subnet;
-      DNSQuestion dq(&a, QType::A, QClass::IN, &remote, &remote, query, DNSQuestion::Protocol::DoUDP, &queryTime);
+      DNSQuestion dq(&a, QType::A, QClass::IN, &remote, &remote, query, dnsdist::Protocol::DoUDP, &queryTime);
       bool found = PC.get(dq, 0, &key, subnet, dnssecOK, receivedOverUDP);
       if (found == true) {
         auto removed = PC.expungeByName(a);
@@ -100,7 +100,7 @@ BOOST_AUTO_TEST_CASE(test_PacketCacheSimple) {
       pwQ.getHeader()->rd = 1;
       uint32_t key = 0;
       boost::optional<Netmask> subnet;
-      DNSQuestion dq(&a, QType::A, QClass::IN, &remote, &remote, query, DNSQuestion::Protocol::DoUDP, &queryTime);
+      DNSQuestion dq(&a, QType::A, QClass::IN, &remote, &remote, query, dnsdist::Protocol::DoUDP, &queryTime);
       if (PC.get(dq, pwQ.getHeader()->id, &key, subnet, dnssecOK, receivedOverUDP)) {
         matches++;
       }
@@ -161,7 +161,7 @@ BOOST_AUTO_TEST_CASE(test_PacketCacheSharded) {
 
       uint32_t key = 0;
       boost::optional<Netmask> subnet;
-      DNSQuestion dq(&a, QType::AAAA, QClass::IN, &remote, &remote, query, DNSQuestion::Protocol::DoUDP, &queryTime);
+      DNSQuestion dq(&a, QType::AAAA, QClass::IN, &remote, &remote, query, dnsdist::Protocol::DoUDP, &queryTime);
       bool found = PC.get(dq, 0, &key, subnet, dnssecOK, receivedOverUDP);
       BOOST_CHECK_EQUAL(found, false);
       BOOST_CHECK(!subnet);
@@ -192,7 +192,7 @@ BOOST_AUTO_TEST_CASE(test_PacketCacheSharded) {
       pwQ.getHeader()->rd = 1;
       uint32_t key = 0;
       boost::optional<Netmask> subnet;
-      DNSQuestion dq(&a, QType::AAAA, QClass::IN, &remote, &remote, query, DNSQuestion::Protocol::DoUDP, &queryTime);
+      DNSQuestion dq(&a, QType::AAAA, QClass::IN, &remote, &remote, query, dnsdist::Protocol::DoUDP, &queryTime);
       if (PC.get(dq, pwQ.getHeader()->id, &key, subnet, dnssecOK, receivedOverUDP)) {
         matches++;
       }
@@ -257,7 +257,7 @@ BOOST_AUTO_TEST_CASE(test_PacketCacheTCP) {
       /* UDP */
       uint32_t key = 0;
       boost::optional<Netmask> subnet;
-      DNSQuestion dq(&a, QType::A, QClass::IN, &remote, &remote, query, DNSQuestion::Protocol::DoUDP, &queryTime);
+      DNSQuestion dq(&a, QType::A, QClass::IN, &remote, &remote, query, dnsdist::Protocol::DoUDP, &queryTime);
       bool found = PC.get(dq, 0, &key, subnet, dnssecOK, receivedOverUDP);
       BOOST_CHECK_EQUAL(found, false);
       BOOST_CHECK(!subnet);
@@ -272,7 +272,7 @@ BOOST_AUTO_TEST_CASE(test_PacketCacheTCP) {
       /* same but over TCP */
       uint32_t key = 0;
       boost::optional<Netmask> subnet;
-      DNSQuestion dq(&a, QType::A, QClass::IN, &remote, &remote, query, DNSQuestion::Protocol::DoTCP, &queryTime);
+      DNSQuestion dq(&a, QType::A, QClass::IN, &remote, &remote, query, dnsdist::Protocol::DoTCP, &queryTime);
       bool found = PC.get(dq, 0, &key, subnet, dnssecOK, !receivedOverUDP);
       BOOST_CHECK_EQUAL(found, false);
       BOOST_CHECK(!subnet);
@@ -316,7 +316,7 @@ BOOST_AUTO_TEST_CASE(test_PacketCacheServFailTTL) {
 
     uint32_t key = 0;
     boost::optional<Netmask> subnet;
-    DNSQuestion dq(&a, QType::A, QClass::IN, &remote, &remote, query, DNSQuestion::Protocol::DoUDP, &queryTime);
+    DNSQuestion dq(&a, QType::A, QClass::IN, &remote, &remote, query, dnsdist::Protocol::DoUDP, &queryTime);
     bool found = PC.get(dq, 0, &key, subnet, dnssecOK, receivedOverUDP);
     BOOST_CHECK_EQUAL(found, false);
     BOOST_CHECK(!subnet);
@@ -369,7 +369,7 @@ BOOST_AUTO_TEST_CASE(test_PacketCacheNoDataTTL) {
 
     uint32_t key = 0;
     boost::optional<Netmask> subnet;
-    DNSQuestion dq(&name, QType::A, QClass::IN, &remote, &remote, query, DNSQuestion::Protocol::DoUDP, &queryTime);
+    DNSQuestion dq(&name, QType::A, QClass::IN, &remote, &remote, query, dnsdist::Protocol::DoUDP, &queryTime);
     bool found = PC.get(dq, 0, &key, subnet, dnssecOK, receivedOverUDP);
     BOOST_CHECK_EQUAL(found, false);
     BOOST_CHECK(!subnet);
@@ -421,7 +421,7 @@ BOOST_AUTO_TEST_CASE(test_PacketCacheNXDomainTTL) {
 
     uint32_t key = 0;
     boost::optional<Netmask> subnet;
-    DNSQuestion dq(&name, QType::A, QClass::IN, &remote, &remote, query, DNSQuestion::Protocol::DoUDP, &queryTime);
+    DNSQuestion dq(&name, QType::A, QClass::IN, &remote, &remote, query, dnsdist::Protocol::DoUDP, &queryTime);
     bool found = PC.get(dq, 0, &key, subnet, dnssecOK, receivedOverUDP);
     BOOST_CHECK_EQUAL(found, false);
     BOOST_CHECK(!subnet);
@@ -470,7 +470,7 @@ static void threadMangler(unsigned int offset)
 
       uint32_t key = 0;
       boost::optional<Netmask> subnet;
-      DNSQuestion dq(&a, QType::A, QClass::IN, &remote, &remote, query, DNSQuestion::Protocol::DoUDP, &queryTime);
+      DNSQuestion dq(&a, QType::A, QClass::IN, &remote, &remote, query, dnsdist::Protocol::DoUDP, &queryTime);
       g_PC.get(dq, 0, &key, subnet, dnssecOK, receivedOverUDP);
 
       g_PC.insert(key, subnet, *(getFlagsFromDNSHeader(dq.getHeader())), dnssecOK, a, QType::A, QClass::IN, response, receivedOverUDP, 0, boost::none);
@@ -500,7 +500,7 @@ static void threadReader(unsigned int offset)
 
       uint32_t key = 0;
       boost::optional<Netmask> subnet;
-      DNSQuestion dq(&a, QType::A, QClass::IN, &remote, &remote, query, DNSQuestion::Protocol::DoUDP, &queryTime);
+      DNSQuestion dq(&a, QType::A, QClass::IN, &remote, &remote, query, dnsdist::Protocol::DoUDP, &queryTime);
       bool found = g_PC.get(dq, 0, &key, subnet, dnssecOK, receivedOverUDP);
       if (!found) {
 	g_missing++;
@@ -569,14 +569,14 @@ BOOST_AUTO_TEST_CASE(test_PCCollision) {
     GenericDNSPacketWriter<PacketBuffer>::optvect_t ednsOptions;
     EDNSSubnetOpts opt;
     opt.source = Netmask("10.0.59.220/32");
-    ednsOptions.push_back(std::make_pair(EDNSOptionCode::ECS, makeEDNSSubnetOptsString(opt)));
+    ednsOptions.emplace_back(EDNSOptionCode::ECS, makeEDNSSubnetOptsString(opt));
     pwQ.addOpt(512, 0, 0, ednsOptions);
     pwQ.commit();
 
     ComboAddress remote("192.0.2.1");
     struct timespec queryTime;
     gettime(&queryTime);
-    DNSQuestion dq(&qname, QType::AAAA, QClass::IN, &remote, &remote, query, DNSQuestion::Protocol::DoUDP, &queryTime);
+    DNSQuestion dq(&qname, QType::AAAA, QClass::IN, &remote, &remote, query, dnsdist::Protocol::DoUDP, &queryTime);
     bool found = PC.get(dq, 0, &key, subnetOut, dnssecOK, receivedOverUDP);
     BOOST_CHECK_EQUAL(found, false);
     BOOST_REQUIRE(subnetOut);
@@ -612,14 +612,14 @@ BOOST_AUTO_TEST_CASE(test_PCCollision) {
     GenericDNSPacketWriter<PacketBuffer>::optvect_t ednsOptions;
     EDNSSubnetOpts opt;
     opt.source = Netmask("10.0.167.48/32");
-    ednsOptions.push_back(std::make_pair(EDNSOptionCode::ECS, makeEDNSSubnetOptsString(opt)));
+    ednsOptions.emplace_back(EDNSOptionCode::ECS, makeEDNSSubnetOptsString(opt));
     pwQ.addOpt(512, 0, 0, ednsOptions);
     pwQ.commit();
 
     ComboAddress remote("192.0.2.1");
     struct timespec queryTime;
     gettime(&queryTime);
-    DNSQuestion dq(&qname, QType::AAAA, QClass::IN, &remote, &remote, query, DNSQuestion::Protocol::DoUDP, &queryTime);
+    DNSQuestion dq(&qname, QType::AAAA, QClass::IN, &remote, &remote, query, dnsdist::Protocol::DoUDP, &queryTime);
     bool found = PC.get(dq, 0, &secondKey, subnetOut, dnssecOK, receivedOverUDP);
     BOOST_CHECK_EQUAL(found, false);
     BOOST_CHECK_EQUAL(secondKey, key);
@@ -649,11 +649,11 @@ BOOST_AUTO_TEST_CASE(test_PCCollision) {
           pwFQ.getHeader()->id = 0x42;
           opt.source = Netmask("10." + std::to_string(idxA) + "." + std::to_string(idxB) + "." + std::to_string(idxC) + "/32");
           ednsOptions.clear();
-          ednsOptions.push_back(std::make_pair(EDNSOptionCode::ECS, makeEDNSSubnetOptsString(opt)));
+          ednsOptions.emplace_back(EDNSOptionCode::ECS, makeEDNSSubnetOptsString(opt));
           pwFQ.addOpt(512, 0, 0, ednsOptions);
           pwFQ.commit();
           secondKey = pc.getKey(qname.toDNSString(), qname.wirelength(), secondQuery, false);
-          auto pair = colMap.insert(std::make_pair(secondKey, opt.source));
+          auto pair = colMap.emplace(secondKey, opt.source);
           total++;
           if (!pair.second) {
             collisions++;
@@ -695,7 +695,7 @@ BOOST_AUTO_TEST_CASE(test_PCDNSSECCollision) {
     ComboAddress remote("192.0.2.1");
     struct timespec queryTime;
     gettime(&queryTime);
-    DNSQuestion dq(&qname, QType::AAAA, QClass::IN, &remote, &remote, query, DNSQuestion::Protocol::DoUDP, &queryTime);
+    DNSQuestion dq(&qname, QType::AAAA, QClass::IN, &remote, &remote, query, dnsdist::Protocol::DoUDP, &queryTime);
     bool found = PC.get(dq, 0, &key, subnetOut, true, receivedOverUDP);
     BOOST_CHECK_EQUAL(found, false);
 

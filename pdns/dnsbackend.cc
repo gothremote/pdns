@@ -171,7 +171,7 @@ void BackendMakerClass::launch(const string &instr)
         throw ArgException("Trying to launch unknown backend '"+module+"'");
     }
     d_repository[module]->declareArguments(name);
-    d_instances.push_back(make_pair(module,name));
+    d_instances.emplace_back(module, name);
   }
 }
 
@@ -246,25 +246,31 @@ bool DNSBackend::getSOA(const DNSName &domain, SOAData &sd)
   S.inc("backend-queries");
 
   DNSResourceRecord rr;
-  rr.auth = true;
-
   int hits=0;
 
-  while(this->get(rr)) {
-    if (rr.qtype != QType::SOA) throw PDNSException("Got non-SOA record when asking for SOA");
-    hits++;
-    fillSOAData(rr.content, sd);
-    sd.domain_id=rr.domain_id;
-    sd.ttl=rr.ttl;
+  sd.db = nullptr;
+
+  try {
+    while (this->get(rr)) {
+      if (rr.qtype != QType::SOA) {
+        throw PDNSException("Got non-SOA record when asking for SOA, zone: '" + domain.toLogString() + "'");
+      }
+      hits++;
+      sd.qname = domain;
+      sd.ttl = rr.ttl;
+      sd.db = this;
+      sd.domain_id = rr.domain_id;
+      fillSOAData(rr.content, sd);
+    }
+  }
+  catch (...) {
+    while (this->get(rr)) {
+      ;
+    }
+    throw;
   }
 
-  if(!hits)
-    return false;
-
-  sd.qname = domain;
-  sd.db=this;
-
-  return true;
+  return hits;
 }
 
 bool DNSBackend::get(DNSZoneRecord& dzr)
@@ -298,7 +304,7 @@ bool DNSBackend::getBeforeAndAfterNames(uint32_t id, const DNSName& zonename, co
   return ret;
 }
 
-void DNSBackend::getAllDomains(vector<DomainInfo>* domains, bool include_disabled)
+void DNSBackend::getAllDomains(vector<DomainInfo>* domains, bool getSerial, bool include_disabled)
 {
   if (g_zoneCache.isEnabled()) {
     g_log << Logger::Error << "One of the backends does not support zone caching. Put zone-cache-refresh-interval=0 in the config file to disable this cache." << endl;
@@ -340,7 +346,7 @@ void fillSOAData(const string &content, SOAData &data)
 
   try {
     data.nameserver = DNSName(parts.at(0));
-    data.hostmaster = DNSName(attodot(parts.at(1))); // ahu@ds9a.nl -> ahu.ds9a.nl, piet.puk@ds9a.nl -> piet\.puk.ds9a.nl
+    data.hostmaster = DNSName(parts.at(1));
     data.serial = pdns_stou(parts.at(2).c_str());
     data.refresh = pdns_stou(parts.at(3).c_str());
     data.retry = pdns_stou(parts.at(4).c_str());
@@ -348,6 +354,6 @@ void fillSOAData(const string &content, SOAData &data)
     data.minimum = pdns_stou(parts.at(6).c_str());
   }
   catch(const std::out_of_range& oor) {
-    throw PDNSException("Out of range exception parsing "+content);
+    throw PDNSException("Out of range exception parsing '" + content + "'");
   }
 }

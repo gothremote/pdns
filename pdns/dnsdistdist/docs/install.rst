@@ -42,15 +42,24 @@ dnsdist is also available in `FreeBSD ports <http://www.freshports.org/dns/dnsdi
 Installing from Source
 ----------------------
 
-In order to compile dnsdist, a modern compiler with C++ 2011 support (like GCC 4.8+ or clang 3.5+) and GNU make are required.
+In order to compile dnsdist, a modern compiler with C++ 2017 support and GNU make are required.
 dnsdist depends on the following libraries:
 
 * `Boost <http://boost.org/>`_
 * `Lua <http://www.lua.org/>`_ 5.1+ or `LuaJit <http://luajit.org/>`_
 * `Editline (libedit) <http://thrysoee.dk/editline/>`_
-* `libsodium <https://download.libsodium.org/doc/>`_ (optional)
+* `libfstrm <https://github.com/farsightsec/fstrm>`_ (optional, dnstap support)
+* `GnuTLS <https://www.gnutls.org/>`_ (optional, DoT and outgoing DoH support)
+* `libh2o <https://github.com/h2o/h2o>`_ (optional, incoming DoH support)
+* `libcap <https://sites.google.com/site/fullycapable/>`_ (optional, capabilities support)
+* `libsodium <https://download.libsodium.org/doc/>`_ (optional, DNSCrypt and console encryption support)
+* `LMDB <http://www.lmdb.tech/doc/>`_ (optional, LMDB support)
+* `net-snmp <http://www.net-snmp.org/>`_ (optional, SNMP support)
+* `nghttp2 <https://nghttp2.org/>`_ (optional, outgoing DoH support)
+* `OpenSSL <https://www.openssl.org/>`_ (optional, DoT and DoH support)
 * `protobuf <https://developers.google.com/protocol-buffers/>`_ (optional, not needed as of 1.6.0)
 * `re2 <https://github.com/google/re2>`_ (optional)
+* `TinyCDB <https://www.corpit.ru/mjt/tinycdb.html>` (optional, CDB support)
 
 Should :program:`dnsdist` be run on a system with systemd, it is highly recommended to have
 the systemd header files (``libsystemd-dev`` on Debian and ``systemd-devel`` on CentOS)
@@ -98,3 +107,36 @@ OS Specific Instructions
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
 None, really.
+
+Build options
+~~~~~~~~~~~~~
+
+Our ``configure`` script provides a fair number of options with regard to which features should be enabled, as well as which libraries should be used. In addition to these options, more features can be disabled at compile-time by defining the following symbols:
+
+* ``DISABLE_BUILTIN_HTML`` removes the built-in web pages
+* ``DISABLE_CARBON`` for carbon support
+* ``DISABLE_COMPLETION`` for completion support in the console
+* ``DISABLE_DEPRECATED_DYNBLOCK`` for legacy dynamic blocks not using the new ``DynBlockRulesGroup`` interface
+* ``DISABLE_ECS_ACTIONS`` to disable actions altering EDNS Client Subnet
+* ``DISABLE_LUA_WEB_HANDLERS`` for custom Lua web handlers support
+* ``DISABLE_PROMETHEUS`` for prometheus
+* ``DISABLE_PROTOBUF`` for protocol-buffer support, including dnstap
+* ``DISABLE_RECVMMSG`` for ``recvmmsg`` support
+* ``DISABLE_RULES_ALTERING_QUERIES`` to remove rules altering the content of queries
+* ``DISABLE_SECPOLL`` for security polling
+* ``DISABLE_WEB_CONFIG`` to disable accessing the configuration via the web interface
+
+Additionally several Lua bindings can be removed when they are not needed, as they increase the memory required during compilation and the size of the final binary:
+
+* ``DISABLE_CLIENT_STATE_BINDINGS``
+* ``DISABLE_COMBO_ADDR_BINDINGS``
+* ``DISABLE_DNSHEADER_BINDINGS``
+* ``DISABLE_DNSNAME_BINDINGS``
+* ``DISABLE_DOWNSTREAM_BINDINGS``
+* ``DISABLE_NETMASK_BINDINGS``
+* ``DISABLE_NON_FFI_DQ_BINDINGS``
+* ``DISABLE_PACKETCACHE_BINDINGS``
+* ``DISABLE_POLICIES_BINDINGS``
+* ``DISABLE_QPS_LIMITER_BINDINGS``
+* ``DISABLE_SUFFIX_MATCH_BINDINGS``
+* ``DISABLE_TOP_N_BINDINGS``

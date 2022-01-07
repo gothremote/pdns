@@ -1,0 +1,335 @@
+Changelogs for 4.6.X
+====================
+
+.. changelog::
+  :version: 4.6.0
+  :released: 17th of December 2021
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 11091
+
+    Do not generate event trace records for Lua hooks if no Lua hook is defined.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 11092
+
+    Remove capability requirements from Docker images.
+
+.. changelog::
+  :version: 4.6.0-rc1
+  :released: 3rd of December 2021
+
+  .. change::
+    :tags: Bug Fixes
+    :pullreq: 11055
+    :tickets: 10982
+
+    Condition to HAVE_SYSTEMD_WITH_RUNTIME_DIR_ENV is reversed.
+    During build, the runtime directory in the service files for virtual-hosting are now correctly generated.
+
+  .. change::
+    :tags: Bug Fixes
+    :pullreq: 11025
+    :tickets: 10994, 11010
+
+    Do cache negative answers, even when the response was ECS-scoped.
+
+  .. change::
+    :tags: Bug Fixes
+    :pullreq: 11022
+    :tickets: 11018
+
+    Fix logic botch in TCP code introduced by notify handling in 4.6.0-beta2.
+
+  .. change::
+    :tags: Bug Fixes
+    :pullreq: 11016
+    :tickets: 11005
+
+    Include sys/time.h; needed on musl.
+
+.. changelog::
+  :version: 4.6.0-beta2
+  :released: 17th of November 2021
+
+  .. change::
+    :tags: Bug Fixes
+    :pullreq: 10980
+    :tickets: 10936
+
+    Return the proper extended error code on specific validation failures.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10751
+    :tickets: 7014
+
+    Add support for NOTIFY queries to wipe cache entries (Kevin P. Fleming).
+
+  .. change::
+    :tags: Bug Fixes
+    :pullreq: 10971
+
+    We need a libcurl dev lib for the zone-to-cache function.
+
+.. changelog::
+  :version: 4.6.0-beta1
+  :released: 9th of November 2021
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10865
+
+    Return documented reply on /api/v1 access.
+
+  .. change::
+    :tags: Bug Fixes
+    :pullreq: 10943
+    :tickets: 10938
+
+    Credentials: EVP_PKEY_CTX_set1_scrypt_salt() takes an `unsigned char*`.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10919
+    :tickets: 10852
+
+    Add more UDP error metrics (checksum, IPv6).
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10930,10965
+
+    Move to a stream based socket for the control channel.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10901
+
+    ZoneParserTNG: Stricter checks when loading a zone file.
+
+  .. change::
+    :tags: Bug Fixes
+    :pullreq: 10926
+
+    Fix regression of carbon-ourname.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10891
+
+    Implement fd-usage metric for OpenBSD.
+
+.. changelog::
+  :version: 4.6.0-alpha2
+  :released: 25th of October 2021
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10646,10868,10870
+
+    Move to modern C++ constructs (Rosen Penev).
+
+  .. change::
+    :tags: Bug Fixes
+    :pullreq: 10842
+
+    Correct appliedPolicyTrigger value for IP matches.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10843
+
+    NOD - use structured logging API.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10847
+
+    Sync dnsmessage.proto.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10567
+    :tickets: 7558,7420
+
+    Introduce experimental Event Trace function to get a more detailed view the work done by the Recursor.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10797
+    :tickets: 9135
+
+    Use packetcache-servfail-ttl for all packet cache entries considered an error reply.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10505,10794,10799
+
+    Add a periodic zones-to-cache function.
+
+  .. change::
+    :tags: Bug Fixes
+    :pullreq: 10768
+
+    Use the correct RPZ policy name when loading via XFR.
+
+  .. change::
+    :tags: Bug Fixes
+    :pullreq: 10760
+
+    Don't create file with wide permissions.
+
+  .. change::
+    :tags: Bug Fixes
+    :pullreq: 10757
+
+    Update the stats (serial, number of records, timestamp) for RPZ files.
+
+
+             
+.. changelog::
+  :version: 4.6.0-alpha1
+  :released: 29th of September 2021
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10669
+
+    TCP/DoT outgoing connection pooling.
+
+  .. change::
+    :tags: Bug Fixes
+    :pullreq: 10718
+    :tickets: 10713
+
+    Only the DNAME records are authoritative in DNAME answers.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10599
+
+    Be more strict when validating DS with respect to parent/child NSEC(3)s.
+
+  .. change::
+    :tags: Bug Fixes
+    :pullreq: 10633
+    :tickets: 10632
+
+    Pass the Lua context to follow up queries (follow CNAME, dns64).
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10605
+    :tickets: 10554
+
+    Keep a count of per RPZ (or filter) hits.
+
+  .. change::
+    :tags: Bug Fixes
+    :pullreq: 10622
+    :tickets: 10621
+
+    Detect a loop when the denial of the DS comes from the child zone.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10554,10738
+    :tickets: 10735
+
+    Modify per-thread cpu usage stats to be Prometheus-friendly.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10598
+
+    Refactor almost-expired code and add more detailed stats.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10546
+
+    Add dns64 metrics.
+
+  .. change::
+    :tags: Bug Fixes
+    :pullreq: 10602
+
+    Process policy and potential Drop action after Lua hooks.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10634
+    :tickets: 10631
+
+    Move MacOS to kqueue event handler and assorted compile fixes.
+
+  .. change::
+    :tags: Bug Fixes
+    :pullreq: 10565
+
+    Do not use DNSKEYs found below an apex for validation.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10122,10663
+    :tickets: 9077,10122
+
+    Cumulative and Prometheus friendly histograms.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10428,10659,10533
+
+    Rewrite of outgoing TCP code and implement DoT to auth or forwarders.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10467
+
+    Switch OpenBSD to kqueue event handler.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10396
+    :tickets: 10395
+
+    Take into account g_quiet when determining loglevel and change a few loglevels.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10349,10623
+
+    Move to tcpiohandler for outgoing TCP, sharing much more code with dnsdist.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10288
+
+    Deprecate offensive setting names.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10160
+
+    Implement structured logging API.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10264
+
+    Disable PMTU for IPv6.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10157
+
+    Move to hashed passwords for the web interface.
+
+  .. change::
+    :tags: Improvements
+    :pullreq: 10491
+
+    Rec: Add bindings to set arbitrary key-value metadata in logged messages

@@ -1,6 +1,7 @@
 #include "config.h"
 #include <boost/format.hpp>
 #include <boost/container/string.hpp>
+#include "credentials.hh"
 #include "dnsparser.hh"
 #include "sstuff.hh"
 #include "misc.hh"
@@ -11,6 +12,12 @@
 #include "uuid-utils.hh"
 #include "dnssecinfra.hh"
 #include "lock.hh"
+#include "dns_random.hh"
+#include "arguments.hh"
+
+#if defined(HAVE_LIBSODIUM)
+#include <sodium.h>
+#endif
 
 #ifndef RECURSOR
 #include "statbag.hh"
@@ -35,9 +42,9 @@ template<typename C> void doRun(const C& cmd, int mseconds=100)
   it.it_interval.tv_sec=0;
   it.it_interval.tv_usec=0;
 
-  signal(SIGVTALRM, alarmHandler);
-  setitimer(ITIMER_VIRTUAL, &it, 0);
-  
+  signal(SIGPROF, alarmHandler);
+  setitimer(ITIMER_PROF, &it, 0);
+
   unsigned int runs=0;
   g_stop=false;
   CPUTime dt;
@@ -88,7 +95,7 @@ struct MakeStringFromCharStarTest
   {
     string name("outpost.ds9a.nl");
     d_size += name.length();
-    
+
   }
   mutable int d_size;
 };
@@ -108,22 +115,81 @@ struct GetTimeTest
   }
 };
 
-std::mutex s_testlock;
-
 struct GetLockUncontendedTest
 {
   string getName() const
   {
-    return "getlock-uncontended-test";
+    return "get-lock-uncontended-test";
   }
 
   void operator()() const
   {
-    s_testlock.lock();
-    s_testlock.unlock();
+    for (size_t idx = 0; idx < 1000; idx++) {
+      d_testlock.lock();
+      ++d_value;
+      d_testlock.unlock();
+    }
   }
+private:
+  mutable std::mutex d_testlock;
+  mutable uint64_t d_value{0};
 };
 
+struct GetUniqueLockUncontendedTest
+{
+  string getName() const
+  {
+    return "get-unique-lock-uncontended-test";
+  }
+
+  void operator()() const
+  {
+    for (size_t idx = 0; idx < 1000; idx++) {
+      std::unique_lock<decltype(d_testlock)> lock(d_testlock);
+      ++d_value;
+    }
+  }
+private:
+  mutable std::mutex d_testlock;
+  mutable uint64_t d_value{0};
+};
+
+struct GetLockGuardUncontendedTest
+{
+  string getName() const
+  {
+    return "get-lock-guard-uncontended-test";
+  }
+
+  void operator()() const
+  {
+    for (size_t idx = 0; idx < 1000; idx++) {
+      std::lock_guard<decltype(d_testlock)> lock(d_testlock);
+      ++d_value;
+    }
+  }
+private:
+  mutable std::mutex d_testlock;
+  mutable uint64_t d_value{0};
+};
+
+struct GetLockGuardedUncontendedTest
+{
+  string getName() const
+  {
+    return "get-lock-guarded-uncontended-test";
+  }
+
+  void operator()() const
+  {
+    for (size_t idx = 0; idx < 1000; idx++) {
+      ++*(d_value.lock());
+    }
+  }
+
+private:
+  mutable LockGuarded<uint64_t> d_value{0};
+};
 
 struct StaticMemberTest
 {
@@ -146,8 +212,8 @@ struct StringtokTest
   {
     return "stringtok";
   }
-  
-  void operator()() const 
+
+  void operator()() const
   {
     string str("the quick brown fox jumped");
     vector<string> parts;
@@ -161,8 +227,8 @@ struct VStringtokTest
   {
     return "vstringtok";
   }
-  
-  void operator()() const 
+
+  void operator()() const
   {
     string str("the quick brown fox jumped");
     vector<pair<unsigned int, unsigned> > parts;
@@ -176,14 +242,14 @@ struct StringAppendTest
   {
     return "stringappend";
   }
-  
-  void operator()() const 
+
+  void operator()() const
   {
     string str;
     static char i;
     for(int n=0; n < 1000; ++n)
       str.append(1, i);
-    i++; 
+    i++;
   }
 };
 
@@ -194,14 +260,14 @@ struct BoostStringAppendTest
   {
     return "booststringappend";
   }
-  
-  void operator()() const 
+
+  void operator()() const
   {
     boost::container::string str;
     static char i;
     for(int n=0; n < 1000; ++n)
       str.append(1, i);
-    i++; 
+    i++;
   }
 };
 
@@ -374,12 +440,12 @@ struct TXTRecordTest
 
 struct GenericRecordTest
 {
-  explicit GenericRecordTest(int records, uint16_t type, const std::string& content) 
+  explicit GenericRecordTest(int records, uint16_t type, const std::string& content)
     : d_records(records), d_type(type), d_content(content) {}
 
   string getName() const
   {
-    return (boost::format("%d %s records") % d_records % 
+    return (boost::format("%d %s records") % d_records %
             DNSRecordContent::NumberToType(d_type)).str();
   }
 
@@ -581,7 +647,7 @@ struct timeval d_now;
 
 struct ParsePacketTest
 {
-  explicit ParsePacketTest(const vector<uint8_t>& packet, const std::string& name) 
+  explicit ParsePacketTest(const vector<uint8_t>& packet, const std::string& name)
     : d_packet(packet), d_name(name)
   {}
 
@@ -595,17 +661,17 @@ struct ParsePacketTest
     MOADNSParser mdp(false, (const char*)&*d_packet.begin(), d_packet.size());
     typedef map<pair<DNSName, QType>, set<DNSResourceRecord>, TCacheComp > tcache_t;
     tcache_t tcache;
-    
+
     struct {
             vector<DNSResourceRecord> d_result;
             bool d_aabit;
             int d_rcode;
     } lwr;
-    for(MOADNSParser::answers_t::const_iterator i=mdp.d_answers.begin(); i!=mdp.d_answers.end(); ++i) {          
+    for(MOADNSParser::answers_t::const_iterator i=mdp.d_answers.begin(); i!=mdp.d_answers.end(); ++i) {
       DNSResourceRecord rr;
       rr.qtype=i->first.d_type;
       rr.qname=i->first.d_name;
-    
+
       rr.ttl=i->first.d_ttl;
       rr.content=i->first.d_content->getZoneRepresentation();  // this should be the serialised form
       lwr.d_result.push_back(rr);
@@ -619,7 +685,7 @@ struct ParsePacketTest
 
 struct ParsePacketBareTest
 {
-  explicit ParsePacketBareTest(const vector<uint8_t>& packet, const std::string& name) 
+  explicit ParsePacketBareTest(const vector<uint8_t>& packet, const std::string& name)
     : d_packet(packet), d_name(name)
   {}
 
@@ -639,7 +705,7 @@ struct ParsePacketBareTest
 
 struct SimpleCompressTest
 {
-  explicit SimpleCompressTest(const std::string& name) 
+  explicit SimpleCompressTest(const std::string& name)
     : d_name(name)
   {}
 
@@ -863,6 +929,22 @@ struct NSEC3HashTest
   DNSName d_name = DNSName("www.example.com");
 };
 
+struct SharedLockTest
+{
+  string getName() const { return "Shared lock"; }
+
+  void operator()() const {
+    for (size_t idx = 0; idx < 1000; idx++) {
+      std::shared_lock<decltype(d_lock)> lock(d_lock);
+      ++d_value;
+    }
+  }
+
+private:
+  mutable std::shared_mutex d_lock;
+  mutable uint64_t d_value;
+};
+
 struct ReadWriteLockSharedTest
 {
   explicit ReadWriteLockSharedTest(ReadWriteLock& lock): d_lock(lock)
@@ -953,6 +1035,110 @@ private:
   bool d_contended;
 };
 
+struct CredentialsHashTest
+{
+  explicit CredentialsHashTest() {}
+
+  string getName() const
+  {
+    return "Credentials hashing test";
+  }
+
+  void operator()() const
+  {
+    hashPassword(d_password);
+  }
+
+private:
+  const std::string d_password{"test password"};
+};
+
+struct RndSpeedTest
+{
+  explicit RndSpeedTest(std::string which) : name(which){
+    ::arg().set("entropy-source", "If set, read entropy from this file")="/dev/urandom";
+    ::arg().set("rng", "") = which;
+    dns_random_init("", true);
+  }
+  string getName() const
+  {
+    return "Random test " + name;
+  }
+
+  void operator()() const
+  {
+    dns_random_uint16();
+  }
+
+  const std::string name;
+};
+
+struct CredentialsVerifyTest
+{
+  explicit CredentialsVerifyTest() {
+    d_hashed = hashPassword(d_password);
+  }
+
+  string getName() const
+  {
+    return "Credentials verification test";
+  }
+
+  void operator()() const
+  {
+    verifyPassword(d_hashed, d_password);
+  }
+
+private:
+  std::string d_hashed;
+  const std::string d_password{"test password"};
+};
+
+struct BurtleHashTest
+{
+  explicit BurtleHashTest(const string& str) : d_name(str) {}
+
+  string getName() const
+  {
+    return "BurtleHash";
+  }
+
+  void operator()() const
+  {
+    burtle(reinterpret_cast<const unsigned char*>(d_name.data()), d_name.length(), 0);
+
+  }
+
+private:
+  const string d_name;
+};
+
+
+#if defined(HAVE_LIBSODIUM)
+struct SipHashTest
+{
+  explicit SipHashTest(const string& str) : d_name(str)
+  {
+    crypto_shorthash_keygen(d_key);
+  }
+
+  string getName() const
+  {
+    return "SipHash";
+  }
+
+  void operator()() const
+  {
+    unsigned char out[crypto_shorthash_BYTES];
+    crypto_shorthash(out, reinterpret_cast<const unsigned char*>(d_name.data()), d_name.length(), d_key);
+  }
+
+private:
+  const string d_name;
+  unsigned char d_key[crypto_shorthash_KEYBYTES];
+};
+#endif
+
 int main(int argc, char** argv)
 try
 {
@@ -984,12 +1170,17 @@ try
 
   doRun(SimpleCompressTest("www.france.ds9a.nl"));
 
-  
+
   doRun(VectorExpandTest());
 
   doRun(GetTimeTest());
-  
+
   doRun(GetLockUncontendedTest());
+  doRun(GetUniqueLockUncontendedTest());
+  doRun(GetLockGuardUncontendedTest());
+  doRun(GetLockGuardedUncontendedTest());
+  doRun(SharedLockTest());
+
   {
     ReadWriteLock rwlock;
     doRun(ReadWriteLockSharedTest(rwlock));
@@ -1007,7 +1198,7 @@ try
   }
 
   doRun(StaticMemberTest());
-  
+
   doRun(ARecordTest(1));
   doRun(ARecordTest(2));
   doRun(ARecordTest(4));
@@ -1043,9 +1234,9 @@ try
   doRun(SOARecordTest(64));
 
   doRun(StringtokTest());
-  doRun(VStringtokTest());  
-  doRun(StringAppendTest());  
-  doRun(BoostStringAppendTest());  
+  doRun(VStringtokTest());
+  doRun(StringAppendTest());
+  doRun(BoostStringAppendTest());
 
   doRun(DNSNameParseTest());
   doRun(DNSNameRootTest());
@@ -1053,6 +1244,20 @@ try
   doRun(NetmaskTreeTest());
 
   doRun(UUIDGenTest());
+
+#if defined(HAVE_GETRANDOM)
+  doRun(RndSpeedTest("getrandom"));
+#endif
+#if defined(HAVE_ARC4RANDOM)
+  doRun(RndSpeedTest("arc4random"));
+#endif
+#if defined(HAVE_RANDOMBYTES_STIR)
+  doRun(RndSpeedTest("sodium"));
+#endif
+#if defined(HAVE_RAND_BYTES)
+  doRun(RndSpeedTest("openssl"));
+#endif
+  doRun(RndSpeedTest("urandom"));
 
   doRun(NSEC3HashTest(1, "ABCD"));
   doRun(NSEC3HashTest(10, "ABCD"));
@@ -1066,6 +1271,11 @@ try
   doRun(NSEC3HashTest(150, "ABCDABCDABCDABCDABCDABCDABCDABCD"));
   doRun(NSEC3HashTest(500, "ABCDABCDABCDABCDABCDABCDABCDABCD"));
 
+#if defined(HAVE_LIBSODIUM) && defined(HAVE_EVP_PKEY_CTX_SET1_SCRYPT_SALT)
+  doRun(CredentialsHashTest());
+  doRun(CredentialsVerifyTest());
+#endif
+
 #ifndef RECURSOR
   S.doRings();
 
@@ -1076,11 +1286,20 @@ try
   doRun(StatRingDNSNameQTypeTest(DNSName("example.com"), QType(1)));
 #endif
 
-  cerr<<"Total runs: " << g_totalRuns<<endl;
+  doRun(BurtleHashTest("a string of chars"));
+#ifdef HAVE_LIBSODIUM
+  doRun(SipHashTest("a string of chars"));
+#endif
 
+  cerr<<"Total runs: " << g_totalRuns<<endl;
 }
 catch(std::exception &e)
 {
   cerr<<"Fatal: "<<e.what()<<endl;
 }
 
+ArgvMap& arg()
+{	
+  static ArgvMap theArg;
+  return theArg;
+}

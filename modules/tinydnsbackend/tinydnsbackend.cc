@@ -29,8 +29,7 @@
 
 static string backendname = "[TinyDNSBackend] ";
 uint32_t TinyDNSBackend::s_lastId;
-std::mutex TinyDNSBackend::s_domainInfoLock;
-TinyDNSBackend::TDI_suffix_t TinyDNSBackend::s_domainInfo;
+LockGuarded<TinyDNSBackend::TDI_suffix_t> TinyDNSBackend::s_domainInfo;
 
 vector<string> TinyDNSBackend::getLocations()
 {
@@ -59,7 +58,7 @@ vector<string> TinyDNSBackend::getLocations()
   for (int i = 4; i >= 0; i--) {
     string searchkey(key, i + 2);
     try {
-      auto reader = std::unique_ptr<CDB>(new CDB(getArg("dbfile")));
+      auto reader = std::make_unique<CDB>(getArg("dbfile"));
       ret = reader->findall(searchkey);
     }
     catch (const std::exception& e) {
@@ -91,17 +90,16 @@ TinyDNSBackend::TinyDNSBackend(const string& suffix)
 
 void TinyDNSBackend::getUpdatedMasters(vector<DomainInfo>* retDomains)
 {
-  std::lock_guard<std::mutex> l(s_domainInfoLock); //TODO: We could actually lock less if we do it per suffix.
-
-  if (!s_domainInfo.count(d_suffix)) {
+  auto domainInfo = s_domainInfo.lock(); //TODO: We could actually lock less if we do it per suffix.
+  if (!domainInfo->count(d_suffix)) {
     TDI_t tmp;
-    s_domainInfo.insert(make_pair(d_suffix, tmp));
+    domainInfo->emplace(d_suffix, tmp);
   }
 
-  TDI_t* domains = &s_domainInfo[d_suffix];
+  TDI_t* domains = &(*domainInfo)[d_suffix];
 
   vector<DomainInfo> allDomains;
-  getAllDomains(&allDomains);
+  getAllDomains(&allDomains, true, false);
   if (domains->size() == 0 && !mustDo("notify-on-startup")) {
     for (vector<DomainInfo>::iterator di = allDomains.begin(); di != allDomains.end(); ++di) {
       di->notified_serial = 0;
@@ -136,11 +134,11 @@ void TinyDNSBackend::getUpdatedMasters(vector<DomainInfo>* retDomains)
 
 void TinyDNSBackend::setNotified(uint32_t id, uint32_t serial)
 {
-  std::lock_guard<std::mutex> l(s_domainInfoLock);
-  if (!s_domainInfo.count(d_suffix)) {
+  auto domainInfo = s_domainInfo.lock();
+  if (!domainInfo->count(d_suffix)) {
     throw PDNSException("Can't get list of domains to set the serial.");
   }
-  TDI_t* domains = &s_domainInfo[d_suffix];
+  TDI_t* domains = &(*domainInfo)[d_suffix];
   TDIById_t& domain_index = domains->get<tag_domainid>();
   TDIById_t::iterator itById = domain_index.find(id);
   if (itById == domain_index.end()) {
@@ -150,17 +148,17 @@ void TinyDNSBackend::setNotified(uint32_t id, uint32_t serial)
     DLOG(g_log << Logger::Debug << backendname << "Setting serial for " << itById->zone << " to " << serial << endl);
     domain_index.modify(itById, TDI_SerialModifier(serial));
   }
-  s_domainInfo[d_suffix] = *domains;
+  (*domainInfo)[d_suffix] = *domains;
 }
 
-void TinyDNSBackend::getAllDomains(vector<DomainInfo>* domains, bool include_disabled)
+void TinyDNSBackend::getAllDomains(vector<DomainInfo>* domains, bool getSerial, bool include_disabled)
 {
   d_isAxfr = true;
   d_isGetDomains = true;
   d_dnspacket = NULL;
 
   try {
-    d_cdbReader = std::unique_ptr<CDB>(new CDB(getArg("dbfile")));
+    d_cdbReader = std::make_unique<CDB>(getArg("dbfile"));
   }
   catch (const std::exception& e) {
     g_log << Logger::Error << e.what() << endl;
@@ -173,17 +171,25 @@ void TinyDNSBackend::getAllDomains(vector<DomainInfo>* domains, bool include_dis
 
   while (get(rr)) {
     if (rr.qtype.getCode() == QType::SOA && dupcheck.insert(rr.qname).second) {
-      SOAData sd;
-      fillSOAData(rr.content, sd);
-
       DomainInfo di;
       di.id = -1; //TODO: Check if this is ok.
       di.backend = this;
       di.zone = rr.qname;
-      di.serial = sd.serial;
-      di.notified_serial = sd.serial;
       di.kind = DomainInfo::Master;
       di.last_check = time(0);
+
+      if (getSerial) {
+        SOAData sd;
+        try {
+          fillSOAData(rr.content, sd);
+          di.serial = sd.serial;
+        }
+        catch (...) {
+          di.serial = 0;
+        }
+      }
+
+      di.notified_serial = di.serial;
       domains->push_back(di);
     }
   }
@@ -195,7 +201,7 @@ bool TinyDNSBackend::list(const DNSName& target, int domain_id, bool include_dis
   d_isGetDomains = false;
   string key = target.toDNSStringLC();
   try {
-    d_cdbReader = std::unique_ptr<CDB>(new CDB(getArg("dbfile")));
+    d_cdbReader = std::make_unique<CDB>(getArg("dbfile"));
   }
   catch (const std::exception& e) {
     g_log << Logger::Error << e.what() << endl;
@@ -225,7 +231,7 @@ void TinyDNSBackend::lookup(const QType& qtype, const DNSName& qdomain, int zone
   d_qtype = qtype;
 
   try {
-    d_cdbReader = std::unique_ptr<CDB>(new CDB(getArg("dbfile")));
+    d_cdbReader = std::make_unique<CDB>(getArg("dbfile"));
   }
   catch (const std::exception& e) {
     g_log << Logger::Error << e.what() << endl;

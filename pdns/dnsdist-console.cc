@@ -19,12 +19,14 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  */
+#include "config.h"
 
 #include <fstream>
 // we need this to get the home directory of the current user
 #include <pwd.h>
 #include <thread>
 
+#ifdef HAVE_LIBEDIT
 #if defined (__OpenBSD__) || defined(__NetBSD__)
 // If this is not undeffed, __attribute__ wil be redefined by /usr/include/readline/rlstdc.h
 #undef __STRICT_ANSI__
@@ -33,6 +35,7 @@
 #else
 #include <editline/readline.h>
 #endif
+#endif /* HAVE_LIBEDIT */
 
 #include "ext/json11/json11.hpp"
 
@@ -105,9 +108,10 @@ static void feedConfigDelta(const std::string& line)
     return;
   struct timeval now;
   gettimeofday(&now, 0);
-  g_confDelta.push_back({now,line});
+  g_confDelta.emplace_back(now, line);
 }
 
+#ifdef HAVE_LIBEDIT
 static string historyFile(const bool &ignoreHOME = false)
 {
   string ret;
@@ -127,6 +131,7 @@ static string historyFile(const bool &ignoreHOME = false)
   ret.append("/.dnsdist_history");
   return ret;
 }
+#endif /* HAVE_LIBEDIT */
 
 static bool getMsgLen32(int fd, uint32_t* len)
 {
@@ -245,12 +250,14 @@ void doClient(ComboAddress server, const std::string& command)
     return; 
   }
 
+#ifdef HAVE_LIBEDIT
   string histfile = historyFile();
   {
     ifstream history(histfile);
     string line;
-    while(getline(history, line))
+    while (getline(history, line)) {
       add_history(line.c_str());
+    }
   }
   ofstream history(histfile, std::ios_base::app);
   string lastline;
@@ -282,49 +289,85 @@ void doClient(ComboAddress server, const std::string& command)
       break;
     }
   }
+#else
+  errlog("Client mode requested but libedit support is not available");
+#endif /* HAVE_LIBEDIT */
   close(fd);
 }
 
+#ifdef HAVE_LIBEDIT
+static std::optional<std::string> getNextConsoleLine(ofstream& history, std::string& lastline)
+{
+  char* sline = readline("> ");
+  rl_bind_key('\t', rl_complete);
+  if (!sline) {
+    return std::nullopt;
+  }
+
+  string line(sline);
+  if (!line.empty() && line != lastline) {
+    add_history(sline);
+    history << sline <<endl;
+    history.flush();
+  }
+
+  lastline = line;
+  free(sline);
+
+  return line;
+}
+#else /* HAVE_LIBEDIT */
+static std::optional<std::string> getNextConsoleLine()
+{
+  std::string line;
+  if (!std::getline(std::cin, line)) {
+    return std::nullopt;
+  }
+  return line;
+}
+#endif /* HAVE_LIBEDIT */
+
 void doConsole()
 {
+#ifdef HAVE_LIBEDIT
   string histfile = historyFile(true);
   {
     ifstream history(histfile);
     string line;
-    while(getline(history, line))
+    while (getline(history, line)) {
       add_history(line.c_str());
+    }
   }
   ofstream history(histfile, std::ios_base::app);
   string lastline;
-  for(;;) {
-    char* sline = readline("> ");
-    rl_bind_key('\t',rl_complete);
-    if(!sline)
-      break;
+#endif /* HAVE_LIBEDIT */
 
-    string line(sline);
-    if(!line.empty() && line != lastline) {
-      add_history(sline);
-      history << sline <<endl;
-      history.flush();
-    }
-    lastline=line;
-    free(sline);
-    
-    if(line=="quit")
+  for (;;) {
+#ifdef HAVE_LIBEDIT
+    auto line = getNextConsoleLine(history, lastline);
+#else /* HAVE_LIBEDIT */
+    auto line = getNextConsoleLine();
+#endif /* HAVE_LIBEDIT */
+    if (!line) {
       break;
-    if(line=="help" || line=="?")
-      line="help()";
+    }
+
+    if (*line == "quit") {
+      break;
+    }
+    if (*line == "help" || *line == "?") {
+      line = "help()";
+    }
 
     string response;
     try {
-      bool withReturn=true;
+      bool withReturn = true;
     retry:;
       try {
-        std::lock_guard<std::mutex> lock(g_luamutex);
+        auto lua = g_lua.lock();
         g_outputBuffer.clear();
         resetLuaSideEffect();
-        auto ret=g_lua.executeCode<
+        auto ret = lua->executeCode<
           boost::optional<
             boost::variant<
               string, 
@@ -333,8 +376,8 @@ void doConsole()
               std::unordered_map<string, double>
               >
             >
-          >(withReturn ? ("return "+line) : line);
-        if(ret) {
+          >(withReturn ? ("return "+*line) : *line);
+        if (ret) {
           if (const auto dsValue = boost::get<shared_ptr<DownstreamState>>(&*ret)) {
             if (*dsValue) {
               cout<<(*dsValue)->getName()<<endl;
@@ -348,7 +391,7 @@ void doConsole()
           else if (const auto strValue = boost::get<string>(&*ret)) {
             cout<<*strValue<<endl;
           }
-          else if(const auto um = boost::get<std::unordered_map<string, double> >(&*ret)) {
+          else if (const auto um = boost::get<std::unordered_map<string, double> >(&*ret)) {
             using namespace json11;
             Json::object o;
             for(const auto& v : *um)
@@ -357,52 +400,61 @@ void doConsole()
             cout<<out.dump()<<endl;
           }
         }
-        else 
+        else {
           cout << g_outputBuffer << std::flush;
-        if(!getLuaNoSideEffect())
-          feedConfigDelta(line);
+        }
+
+        if (!getLuaNoSideEffect()) {
+          feedConfigDelta(*line);
+        }
       }
-      catch(const LuaContext::SyntaxErrorException&) {
-        if(withReturn) {
+      catch (const LuaContext::SyntaxErrorException&) {
+        if (withReturn) {
           withReturn=false;
           goto retry;
         }
         throw;
       }
     }
-    catch(const LuaContext::WrongTypeException& e) {
+    catch (const LuaContext::WrongTypeException& e) {
       std::cerr<<"Command returned an object we can't print: "<<std::string(e.what())<<std::endl;
       // tried to return something we don't understand
     }
-    catch(const LuaContext::ExecutionErrorException& e) {
-      if(!strcmp(e.what(),"invalid key to 'next'"))
+    catch (const LuaContext::ExecutionErrorException& e) {
+      if (!strcmp(e.what(), "invalid key to 'next'")) {
         std::cerr<<"Error parsing parameters, did you forget parameter name?";
-      else
-        std::cerr << e.what(); 
+      }
+      else {
+        std::cerr << e.what();
+      }
+
       try {
         std::rethrow_if_nested(e);
 
         std::cerr << std::endl;
-      } catch(const std::exception& ne) {
+      } catch (const std::exception& ne) {
         // ne is the exception that was thrown from inside the lambda
         std::cerr << ": " << ne.what() << std::endl;
       }
-      catch(const PDNSException& ne) {
+      catch (const PDNSException& ne) {
         // ne is the exception that was thrown from inside the lambda
         std::cerr << ": " << ne.reason << std::endl;
       }
     }
-    catch(const std::exception& e) {
+    catch (const std::exception& e) {
       std::cerr << e.what() << std::endl;      
     }
   }
 }
+
+#ifndef DISABLE_COMPLETION
 /**** CARGO CULT CODE AHEAD ****/
 const std::vector<ConsoleKeyword> g_consoleKeywords{
   /* keyword, function, parameters, description */
   { "addACL", true, "netmask", "add to the ACL set who can use this server" },
   { "addAction", true, "DNS rule, DNS action [, {uuid=\"UUID\", name=\"name\"}]", "add a rule" },
   { "addBPFFilterDynBlocks", true, "addresses, dynbpf[[, seconds=10], msg]", "This is the eBPF equivalent of addDynBlocks(), blocking a set of addresses for (optionally) a number of seconds, using an eBPF dynamic filter" },
+  { "addCapabilitiesToRetain", true, "capability or list of capabilities", "Linux capabilities to retain after startup, like CAP_BPF" },
   { "addConsoleACL", true, "netmask", "add a netmask to the console ACL" },
   { "addDNSCryptBind", true, "\"127.0.0.1:8443\", \"provider name\", \"/path/to/resolver.cert\", \"/path/to/resolver.key\", {reusePort=false, tcpFastOpenQueueSize=0, interface=\"\", cpus={}}", "listen to incoming DNSCrypt queries on 127.0.0.1 port 8443, with a provider name of `provider name`, using a resolver certificate and associated key stored respectively in the `resolver.cert` and `resolver.key` files. The fifth optional parameter is a table of parameters" },
   { "addDOHLocal", true, "addr, certFile, keyFile [, urls [, vars]]", "listen to incoming DNS over HTTPS queries on the specified address using the specified certificate and key. The last two parameters are tables" },
@@ -456,6 +508,9 @@ const std::vector<ConsoleKeyword> g_consoleKeywords{
   { "getDNSCryptBindCount", true, "", "returns the number of DNSCrypt listeners" },
   { "getDOHFrontend", true, "n", "returns the DOH frontend with index n" },
   { "getDOHFrontendCount", true, "", "returns the number of DoH listeners" },
+  { "getListOfAddressesOfNetworkInterface", true, "itf", "returns the list of addresses configured on a given network interface, as strings" },
+  { "getListOfNetworkInterfaces", true, "", "returns the list of network interfaces present on the system, as strings" },
+  { "getOutgoingTLSSessionCacheSize", true, "", "returns the number of TLS sessions (for outgoing connections) currently cached" },
   { "getPool", true, "name", "return the pool named `name`, or \"\" for the default pool" },
   { "getPoolServers", true, "pool", "return servers part of this pool" },
   { "getQueryCounters", true, "[max=10]", "show current buffer of query counters, limited by 'max' if provided" },
@@ -472,6 +527,7 @@ const std::vector<ConsoleKeyword> g_consoleKeywords{
   { "getTLSFrontend", true, "n", "returns the TLS frontend with index n" },
   { "getTLSFrontendCount", true, "", "returns the number of DoT listeners" },
   { "grepq", true, "Netmask|DNS Name|100ms|{\"::1\", \"powerdns.com\", \"100ms\"} [, n]", "shows the last n queries and responses matching the specified client address or range (Netmask), or the specified DNS Name, or slower than 100ms" },
+  { "hashPassword", true, "password [, workFactor]", "Returns a hashed and salted version of the supplied password, usable with 'setWebserverConfig()'"},
   { "HTTPHeaderRule", true, "name, regex", "matches DoH queries with a HTTP header 'name' whose content matches the regular expression 'regex'"},
   { "HTTPPathRegexRule", true, "regex", "matches DoH queries whose HTTP path matches 'regex'"},
   { "HTTPPathRule", true, "path", "matches DoH queries whose HTTP path is an exact match to 'path'"},
@@ -487,6 +543,7 @@ const std::vector<ConsoleKeyword> g_consoleKeywords{
   { "KeyValueStoreLookupRule", true, "kvs, lookupKey", "matches queries if the key is found in the specified Key Value store" },
   { "KeyValueStoreRangeLookupRule", true, "kvs, lookupKey", "matches queries if the key is found in the specified Key Value store" },
   { "leastOutstanding", false, "", "Send traffic to downstream server with least outstanding queries, with the lowest 'order', and within that the lowest recent latency"},
+  { "loadTLSEngine", true, "engineName [, defaultString]", "Load the OpenSSL engine named 'engineName', setting the engine default string to 'defaultString' if supplied"},
   { "LogAction", true, "[filename], [binary], [append], [buffered]", "Log a line for each query, to the specified file if any, to the console (require verbose) otherwise. When logging to a file, the `binary` optional parameter specifies whether we log in binary form (default) or in textual form, the `append` optional parameter specifies whether we open the file for appending or truncate each time (default), and the `buffered` optional parameter specifies whether writes to the file are buffered (default) or not." },
   { "LogResponseAction", true, "[filename], [append], [buffered]", "Log a line for each response, to the specified file if any, to the console (require verbose) otherwise. The `append` optional parameter specifies whether we open the file for appending or truncate each time (default), and the `buffered` optional parameter specifies whether writes to the file are buffered (default) or not." },
   { "LuaAction", true, "function", "Invoke a Lua function that accepts a DNSQuestion" },
@@ -497,7 +554,9 @@ const std::vector<ConsoleKeyword> g_consoleKeywords{
   { "LuaFFIRule", true, "function", "Invoke a Lua FFI function that filters DNS questions" },
   { "LuaResponseAction", true, "function", "Invoke a Lua function that accepts a DNSResponse" },
   { "LuaRule", true, "function", "Invoke a Lua function that filters DNS questions" },
+#ifdef HAVE_IPCIPHER
   { "makeIPCipherKey", true, "password", "generates a 16-byte key that can be used to pseudonymize IP addresses with IP cipher" },
+#endif /* HAVE_IPCIPHER */
   { "makeKey", true, "", "generate a new server access key, emit configuration line ready for pasting" },
   { "makeRule", true, "rule", "Make a NetmaskGroupRule() or a SuffixMatchNodeRule(), depending on how it is called" }  ,
   { "MaxQPSIPRule", true, "qps, [v4Mask=32 [, v6Mask=64 [, burst=qps [, expiration=300 [, cleanupDelay=60]]]]]", "matches traffic exceeding the qps limit per subnet" },
@@ -532,6 +591,7 @@ const std::vector<ConsoleKeyword> g_consoleKeywords{
   { "newServer", true, "{address=\"ip:port\", qps=1000, order=1, weight=10, pool=\"abuse\", retries=5, tcpConnectTimeout=5, tcpSendTimeout=30, tcpRecvTimeout=30, checkName=\"a.root-servers.net.\", checkType=\"A\", maxCheckFailures=1, mustResolve=false, useClientSubnet=true, source=\"address|interface name|address@interface\", sockets=1, reconnectOnUp=false}", "instantiate a server" },
   { "newServerPolicy", true, "name, function", "create a policy object from a Lua function" },
   { "newSuffixMatchNode", true, "", "returns a new SuffixMatchNode" },
+  { "newSVCRecordParameters", true, "priority, target, mandatoryParams, alpns, noDefaultAlpn [, port [, ech [, ipv4hints [, ipv6hints [, additionalParameters ]]]]]", "return a new SVCRecordParameters object, to use with SpoofSVCAction" },
   { "NegativeAndSOAAction", true, "nxd, zone, ttl, mname, rname, serial, refresh, retry, expire, minimum [, options]", "Turn a query into a NXDomain or NoData answer and sets a SOA record in the additional section" },
   { "NoneAction", true, "", "Does nothing. Subsequent rules are processed after this action" },
   { "NotRule", true, "selector", "Matches the traffic if the selector rule does not match" },
@@ -539,6 +599,7 @@ const std::vector<ConsoleKeyword> g_consoleKeywords{
   { "OrRule", true, "selectors", "Matches the traffic if one or more of the the selectors rules does match" },
   { "PoolAction", true, "poolname", "set the packet into the specified pool" },
   { "PoolAvailableRule", true, "poolname", "Check whether a pool has any servers available to handle queries" },
+  { "PoolOutstandingRule", true, "poolname, limit", "Check whether a pool has outstanding queries above limit" },
   { "printDNSCryptProviderFingerprint", true, "\"/path/to/providerPublic.key\"", "display the fingerprint of the provided resolver public key" },
   { "ProbaRule", true, "probability", "Matches queries with a given probability. 1.0 means always" },
   { "ProxyProtocolValueRule", true, "type [, value]", "matches queries with a specified Proxy Protocol TLV value of that type, optionally matching the content of the option as well" },
@@ -582,6 +643,8 @@ const std::vector<ConsoleKeyword> g_consoleKeywords{
   { "setConsoleMaximumConcurrentConnections", true, "max", "Set the maximum number of concurrent console connections" },
   { "setConsoleOutputMaxMsgSize", true, "messageSize", "set console message maximum size in bytes, default is 10 MB" },
   { "setDefaultBPFFilter", true, "filter", "When used at configuration time, the corresponding BPFFilter will be attached to every bind" },
+  { "setDoHDownstreamCleanupInterval", true, "interval", "minimum interval in seconds between two cleanups of the idle DoH downstream connections" },
+  { "setDoHDownstreamMaxIdleTime", true, "time", "Maximum time in seconds that a downstream DoH connection to a backend might stay idle" },
   { "setDynBlocksAction", true, "action", "set which action is performed when a query is blocked. Only DNSAction.Drop (the default) and DNSAction.Refused are supported" },
   { "setDynBlocksPurgeInterval", true, "sec", "set how often the expired dynamic block entries should be removed" },
   { "setDropEmptyQueries", true, "drop", "Whether to drop empty queries right away instead of sending a NOTIMP response" },
@@ -590,6 +653,7 @@ const std::vector<ConsoleKeyword> g_consoleKeywords{
   { "setECSSourcePrefixV6", true, "prefix-length", "the EDNS Client Subnet prefix-length used for IPv6 queries" },
   { "setKey", true, "key", "set access key to that key" },
   { "setLocal", true, "addr [, {doTCP=true, reusePort=false, tcpFastOpenQueueSize=0, interface=\"\", cpus={}}]", "reset the list of addresses we listen on to this address" },
+  { "setMaxCachedDoHConnectionsPerDownstream", true, "max", "Set the maximum number of inactive DoH connections to a backend cached by each worker DoH thread" },
   { "setMaxCachedTCPConnectionsPerDownstream", true, "max", "Set the maximum number of inactive TCP connections to a backend cached by each worker TCP thread" },
   { "setMaxTCPClientThreads", true, "n", "set the maximum of TCP client threads, handling TCP connections" },
   { "setMaxTCPConnectionDuration", true, "n", "set the maximum duration of an incoming TCP connection, in seconds. 0 means unlimited" },
@@ -621,11 +685,12 @@ const std::vector<ConsoleKeyword> g_consoleKeywords{
   { "setStaleCacheEntriesTTL", true, "n", "allows using cache entries expired for at most n seconds when there is no backend available to answer for a query" },
   { "setSyslogFacility", true, "facility", "set the syslog logging facility to 'facility'. Defaults to LOG_DAEMON" },
   { "setTCPDownstreamCleanupInterval", true, "interval", "minimum interval in seconds between two cleanups of the idle TCP downstream connections" },
+  { "setTCPDownstreamMaxIdleTime", true, "time", "Maximum time in seconds that a downstream TCP connection to a backend might stay idle" },
   { "setTCPInternalPipeBufferSize", true, "size", "Set the size in bytes of the internal buffer of the pipes used internally to distribute connections to TCP (and DoT) workers threads" },
-  { "setTCPUseSinglePipe", true, "bool", "whether the incoming TCP connections should be put into a single queue instead of using per-thread queues. Defaults to false" },
   { "setTCPRecvTimeout", true, "n", "set the read timeout on TCP connections from the client, in seconds" },
   { "setTCPSendTimeout", true, "n", "set the write timeout on TCP connections from the client, in seconds" },
   { "setUDPMultipleMessagesVectorSize", true, "n", "set the size of the vector passed to recvmmsg() to receive UDP messages. Default to 1 which means that the feature is disabled and recvmsg() is used instead" },
+  { "setUDPSocketBufferSizes", true, "recv, send", "Set the size of the receive (SO_RCVBUF) and send (SO_SNDBUF) buffers for incoming UDP sockets" },
   { "setUDPTimeout", true, "n", "set the maximum time dnsdist will wait for a response from a backend over UDP, in seconds" },
   { "setVerboseHealthChecks", true, "bool", "set whether health check errors will be logged" },
   { "setWebserverConfig", true, "[{password=string, apiKey=string, customHeaders, statsRequireAuthentication}]", "Updates webserver configuration" },
@@ -653,6 +718,7 @@ const std::vector<ConsoleKeyword> g_consoleKeywords{
   { "showTLSContexts", true, "", "list all the available TLS contexts" },
   { "showTLSErrorCounters", true, "", "show metrics about TLS handshake failures" },
   { "showVersion", true, "", "show the current version" },
+  { "showWebserverConfig", true, "", "Show the current webserver configuration" },
   { "shutdown", true, "", "shut down `dnsdist`" },
   { "snmpAgent", true, "enableTraps [, daemonSocket]", "enable `SNMP` support. `enableTraps` is a boolean indicating whether traps should be sent and `daemonSocket` an optional string specifying how to connect to the daemon agent"},
   { "SetAdditionalProxyProtocolValueAction", true, "type, value", "Add a Proxy Protocol TLV value of this type" },
@@ -662,7 +728,9 @@ const std::vector<ConsoleKeyword> g_consoleKeywords{
   { "SetECSOverrideAction", true, "override", "Whether an existing EDNS Client Subnet value should be overridden (true) or not (false). Subsequent rules are processed after this action" },
   { "SetECSPrefixLengthAction", true, "v4, v6", "Set the ECS prefix length. Subsequent rules are processed after this action" },
   { "SetMacAddrAction", true, "option", "Add the source MAC address to the query as EDNS0 option option. This action is currently only supported on Linux. Subsequent rules are processed after this action" },
+  { "SetEDNSOptionAction", true, "option, data", "Add arbitrary EDNS option and data to the query. Subsequent rules are processed after this action" },
   { "SetNoRecurseAction", true, "", "strip RD bit from the question, let it go through" },
+  { "setOutgoingDoHWorkerThreads", true, "n", "Number of outgoing DoH worker threads" },
   { "SetProxyProtocolValuesAction", true, "values", "Set the Proxy-Protocol values for this queries to 'values'" },
   { "SetSkipCacheAction", true, "", "Don’t lookup the cache for this query, don’t store the answer" },
   { "SetSkipCacheResponseAction", true, "", "Don’t store this response into the cache" },
@@ -675,6 +743,7 @@ const std::vector<ConsoleKeyword> g_consoleKeywords{
   { "SpoofAction", true, "ip|list of ips [, options]", "forge a response with the specified IPv4 (for an A query) or IPv6 (for an AAAA). If you specify multiple addresses, all that match the query type (A, AAAA or ANY) will get spoofed in" },
   { "SpoofCNAMEAction", true, "cname [, options]", "Forge a response with the specified CNAME value" },
   { "SpoofRawAction", true, "raw|list of raws [, options]", "Forge a response with the specified record data as raw bytes. If you specify multiple raws (it is assumed they match the query type), all will get spoofed in" },
+  { "SpoofSVCAction", true, "list of svcParams [, options]", "Forge a response with the specified SVC record data" } ,
   { "SuffixMatchNodeRule", true, "smn[, quiet]", "Matches based on a group of domain suffixes for rapid testing of membership. Pass true as second parameter to prevent listing of all domains matched" },
   { "TagRule", true, "name [, value]", "matches if the tag named 'name' is present, with the given 'value' matching if any" },
   { "TCAction", true, "", "create answer to query with TC and RD bits set, to move to TCP" },
@@ -739,6 +808,7 @@ char** my_completion( const char * text , int start,  int end)
   return matches;
 }
 }
+#endif /* DISABLE_COMPLETION */
 
 static void controlClientThread(ConsoleConnection&& conn)
 {
@@ -779,11 +849,11 @@ static void controlClientThread(ConsoleConnection&& conn)
         bool withReturn=true;
       retry:;
         try {
-          std::lock_guard<std::mutex> lock(g_luamutex);
+          auto lua = g_lua.lock();
         
           g_outputBuffer.clear();
           resetLuaSideEffect();
-          auto ret=g_lua.executeCode<
+          auto ret = lua->executeCode<
             boost::optional<
               boost::variant<
                 string, 
@@ -918,6 +988,8 @@ void controlThread(int fd, ComboAddress local)
 
 void clearConsoleHistory()
 {
+#ifdef HAVE_LIBEDIT
   clear_history();
+#endif /* HAVE_LIBEDIT */
   g_confDelta.clear();
 }

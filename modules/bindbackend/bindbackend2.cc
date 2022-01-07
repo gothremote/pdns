@@ -66,7 +66,7 @@
    or safeRemoveBBDomainInfo. These all lock as they should.
 
    Several functions need to traverse s_state to get data for the rest of PowerDNS. When doing so,
-   you need to manually take the s_state_lock (read).
+   you need to manually take the lock (read).
 
    Parsing zones happens with parseZone(), which fills a BB2DomainInfo object. This can then be stored with safePutBBDomainInfo.
 
@@ -74,17 +74,13 @@
    the records might be in use in other places.
 */
 
-Bind2Backend::state_t Bind2Backend::s_state;
+SharedLockGuarded<Bind2Backend::state_t> Bind2Backend::s_state;
 int Bind2Backend::s_first = 1;
 bool Bind2Backend::s_ignore_broken_records = false;
 
-ReadWriteLock Bind2Backend::s_state_lock;
 std::mutex Bind2Backend::s_supermaster_config_lock; // protects writes to config file
 std::mutex Bind2Backend::s_startup_lock;
 string Bind2Backend::s_binddirectory;
-
-template <typename T>
-std::mutex LookButDontTouch<T>::s_lock;
 
 BB2DomainInfo::BB2DomainInfo()
 {
@@ -137,44 +133,45 @@ void BB2DomainInfo::setCtime()
 
 bool Bind2Backend::safeGetBBDomainInfo(int id, BB2DomainInfo* bbd)
 {
-  ReadLock rl(&s_state_lock);
-  state_t::const_iterator iter = s_state.find(id);
-  if (iter == s_state.end())
+  auto state = s_state.read_lock();
+  state_t::const_iterator iter = state->find(id);
+  if (iter == state->end()) {
     return false;
+  }
   *bbd = *iter;
   return true;
 }
 
 bool Bind2Backend::safeGetBBDomainInfo(const DNSName& name, BB2DomainInfo* bbd)
 {
-  ReadLock rl(&s_state_lock);
-  typedef state_t::index<NameTag>::type nameindex_t;
-  nameindex_t& nameindex = boost::multi_index::get<NameTag>(s_state);
-
-  nameindex_t::const_iterator iter = nameindex.find(name);
-  if (iter == nameindex.end())
+  auto state = s_state.read_lock();
+  auto& nameindex = boost::multi_index::get<NameTag>(*state);
+  auto iter = nameindex.find(name);
+  if (iter == nameindex.end()) {
     return false;
+  }
   *bbd = *iter;
   return true;
 }
 
 bool Bind2Backend::safeRemoveBBDomainInfo(const DNSName& name)
 {
-  WriteLock rl(&s_state_lock);
+  auto state = s_state.write_lock();
   typedef state_t::index<NameTag>::type nameindex_t;
-  nameindex_t& nameindex = boost::multi_index::get<NameTag>(s_state);
+  nameindex_t& nameindex = boost::multi_index::get<NameTag>(*state);
 
   nameindex_t::iterator iter = nameindex.find(name);
-  if (iter == nameindex.end())
+  if (iter == nameindex.end()) {
     return false;
+  }
   nameindex.erase(iter);
   return true;
 }
 
 void Bind2Backend::safePutBBDomainInfo(const BB2DomainInfo& bbd)
 {
-  WriteLock rl(&s_state_lock);
-  replacing_insert(s_state, bbd);
+  auto state = s_state.write_lock();
+  replacing_insert(*state, bbd);
 }
 
 void Bind2Backend::setNotified(uint32_t id, uint32_t serial)
@@ -224,10 +221,9 @@ bool Bind2Backend::startTransaction(const DNSName& qname, int id)
     int fd = mkstemp(&d_transaction_tmpname.at(0));
     if (fd == -1) {
       throw DBException("Unable to create a unique temporary zonefile '" + d_transaction_tmpname + "': " + stringerror());
-      return false;
     }
 
-    d_of = std::unique_ptr<ofstream>(new ofstream(d_transaction_tmpname.c_str()));
+    d_of = std::make_unique<ofstream>(d_transaction_tmpname);
     if (!*d_of) {
       unlink(d_transaction_tmpname.c_str());
       close(fd);
@@ -326,9 +322,9 @@ void Bind2Backend::getUpdatedMasters(vector<DomainInfo>* changedDomains)
 {
   vector<DomainInfo> consider;
   {
-    ReadLock rl(&s_state_lock);
+    auto state = s_state.read_lock();
 
-    for (const auto& i : s_state) {
+    for (const auto& i : *state) {
       if (i.d_kind != DomainInfo::Master && this->alsoNotify.empty() && i.d_also_notify.empty())
         continue;
 
@@ -366,16 +362,16 @@ void Bind2Backend::getUpdatedMasters(vector<DomainInfo>* changedDomains)
   }
 }
 
-void Bind2Backend::getAllDomains(vector<DomainInfo>* domains, bool include_disabled)
+void Bind2Backend::getAllDomains(vector<DomainInfo>* domains, bool getSerial, bool include_disabled)
 {
   SOAData soadata;
 
   // prevent deadlock by using getSOA() later on
   {
-    ReadLock rl(&s_state_lock);
-    domains->reserve(s_state.size());
+    auto state = s_state.read_lock();
+    domains->reserve(state->size());
 
-    for (const auto& i : s_state) {
+    for (const auto& i : *state) {
       DomainInfo di;
       di.id = i.d_id;
       di.zone = i.d_name;
@@ -387,17 +383,19 @@ void Bind2Backend::getAllDomains(vector<DomainInfo>* domains, bool include_disab
     };
   }
 
-  for (DomainInfo& di : *domains) {
-    // do not corrupt di if domain supplied by another backend.
-    if (di.backend != this)
-      continue;
-    try {
-      this->getSOA(di.zone, soadata);
+  if (getSerial) {
+    for (DomainInfo& di : *domains) {
+      // do not corrupt di if domain supplied by another backend.
+      if (di.backend != this)
+        continue;
+      try {
+        this->getSOA(di.zone, soadata);
+      }
+      catch (...) {
+        continue;
+      }
+      di.serial = soadata.serial;
     }
-    catch (...) {
-      continue;
-    }
-    di.serial = soadata.serial;
   }
 }
 
@@ -405,9 +403,9 @@ void Bind2Backend::getUnfreshSlaveInfos(vector<DomainInfo>* unfreshDomains)
 {
   vector<DomainInfo> domains;
   {
-    ReadLock rl(&s_state_lock);
-    domains.reserve(s_state.size());
-    for (const auto& i : s_state) {
+    auto state = s_state.read_lock();
+    domains.reserve(state->size());
+    for (const auto& i : *state) {
       if (i.d_kind != DomainInfo::Slave)
         continue;
       DomainInfo sd;
@@ -478,8 +476,8 @@ void Bind2Backend::alsoNotifies(const DNSName& domain, set<string>* ips)
       (*ips).insert(str);
     }
   }
-  ReadLock rl(&s_state_lock);
-  for (const auto& i : s_state) {
+  auto state = s_state.read_lock();
+  for (const auto& i : *state) {
     if (i.d_name == domain) {
       for (const auto& it : i.d_also_notify) {
         (*ips).insert(it);
@@ -504,6 +502,7 @@ void Bind2Backend::parseZoneFile(BB2DomainInfo* bbd)
   auto records = std::make_shared<recordstorage_t>();
   ZoneParserTNG zpt(bbd->d_filename, bbd->d_name, s_binddirectory, d_upgradeContent);
   zpt.setMaxGenerateSteps(::arg().asNum("max-generate-steps"));
+  zpt.setMaxIncludes(::arg().asNum("max-include-depth"));
   DNSResourceRecord rr;
   string hashed;
   while (zpt.get(rr)) {
@@ -518,7 +517,7 @@ void Bind2Backend::parseZoneFile(BB2DomainInfo* bbd)
   bbd->d_loaded = true;
   bbd->d_checknow = false;
   bbd->d_status = "parsed into memory at " + nowTime();
-  bbd->d_records = LookButDontTouch<recordstorage_t>(records);
+  bbd->d_records = LookButDontTouch<recordstorage_t>(std::move(records));
   bbd->d_nsec3zone = nsec3zone;
   bbd->d_nsec3param = ns3pr;
 }
@@ -604,8 +603,8 @@ string Bind2Backend::DLDomStatusHandler(const vector<string>& parts, Utility::pi
     }
   }
   else {
-    ReadLock rl(&s_state_lock);
-    for (const auto& i : s_state) {
+    auto state = s_state.read_lock();
+    for (const auto& i : *state) {
       ret << i.d_name << ": " << (i.d_loaded ? "" : "[rejected]") << "\t" << i.d_status << "\n";
     }
   }
@@ -666,8 +665,8 @@ string Bind2Backend::DLDomExtendedStatusHandler(const vector<string>& parts, Uti
     }
   }
   else {
-    ReadLock rl(&s_state_lock);
-    for (const auto& state : s_state) {
+    auto rstate = s_state.read_lock();
+    for (const auto& state : *rstate) {
       printDomainExtendedStatus(ret, state);
     }
   }
@@ -682,8 +681,8 @@ string Bind2Backend::DLDomExtendedStatusHandler(const vector<string>& parts, Uti
 string Bind2Backend::DLListRejectsHandler(const vector<string>& parts, Utility::pid_t ppid)
 {
   ostringstream ret;
-  ReadLock rl(&s_state_lock);
-  for (const auto& i : s_state) {
+  auto rstate = s_state.read_lock();
+  for (const auto& i : *rstate) {
     if (!i.d_loaded)
       ret << i.d_name << "\t" << i.d_status << endl;
   }
@@ -745,6 +744,10 @@ Bind2Backend::Bind2Backend(const string& suffix, bool loadZones)
   setArgPrefix("bind" + suffix);
   d_logprefix = "[bind" + suffix + "backend]";
   d_hybrid = mustDo("hybrid");
+  if (d_hybrid && g_zoneCache.isEnabled()) {
+    throw PDNSException("bind-hybrid and the zone cache currently interoperate badly. Please disable the zone cache or stop using bind-hybrid");
+  }
+
   d_transaction_id = 0;
   s_ignore_broken_records = mustDo("ignore-broken-records");
   d_upgradeContent = ::arg().mustDo("upgrade-unknown-types");
@@ -783,8 +786,8 @@ void Bind2Backend::rediscover(string* status)
 
 void Bind2Backend::reload()
 {
-  WriteLock rwl(&s_state_lock);
-  for (const auto& i : s_state) {
+  auto state = s_state.write_lock();
+  for (const auto& i : *state) {
     i.d_checknow = true; // being a bit cheeky here, don't index state_t on this (mutable)
   }
 }
@@ -903,8 +906,8 @@ void Bind2Backend::loadConfig(string* status)
 
     set<DNSName> oldnames, newnames;
     {
-      ReadLock rl(&s_state_lock);
-      for (const BB2DomainInfo& bbd : s_state) {
+      auto state = s_state.read_lock();
+      for (const BB2DomainInfo& bbd : *state) {
         oldnames.insert(bbd.d_name);
       }
     }
@@ -1041,12 +1044,12 @@ void Bind2Backend::queueReloadAndStore(unsigned int id)
   try {
     if (!safeGetBBDomainInfo(id, &bbold))
       return;
+    bbold.d_checknow = false;
     BB2DomainInfo bbnew(bbold);
     /* make sure that nothing will be able to alter the existing records,
        we will load them from the zone file instead */
     bbnew.d_records = LookButDontTouch<recordstorage_t>();
     parseZoneFile(&bbnew);
-    bbnew.d_checknow = false;
     bbnew.d_wasRejectedLastReload = false;
     safePutBBDomainInfo(bbnew);
     g_log << Logger::Warning << "Zone '" << bbnew.d_name << "' (" << bbnew.d_filename << ") reloaded" << endl;
@@ -1054,16 +1057,18 @@ void Bind2Backend::queueReloadAndStore(unsigned int id)
   catch (PDNSException& ae) {
     ostringstream msg;
     msg << " error at " + nowTime() + " parsing '" << bbold.d_name << "' from file '" << bbold.d_filename << "': " << ae.reason;
-    g_log << Logger::Warning << " error parsing '" << bbold.d_name << "' from file '" << bbold.d_filename << "': " << ae.reason << endl;
+    g_log << Logger::Warning << "Error parsing '" << bbold.d_name << "' from file '" << bbold.d_filename << "': " << ae.reason << endl;
     bbold.d_status = msg.str();
+    bbold.d_lastcheck = time(nullptr);
     bbold.d_wasRejectedLastReload = true;
     safePutBBDomainInfo(bbold);
   }
   catch (std::exception& ae) {
     ostringstream msg;
     msg << " error at " + nowTime() + " parsing '" << bbold.d_name << "' from file '" << bbold.d_filename << "': " << ae.what();
-    g_log << Logger::Warning << " error parsing '" << bbold.d_name << "' from file '" << bbold.d_filename << "': " << ae.what() << endl;
+    g_log << Logger::Warning << "Error parsing '" << bbold.d_name << "' from file '" << bbold.d_filename << "': " << ae.what() << endl;
     bbold.d_status = msg.str();
+    bbold.d_lastcheck = time(nullptr);
     bbold.d_wasRejectedLastReload = true;
     safePutBBDomainInfo(bbold);
   }
@@ -1179,16 +1184,16 @@ void Bind2Backend::lookup(const QType& qtype, const DNSName& qname, int zoneId, 
   d_handle.qtype = qtype;
   d_handle.domain = std::move(domain);
 
-  if (!bbd.d_loaded) {
-    d_handle.reset();
-    throw DBException("Zone for '" + d_handle.domain.toLogString() + "' in '" + bbd.d_filename + "' temporarily not available (file missing, or master dead)"); // fsck
-  }
-
   if (!bbd.current()) {
     g_log << Logger::Warning << "Zone '" << d_handle.domain << "' (" << bbd.d_filename << ") needs reloading" << endl;
     queueReloadAndStore(bbd.d_id);
     if (!safeGetBBDomainInfo(d_handle.domain, &bbd))
       throw DBException("Zone '" + bbd.d_name.toLogString() + "' (" + bbd.d_filename + ") gone after reload"); // if we don't throw here, we crash for some reason
+  }
+
+  if (!bbd.d_loaded) {
+    d_handle.reset();
+    throw DBException("Zone for '" + d_handle.domain.toLogString() + "' in '" + bbd.d_filename + "' not loaded (file missing, corrupt or master dead)"); // fsck
   }
 
   d_handle.d_records = bbd.d_records.get();
@@ -1299,6 +1304,10 @@ bool Bind2Backend::list(const DNSName& target, int id, bool include_disabled)
   d_handle.reset();
   DLOG(g_log << "Bind2Backend constructing handle for list of " << id << endl);
 
+  if (!bbd.d_loaded) {
+    throw PDNSException("zone was not loaded, perhaps because of: " + bbd.d_status);
+  }
+
   d_handle.d_records = bbd.d_records.get(); // give it a copy, which will stay around
   d_handle.d_qname_iter = d_handle.d_records->begin();
   d_handle.d_qname_end = d_handle.d_records->end(); // iter now points to a vector of pointers to vector<BBResourceRecords>
@@ -1364,11 +1373,11 @@ BB2DomainInfo Bind2Backend::createDomainEntry(const DNSName& domain, const strin
 {
   int newid = 1;
   { // Find a free zone id nr.
-    ReadLock rl(&s_state_lock);
-    if (!s_state.empty()) {
+    auto state = s_state.read_lock();
+    if (!state->empty()) {
       // older (1.53) versions of boost have an expression for s_state.rbegin()
       // that is ambiguous in C++17. So construct it explicitly
-      newid = boost::make_reverse_iterator(s_state.end())->d_id + 1;
+      newid = boost::make_reverse_iterator(state->end())->d_id + 1;
     }
   }
 
@@ -1427,11 +1436,15 @@ bool Bind2Backend::searchRecords(const string& pattern, int maxResults, vector<D
     g_log << Logger::Warning << "Search for pattern '" << pattern << "'" << endl;
 
   {
-    ReadLock rl(&s_state_lock);
+    auto state = s_state.read_lock();
 
-    for (const auto& i : s_state) {
+    for (const auto& i : *state) {
       BB2DomainInfo h;
       if (!safeGetBBDomainInfo(i.d_id, &h)) {
+        continue;
+      }
+
+      if (!h.d_loaded) {
         continue;
       }
 

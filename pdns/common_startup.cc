@@ -64,6 +64,8 @@ double avg_latency{0.0};
 unique_ptr<TCPNameserver> TN;
 static vector<DNSDistributor*> g_distributors;
 vector<std::shared_ptr<UDPNameserver> > g_udpReceivers;
+NetmaskGroup g_proxyProtocolACL;
+size_t g_proxyProtocolMaximumSize;
 
 ArgvMap &arg()
 {
@@ -93,6 +95,8 @@ void declareArguments()
   ::arg().setSwitch("dnsupdate","Enable/Disable DNS update (RFC2136) support. Default is no.")="no";
   ::arg().setSwitch("write-pid","Write a PID file")="yes";
   ::arg().set("allow-dnsupdate-from","A global setting to allow DNS updates from these IP ranges.")="127.0.0.0/8,::1";
+  ::arg().set("proxy-protocol-from", "A Proxy Protocol header is only allowed from these subnets, and is mandatory then too.")="";
+  ::arg().set("proxy-protocol-maximum-size", "The maximum size of a proxy protocol payload, including the TLV values")="512";
   ::arg().setSwitch("send-signed-notify", "Send TSIG secured NOTIFY if TSIG key is configured for a zone") = "yes";
   ::arg().set("allow-unsigned-notify", "Allow unsigned notifications for TSIG secured zones") = "yes"; //FIXME: change to 'no' later
   ::arg().set("allow-unsigned-supermaster", "Allow supermasters to create zones without TSIG signed NOTIFY")="yes";
@@ -161,6 +165,8 @@ void declareArguments()
   ::arg().setSwitch("any-to-tcp","Answer ANY queries with tc=1, shunting to TCP")="yes";
   ::arg().setSwitch("edns-subnet-processing","If we should act on EDNS Subnet options")="no";
 
+  ::arg().set("edns-cookie-secret", "When set, set a server cookie when responding to a query with a Client cookie (in hex)")="";
+
   ::arg().setSwitch("webserver","Start a webserver for monitoring (api=yes also enables the HTTP listener)")="no";
   ::arg().setSwitch("webserver-print-arguments","If the webserver should print arguments")="no";
   ::arg().set("webserver-address","IP Address of webserver/API to listen on")="127.0.0.1";
@@ -169,6 +175,7 @@ void declareArguments()
   ::arg().set("webserver-allow-from","Webserver/API access is only allowed from these subnets")="127.0.0.1,::1";
   ::arg().set("webserver-loglevel", "Amount of logging in the webserver (none, normal, detailed)") = "normal";
   ::arg().set("webserver-max-bodysize","Webserver/API maximum request/response body size in megabytes")="2";
+  ::arg().setSwitch("webserver-hash-plaintext-credentials","Whether to hash passwords and api keys supplied in plaintext, to prevent keeping the plaintext version in memory at runtime")="no";
 
   ::arg().setSwitch("query-logging","Hint backends that queries should be logged")="no";
 
@@ -247,6 +254,7 @@ void declareArguments()
   ::arg().set("tcp-fast-open", "Enable TCP Fast Open support on the listening sockets, using the supplied numerical value as the queue size")="0";
 
   ::arg().set("max-generate-steps", "Maximum number of $GENERATE steps when loading a zone from a file")="0";
+  ::arg().set("max-include-depth", "Maximum number of nested $INCLUDE directives while processing a zone file")="20";
   ::arg().setSwitch("upgrade-unknown-types","Transparently upgrade known TYPExxx records. Recommended to keep off, except for PowerDNS upgrades until data sources are cleaned up")="no";
   ::arg().setSwitch("svc-autohints", "Transparently fill ipv6hint=auto ipv4hint=auto SVC params with AAAA/A records for the target name of the record (if within the same zone)")="no";
 
@@ -311,6 +319,7 @@ void declareStats()
 {
   S.declare("udp-queries","Number of UDP queries received");
   S.declare("udp-do-queries","Number of UDP queries received with DO bit");
+  S.declare("udp-cookie-queries", "Number of UDP queries received with the COOKIE EDNS option");
   S.declare("udp-answers","Number of answers sent out over UDP");
   S.declare("udp-answers-bytes","Total size of answers sent out over UDP");
   S.declare("udp4-answers-bytes","Total size of answers sent out over UDPv4");
@@ -329,6 +338,7 @@ void declareStats()
   S.declare("corrupt-packets","Number of corrupt packets received");
   S.declare("signatures", "Number of DNSSEC signatures made");
   S.declare("tcp-queries","Number of TCP queries received");
+  S.declare("tcp-cookie-queries","Number of TCP queries received with the COOKIE option");
   S.declare("tcp-answers","Number of answers sent out over TCP");
   S.declare("tcp-answers-bytes","Total size of answers sent out over TCP");
   S.declare("tcp4-answers-bytes","Total size of answers sent out over TCPv4");
@@ -360,6 +370,12 @@ void declareStats()
   S.declare("udp-sndbuf-errors", "UDP 'sndbuf' errors", udpErrorStats, StatType::counter);
   S.declare("udp-noport-errors", "UDP 'noport' errors", udpErrorStats, StatType::counter);
   S.declare("udp-in-errors", "UDP 'in' errors", udpErrorStats, StatType::counter);
+  S.declare("udp-in-csum-errors", "UDP 'in checksum' errors", udpErrorStats, StatType::counter);
+  S.declare("udp6-in-errors", "UDP 'in' errors over IPv6", udp6ErrorStats, StatType::counter);
+  S.declare("udp6-recvbuf-errors", "UDP 'recvbuf' errors over IPv6", udp6ErrorStats, StatType::counter);
+  S.declare("udp6-sndbuf-errors", "UDP 'sndbuf' errors over IPv6", udp6ErrorStats, StatType::counter);
+  S.declare("udp6-noport-errors", "UDP 'noport' errors over IPv6", udp6ErrorStats, StatType::counter);
+  S.declare("udp6-in-csum-errors", "UDP 'in checksum' errors over IPv6", udp6ErrorStats, StatType::counter);
 #endif
 
   S.declare("sys-msec", "Number of msec spent in system time", getSysUserTimeMsec, StatType::counter);
@@ -405,11 +421,16 @@ static void sendout(std::unique_ptr<DNSPacket>& a)
 {
   if(!a)
     return;
-  
-  N->send(*a);
 
-  int diff=a->d_dt.udiff();
-  avg_latency=0.999*avg_latency+0.001*diff;
+  try {
+    N->send(*a);
+
+    int diff=a->d_dt.udiff();
+    avg_latency=0.999*avg_latency+0.001*diff;
+  }
+  catch (const std::exception& e) {
+    g_log<<Logger::Error<<"Caught unhandled exception while sending a response: "<<e.what()<<endl;
+  }
 }
 
 //! The qthread receives questions over the internet via the Nameserver class, and hands them to the Distributor for further processing
@@ -425,6 +446,7 @@ try
 
   AtomicCounter &numreceived=*S.getPointer("udp-queries");
   AtomicCounter &numreceiveddo=*S.getPointer("udp-do-queries");
+  AtomicCounter &numreceivedcookie=*S.getPointer("udp-cookie-queries");
 
   AtomicCounter &numreceived4=*S.getPointer("udp4-queries");
 
@@ -435,7 +457,6 @@ try
   bool logDNSQueries = ::arg().mustDo("log-dns-queries");
   shared_ptr<UDPNameserver> NS;
   std::string buffer;
-  buffer.resize(DNSPacket::s_udpTruncationThreshold);
 
   // If we have SO_REUSEPORT then create a new port for all receiver threads
   // other than the first one.
@@ -449,76 +470,86 @@ try
   }
 
   for(;;) {
-    if(!NS->receive(question, buffer)) { // receive a packet         inline
-      continue;                    // packet was broken, try again
-    }
+    try {
+      if (g_proxyProtocolACL.empty()) {
+        buffer.resize(DNSPacket::s_udpTruncationThreshold);
+      }
+      else {
+        buffer.resize(DNSPacket::s_udpTruncationThreshold + g_proxyProtocolMaximumSize);
+      }
 
-    numreceived++;
+      if(!NS->receive(question, buffer)) { // receive a packet         inline
+        continue;                    // packet was broken, try again
+      }
 
-    if(question.d_remote.getSocklen()==sizeof(sockaddr_in))
-      numreceived4++;
-    else
-      numreceived6++;
+      numreceived++;
 
-    if(question.d_dnssecOk)
-      numreceiveddo++;
-
-     if(question.d.qr)
-       continue;
-
-    S.ringAccount("queries", question.qdomain, question.qtype);
-    S.ringAccount("remotes", question.d_remote);
-    if(logDNSQueries) {
-      string remote;
-      if(question.hasEDNSSubnet()) 
-        remote = question.getRemote().toString() + "<-" + question.getRealRemote().toString();
+      if(question.d_remote.getSocklen()==sizeof(sockaddr_in))
+        numreceived4++;
       else
-        remote = question.getRemote().toString();
-      g_log << Logger::Notice<<"Remote "<< remote <<" wants '" << question.qdomain<<"|"<<question.qtype.toString() << 
-        "', do = " <<question.d_dnssecOk <<", bufsize = "<< question.getMaxReplyLen();
-      if(question.d_ednsRawPacketSizeLimit > 0 && question.getMaxReplyLen() != (unsigned int)question.d_ednsRawPacketSizeLimit)
-        g_log<<" ("<<question.d_ednsRawPacketSizeLimit<<")";
-    }
+        numreceived6++;
 
-    if(PC.enabled() && (question.d.opcode != Opcode::Notify && question.d.opcode != Opcode::Update) && question.couldBeCached()) {
-      bool haveSomething=PC.get(question, cached); // does the PacketCache recognize this question?
-      if (haveSomething) {
+      if(question.d_dnssecOk)
+        numreceiveddo++;
+
+      if(question.hasEDNSCookie())
+        numreceivedcookie++;
+
+      if(question.d.qr)
+        continue;
+
+      S.ringAccount("queries", question.qdomain, question.qtype);
+      S.ringAccount("remotes", question.d_remote);
+      if(logDNSQueries) {
+        g_log << Logger::Notice<<"Remote "<< question.getRemoteString() <<" wants '" << question.qdomain<<"|"<<question.qtype <<
+          "', do = " <<question.d_dnssecOk <<", bufsize = "<< question.getMaxReplyLen();
+        if(question.d_ednsRawPacketSizeLimit > 0 && question.getMaxReplyLen() != (unsigned int)question.d_ednsRawPacketSizeLimit)
+          g_log<<" ("<<question.d_ednsRawPacketSizeLimit<<")";
+      }
+
+      if(PC.enabled() && (question.d.opcode != Opcode::Notify && question.d.opcode != Opcode::Update) && question.couldBeCached()) {
+        bool haveSomething=PC.get(question, cached); // does the PacketCache recognize this question?
+        if (haveSomething) {
+          if(logDNSQueries)
+            g_log<<": packetcache HIT"<<endl;
+          cached.setRemote(&question.d_remote);  // inlined
+          cached.setSocket(question.getSocket());                               // inlined
+          cached.d_anyLocal = question.d_anyLocal;
+          cached.setMaxReplyLen(question.getMaxReplyLen());
+          cached.d.rd=question.d.rd; // copy in recursion desired bit
+          cached.d.id=question.d.id;
+          cached.commitD(); // commit d to the packet                        inlined
+          NS->send(cached); // answer it then                              inlined
+          diff=question.d_dt.udiff();
+          avg_latency=0.999*avg_latency+0.001*diff; // 'EWMA'
+          continue;
+        }
+      }
+
+      if(distributor->isOverloaded()) {
         if(logDNSQueries)
-          g_log<<": packetcache HIT"<<endl;
-        cached.setRemote(&question.d_remote);  // inlined
-        cached.setSocket(question.getSocket());                               // inlined
-        cached.d_anyLocal = question.d_anyLocal;
-        cached.setMaxReplyLen(question.getMaxReplyLen());
-        cached.d.rd=question.d.rd; // copy in recursion desired bit
-        cached.d.id=question.d.id;
-        cached.commitD(); // commit d to the packet                        inlined
-        NS->send(cached); // answer it then                              inlined
-        diff=question.d_dt.udiff();
-        avg_latency=0.999*avg_latency+0.001*diff; // 'EWMA'
+          g_log<<": Dropped query, backends are overloaded"<<endl;
+        overloadDrops++;
         continue;
       }
-    }
 
-    if(distributor->isOverloaded()) {
-      if(logDNSQueries)
-        g_log<<": Dropped query, backends are overloaded"<<endl;
-      overloadDrops++;
-      continue;
-    }
+      if (logDNSQueries) {
+        if (PC.enabled()) {
+          g_log<<": packetcache MISS"<<endl;
+        } else {
+          g_log<<endl;
+        }
+      }
 
-    if (logDNSQueries) {
-      if (PC.enabled()) {
-        g_log<<": packetcache MISS"<<endl;
-      } else {
-        g_log<<endl;
+      try {
+        distributor->question(question, &sendout); // otherwise, give to the distributor
+      }
+      catch(DistributorFatal& df) { // when this happens, we have leaked loads of memory. Bailing out time.
+        _exit(1);
       }
     }
-
-    try {
-      distributor->question(question, &sendout); // otherwise, give to the distributor
-    }
-    catch(DistributorFatal& df) { // when this happens, we have leaked loads of memory. Bailing out time.
-      _exit(1);
+    catch (const std::exception& e) {
+      g_log<<Logger::Error<<"Caught unhandled exception in question thread: "<<e.what()<<endl;
     }
   }
 }
@@ -563,6 +594,28 @@ void mainthread()
    DNSPacket::s_doEDNSSubnetProcessing = ::arg().mustDo("edns-subnet-processing");
    PacketHandler::s_SVCAutohints = ::arg().mustDo("svc-autohints");
 
+   g_proxyProtocolACL.toMasks(::arg()["proxy-protocol-from"]);
+   g_proxyProtocolMaximumSize = ::arg().asNum("proxy-protocol-maximum-size");
+
+   if (::arg()["edns-cookie-secret"].size() != 0) {
+     // User wants cookie processing
+#ifdef HAVE_CRYPTO_SHORTHASH // we can do siphash-based cookies
+     DNSPacket::s_doEDNSCookieProcessing = true;
+     try {
+       if (::arg()["edns-cookie-secret"].size() != EDNSCookiesOpt::EDNSCookieSecretSize) {
+         throw std::range_error("wrong size (" + std::to_string(::arg()["edns-cookie-secret"].size()) + "), must be " + std::to_string(EDNSCookiesOpt::EDNSCookieSecretSize));
+       }
+       DNSPacket::s_EDNSCookieKey = makeBytesFromHex(::arg()["edns-cookie-secret"]);
+     } catch(const std::range_error &e) {
+       g_log<<Logger::Error<<"edns-cookie-secret invalid: "<<e.what()<<endl;
+       exit(1);
+     }
+#else
+     g_log<<Logger::Error<<"Support for EDNS Cookies is not available because of missing cryptographic functions (libsodium support should be enabled, with the crypto_shorthash() function available)"<<endl;
+     exit(1);
+#endif
+   }
+
    PC.setTTL(::arg().asNum("cache-ttl"));
    PC.setMaxEntries(::arg().asNum("max-packet-cache-entries"));
    QC.setMaxEntries(::arg().asNum("max-cache-entries"));
@@ -601,7 +654,7 @@ void mainthread()
   Utility::dropUserPrivs(newuid);
 
   if(::arg().mustDo("resolver")){
-    DP=std::unique_ptr<DNSProxy>(new DNSProxy(::arg()["resolver"]));
+    DP = std::make_unique<DNSProxy>(::arg()["resolver"]);
     DP->go();
   }
 

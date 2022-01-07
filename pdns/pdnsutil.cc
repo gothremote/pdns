@@ -5,6 +5,7 @@
 
 #include <fcntl.h>
 
+#include "credentials.hh"
 #include "dnsseckeeper.hh"
 #include "dnssecinfra.hh"
 #include "statbag.hh"
@@ -107,6 +108,7 @@ static void loadMainConfig(const std::string& configdir)
   ::arg().set("max-signature-cache-entries", "Maximum number of signatures cache entries")="";
   ::arg().set("rng", "Specify random number generator to use. Valid values are auto,sodium,openssl,getrandom,arc4random,urandom.")="auto";
   ::arg().set("max-generate-steps", "Maximum number of $GENERATE steps when loading a zone from a file")="0";
+  ::arg().set("max-include-depth", "Maximum nested $INCLUDE depth when loading a zone from a file")="20";
   ::arg().setSwitch("upgrade-unknown-types","Transparently upgrade known TYPExxx records. Recommended to keep off, except for PowerDNS upgrades until data sources are cleaned up")="no";
   ::arg().laxFile(configname.c_str());
 
@@ -229,7 +231,7 @@ static bool rectifyAllZones(DNSSECKeeper &dk, bool quiet = false)
   vector<DomainInfo> domainInfo;
   bool result = true;
 
-  B.getAllDomains(&domainInfo);
+  B.getAllDomains(&domainInfo, false, false);
   for(const DomainInfo& di :  domainInfo) {
     if (!quiet) {
       cerr<<"Rectifying "<<di.zone<<": ";
@@ -250,7 +252,7 @@ static int checkZone(DNSSECKeeper &dk, UeberBackend &B, const DNSName& zone, con
 
   DomainInfo di;
   try {
-    if (!B.getDomainInfo(zone, di)) {
+    if (!B.getDomainInfo(zone, di, false)) {
       cout << "[Error] Unable to get zone information for zone '" << zone << "'" << endl;
       return 1;
     }
@@ -262,11 +264,27 @@ static int checkZone(DNSSECKeeper &dk, UeberBackend &B, const DNSName& zone, con
   }
 
   SOAData sd;
-  if(!B.getSOAUncached(zone, sd)) {
-    cout<<"[Error] No SOA record present, or active, in zone '"<<zone<<"'"<<endl;
+  try {
+    if (!B.getSOAUncached(zone, sd)) {
+      cout << "[Error] No SOA record present, or active, in zone '" << zone << "'" << endl;
+      numerrors++;
+      cout << "Checked 0 records of '" << zone << "', " << numerrors << " errors, 0 warnings." << endl;
+      return 1;
+    }
+  }
+  catch (const PDNSException& e) {
+    cout << "[Error] SOA lookup failed for zone '" << zone << "': " << e.reason << endl;
     numerrors++;
-    cout<<"Checked 0 records of '"<<zone<<"', "<<numerrors<<" errors, 0 warnings."<<endl;
-    return 1;
+    if (!sd.db) {
+      return 1;
+    }
+  }
+  catch (const std::exception& e) {
+    cout << "[Error] SOA lookup failed for zone '" << zone << "': " << e.what() << endl;
+    numerrors++;
+    if (!sd.db) {
+      return 1;
+    }
   }
 
   NSEC3PARAMRecordContent ns3pr;
@@ -366,7 +384,14 @@ static int checkZone(DNSSECKeeper &dk, UeberBackend &B, const DNSName& zone, con
       stringtok(parts, rr.content);
 
       if(parts.size() < 7) {
-        cout<<"[Warning] SOA autocomplete is deprecated, missing field(s) in SOA content: "<<rr.qname<<" IN " <<rr.qtype.toString()<< " '" << rr.content<<"'"<<endl;
+        cout << "[Info] SOA autocomplete is deprecated, missing field(s) in SOA content: " << rr.qname << " IN " << rr.qtype.toString() << " '" << rr.content << "'" << endl;
+      }
+
+      if(parts.size() >= 2) {
+        if(parts[1].find('@') != string::npos) {
+          cout<<"[Warning] Found @-sign in SOA RNAME, should probably be a dot (.): "<<rr.qname<<" IN " <<rr.qtype.toString()<< " '" << rr.content<<"'"<<endl;
+          numwarnings++;
+        }
       }
 
       ostringstream o;
@@ -845,7 +870,7 @@ static int checkAllZones(DNSSECKeeper &dk, bool exitOnError)
   auto& seenNames = seenInfos.get<0>();
   auto& seenIds = seenInfos.get<1>();
 
-  B.getAllDomains(&domainInfo, true);
+  B.getAllDomains(&domainInfo, true, true);
   int errors=0;
   for(auto di : domainInfo) {
     if (checkZone(dk, B, di.zone) > 0) {
@@ -1030,7 +1055,7 @@ static int listKeys(const string &zname, DNSSECKeeper& dk){
     listKey(di, dk);
   } else {
     vector<DomainInfo> domainInfo;
-    B.getAllDomains(&domainInfo, g_verbose);
+    B.getAllDomains(&domainInfo, false, g_verbose);
     bool printHeader = true;
     for (const auto& di : domainInfo) {
       listKey(di, dk, printHeader);
@@ -1162,6 +1187,7 @@ static int editZone(const DNSName &zone) {
     tmpfd=-1;
   }
  editMore:;
+  post.clear();
   cmdline=editor+" ";
   if(gotoline > 0)
     cmdline+="+"+std::to_string(gotoline)+" ";
@@ -1173,6 +1199,7 @@ static int editZone(const DNSName &zone) {
   cmdline.clear();
   ZoneParserTNG zpt(tmpnam, g_rootdnsname);
   zpt.setMaxGenerateSteps(::arg().asNum("max-generate-steps"));
+  zpt.setMaxIncludes(::arg().asNum("max-include-depth"));
   DNSResourceRecord zrr;
   map<pair<DNSName,uint16_t>, vector<DNSRecord> > grouped;
   try {
@@ -1271,17 +1298,15 @@ static int editZone(const DNSName &zone) {
             changed[{dr.d_name, dr.d_type}]+=str.str();
             grouped[{dr.d_name, dr.d_type}].at(0) = dr;
           }
-        break;
+          break;
         case 'q':
           return EXIT_FAILURE;
-          break;
         case 'e':
-          goto editAgain;
-          break;
+          goto editMore;
         case 'n':
+          goto reAsk2;
         default:
           goto reAsk3;
-          break;
       }
     }
   }
@@ -1318,6 +1343,7 @@ static int editZone(const DNSName &zone) {
   return EXIT_SUCCESS;
 }
 
+#ifdef HAVE_IPCIPHER
 static int xcryptIP(const std::string& cmd, const std::string& ip, const std::string& rkey)
 {
 
@@ -1331,7 +1357,7 @@ static int xcryptIP(const std::string& cmd, const std::string& ip, const std::st
   cout<<ret.toString()<<endl;
   return EXIT_SUCCESS;
 }
-
+#endif /* HAVE_IPCIPHER */
 
 static int loadZone(const DNSName& zone, const string& fname) {
   UeberBackend B;
@@ -1635,7 +1661,7 @@ static int listAllZones(const string &type="") {
   UeberBackend B("default");
 
   vector<DomainInfo> domains;
-  B.getAllDomains(&domains, g_verbose);
+  B.getAllDomains(&domains, false, g_verbose);
 
   int count = 0;
   for (const auto& di: domains) {
@@ -1827,7 +1853,7 @@ static bool showZone(DNSSECKeeper& dk, const DNSName& zone, bool exportDS = fals
       }
     }
     else if(di.kind == DomainInfo::Slave) {
-      cout << "Primary" << addS(di.masters) << ": ";
+      cout << "Primar" << addS(di.masters, "y", "ies") << ": ";
       for(const auto& m : di.masters)
         cout<<m.toStringWithPort()<<" ";
       cout<<endl;
@@ -1939,7 +1965,9 @@ static bool showZone(DNSSECKeeper& dk, const DNSName& zone, bool exportDS = fals
       }
 
       const std::string prefix(exportDS ? "" : "DS = ");
-      cout<<prefix<<zone.toString()<<" IN DS "<<makeDSFromDNSKey(zone, key, DNSSECKeeper::DIGEST_SHA1).getZoneRepresentation() << " ; ( SHA1 digest )" << endl;
+      if (g_verbose) {
+        cout<<prefix<<zone.toString()<<" IN DS "<<makeDSFromDNSKey(zone, key, DNSSECKeeper::DIGEST_SHA1).getZoneRepresentation() << " ; ( SHA1 digest )" << endl;
+      }
       cout<<prefix<<zone.toString()<<" IN DS "<<makeDSFromDNSKey(zone, key, DNSSECKeeper::DIGEST_SHA256).getZoneRepresentation() << " ; ( SHA256 digest )" << endl;
       try {
         string output=makeDSFromDNSKey(zone, key, DNSSECKeeper::DIGEST_GOST).getZoneRepresentation();
@@ -1990,7 +2018,9 @@ static bool showZone(DNSSECKeeper& dk, const DNSName& zone, bool exportDS = fals
       if (value.second.keyType == DNSSECKeeper::KSK || value.second.keyType == DNSSECKeeper::CSK) {
         const auto &key = value.first.getDNSKEY();
         const std::string prefix(exportDS ? "" : "DS = ");
-        cout<<prefix<<zone.toString()<<" IN DS "<<makeDSFromDNSKey(zone, key, DNSSECKeeper::DIGEST_SHA1).getZoneRepresentation() << " ; ( SHA1 digest )" << endl;
+        if (g_verbose) {
+          cout<<prefix<<zone.toString()<<" IN DS "<<makeDSFromDNSKey(zone, key, DNSSECKeeper::DIGEST_SHA1).getZoneRepresentation() << " ; ( SHA1 digest )" << endl;
+        }
         cout<<prefix<<zone.toString()<<" IN DS "<<makeDSFromDNSKey(zone, key, DNSSECKeeper::DIGEST_SHA256).getZoneRepresentation() << " ; ( SHA256 digest )" << endl;
         try {
           string output=makeDSFromDNSKey(zone, key, DNSSECKeeper::DIGEST_GOST).getZoneRepresentation();
@@ -2334,6 +2364,7 @@ try
     cout<<"generate-zone-key {zsk|ksk} [ALGORITHM] [BITS]"<<endl;
     cout<<"                                   Generate a ZSK or KSK to stdout with specified ALGORITHM and BITS"<<endl;
     cout<<"get-meta ZONE [KIND ...]           Get zone metadata. If no KIND given, lists all known"<<endl;
+    cout<<"hash-password [WORK FACTOR]        Ask for a plaintext password or api key and output a hashed and salted version"<<endl;
     cout<<"hash-zone-record ZONE RNAME        Calculate the NSEC3 hash for RNAME in ZONE"<<endl;
 #ifdef HAVE_P11KIT1
     cout<<"hsm assign ZONE ALGORITHM {ksk|zsk} MODULE SLOT PIN LABEL"<<endl<<
@@ -2406,6 +2437,7 @@ try
       cerr<<"Syntax: pdnsutil [ipencrypt|ipdecrypt] IP passphrase [key]"<<endl;
       return 0;
     }
+#ifdef HAVE_IPCIPHER
     string key;
     if(cmds.size()==4) {
       if (B64Decode(cmds.at(2), key) < 0) {
@@ -2417,6 +2449,10 @@ try
       key = makeIPCipherKey(cmds.at(2));
     }
     exit(xcryptIP(cmds.at(0), cmds.at(1), key));
+#else
+    cerr<<cmds.at(0)<<" requires ipcipher support which is not available"<<endl;
+    return 0;
+#endif /* HAVE_IPCIPHER */
   }
 
   if (cmds.at(0) == "test-algorithms") {
@@ -2483,6 +2519,29 @@ try
     cout<<makeLuaString(drc->serialize(DNSName(), true))<<endl;
 
     return 0;
+  }
+  else if (cmds.at(0) == "hash-password") {
+    uint64_t workFactor = CredentialsHolder::s_defaultWorkFactor;
+    if (cmds.size() > 1) {
+      try {
+        workFactor = pdns_stou(cmds.at(1));
+      }
+      catch (const std::exception& e) {
+        cerr<<"Unable to parse the supplied work factor: "<<e.what()<<endl;
+        return 1;
+      }
+    }
+
+    auto password = CredentialsHolder::readFromTerminal();
+
+    try {
+      cout<<hashPassword(password.getString(), workFactor, CredentialsHolder::s_defaultParallelFactor, CredentialsHolder::s_defaultBlockSize)<<endl;
+      return EXIT_SUCCESS;
+    }
+    catch (const std::exception& e) {
+      cerr<<"Error while hashing the supplied password: "<<e.what()<<endl;
+      return 1;
+    }
   }
 
   DNSSECKeeper dk;
@@ -2929,7 +2988,7 @@ try
     UeberBackend B("default");
 
     vector<DomainInfo> domainInfo;
-    B.getAllDomains(&domainInfo);
+    B.getAllDomains(&domainInfo, false, false);
 
     unsigned int zonesSecured=0, zoneErrors=0;
     for(const DomainInfo& di :  domainInfo) {
@@ -2976,7 +3035,7 @@ try
       cerr<<"Syntax: pdnsutil set-nsec3 ZONE 'params' [narrow]"<<endl;
       return 0;
     }
-    string nsec3params = cmds.size() > 2 ? cmds.at(2) : "1 0 1 ab";
+    string nsec3params = cmds.size() > 2 ? cmds.at(2) : "1 0 0 -";
     bool narrow = cmds.size() > 3 && cmds.at(3) == "narrow";
     NSEC3PARAMRecordContent ns3pr(nsec3params);
 
@@ -3075,6 +3134,14 @@ try
       cerr << "Could not unset publishing for CDS records for " << cmds.at(1) << endl;
       return 1;
     }
+    return 0;
+  }
+  else if(cmds.at(0) == "hash-password") {
+    if (cmds.size() < 2) {
+      cerr<<"Syntax: pdnsutil hash-password PASSWORD"<<endl;
+      return 0;
+    }
+    cout<<hashPassword(cmds.at(1))<<endl;
     return 0;
   }
   else if (cmds.at(0) == "hash-zone-record") {
@@ -3702,11 +3769,11 @@ try
 
     vector<DomainInfo> domains;
 
-    tgt->getAllDomains(&domains, true);
+    tgt->getAllDomains(&domains, false, true);
     if (domains.size()>0)
       throw PDNSException("Target backend has zone(s), please clean it first");
 
-    src->getAllDomains(&domains, true);
+    src->getAllDomains(&domains, false, true);
     // iterate zones
     for(const DomainInfo& di: domains) {
       size_t nr,nc,nm,nk;

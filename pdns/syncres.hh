@@ -52,7 +52,9 @@
 #include "proxy-protocol.hh"
 #include "sholder.hh"
 #include "histogram.hh"
+#include "stat_t.hh"
 #include "tcpiohandler.hh"
+#include "rec-eventtrace.hh"
 
 #ifdef HAVE_CONFIG_H
 #include "config.h"
@@ -426,14 +428,14 @@ public:
   static void addDontQuery(const std::string& mask)
   {
     if (!s_dontQuery)
-      s_dontQuery = std::unique_ptr<NetmaskGroup>(new NetmaskGroup());
+      s_dontQuery = std::make_unique<NetmaskGroup>();
 
     s_dontQuery->addMask(mask);
   }
   static void addDontQuery(const Netmask& mask)
   {
     if (!s_dontQuery)
-      s_dontQuery = std::unique_ptr<NetmaskGroup>(new NetmaskGroup());
+      s_dontQuery = std::make_unique<NetmaskGroup>();
 
     s_dontQuery->addMask(mask);
   }
@@ -734,22 +736,22 @@ public:
 
   static thread_local ThreadLocalStorage t_sstorage;
 
-  static std::atomic<uint64_t> s_queries;
-  static std::atomic<uint64_t> s_outgoingtimeouts;
-  static std::atomic<uint64_t> s_outgoing4timeouts;
-  static std::atomic<uint64_t> s_outgoing6timeouts;
-  static std::atomic<uint64_t> s_throttledqueries;
-  static std::atomic<uint64_t> s_dontqueries;
-  static std::atomic<uint64_t> s_qnameminfallbacksuccess;
-  static std::atomic<uint64_t> s_authzonequeries;
-  static std::atomic<uint64_t> s_outqueries;
-  static std::atomic<uint64_t> s_tcpoutqueries;
-  static std::atomic<uint64_t> s_dotoutqueries;
-  static std::atomic<uint64_t> s_unreachables;
-  static std::atomic<uint64_t> s_ecsqueries;
-  static std::atomic<uint64_t> s_ecsresponses;
-  static std::map<uint8_t, std::atomic<uint64_t>> s_ecsResponsesBySubnetSize4;
-  static std::map<uint8_t, std::atomic<uint64_t>> s_ecsResponsesBySubnetSize6;
+  static pdns::stat_t s_queries;
+  static pdns::stat_t s_outgoingtimeouts;
+  static pdns::stat_t s_outgoing4timeouts;
+  static pdns::stat_t s_outgoing6timeouts;
+  static pdns::stat_t s_throttledqueries;
+  static pdns::stat_t s_dontqueries;
+  static pdns::stat_t s_qnameminfallbacksuccess;
+  static pdns::stat_t s_authzonequeries;
+  static pdns::stat_t s_outqueries;
+  static pdns::stat_t s_tcpoutqueries;
+  static pdns::stat_t s_dotoutqueries;
+  static pdns::stat_t s_unreachables;
+  static pdns::stat_t s_ecsqueries;
+  static pdns::stat_t s_ecsresponses;
+  static std::map<uint8_t, pdns::stat_t> s_ecsResponsesBySubnetSize4;
+  static std::map<uint8_t, pdns::stat_t> s_ecsResponsesBySubnetSize6;
 
   static string s_serverID;
   static unsigned int s_minimumTTL;
@@ -788,11 +790,17 @@ public:
   static int s_tcp_fast_open;
   static bool s_tcp_fast_open_connect;
   static bool s_dot_to_port_853;
-  
+
+  static const int event_trace_to_pb = 1;
+  static const int event_trace_to_log = 2;
+  static int s_event_trace_enabled;
+
   std::unordered_map<std::string,bool> d_discardedPolicies;
   DNSFilterEngine::Policy d_appliedPolicy;
   std::unordered_set<std::string> d_policyTags;
   boost::optional<string> d_routingTag;
+  ComboAddress d_fromAuthIP;
+  RecEventTrace d_eventTrace;
 
   unsigned int d_authzonequeries;
   unsigned int d_outqueries;
@@ -899,8 +907,8 @@ private:
   ostringstream d_trace;
   shared_ptr<RecursorLua4> d_pdl;
   boost::optional<Netmask> d_outgoingECSNetwork;
-  std::shared_ptr<std::vector<std::unique_ptr<RemoteLogger>>> d_outgoingProtobufServers{nullptr};
-  std::shared_ptr<std::vector<std::unique_ptr<FrameStreamLogger>>> d_frameStreamServers{nullptr};
+  std::shared_ptr<std::vector<std::unique_ptr<RemoteLogger>>> d_outgoingProtobufServers;
+  std::shared_ptr<std::vector<std::unique_ptr<FrameStreamLogger>>> d_frameStreamServers;
   boost::optional<const boost::uuids::uuid&> d_initialRequestId;
   asyncresolve_t d_asyncResolve{nullptr};
   struct timeval d_now;
@@ -1023,9 +1031,9 @@ MT_t* getMT();
 
 struct RecursorStats
 {
-  std::atomic<uint64_t> servFails;
-  std::atomic<uint64_t> nxDomains;
-  std::atomic<uint64_t> noErrors;
+  pdns::stat_t servFails;
+  pdns::stat_t nxDomains;
+  pdns::stat_t noErrors;
   pdns::AtomicHistogram answers;
   pdns::AtomicHistogram auth4Answers;
   pdns::AtomicHistogram auth6Answers;
@@ -1033,57 +1041,62 @@ struct RecursorStats
   pdns::AtomicHistogram cumulativeAnswers;
   pdns::AtomicHistogram cumulativeAuth4Answers;
   pdns::AtomicHistogram cumulativeAuth6Answers;
-  std::atomic<double> avgLatencyUsec;
-  std::atomic<double> avgLatencyOursUsec;
-  std::atomic<uint64_t> qcounter;     // not increased for unauth packets
-  std::atomic<uint64_t> ipv6qcounter;
-  std::atomic<uint64_t> tcpqcounter;
-  std::atomic<uint64_t> unauthorizedUDP;  // when this is increased, qcounter isn't
-  std::atomic<uint64_t> unauthorizedTCP;  // when this is increased, qcounter isn't
-  std::atomic<uint64_t> policyDrops;
-  std::atomic<uint64_t> tcpClientOverflow;
-  std::atomic<uint64_t> clientParseError;
-  std::atomic<uint64_t> serverParseError;
-  std::atomic<uint64_t> tooOldDrops;
-  std::atomic<uint64_t> truncatedDrops;
-  std::atomic<uint64_t> queryPipeFullDrops;
-  std::atomic<uint64_t> unexpectedCount;
-  std::atomic<uint64_t> caseMismatchCount;
-  std::atomic<uint64_t> spoofCount;
-  std::atomic<uint64_t> resourceLimits;
-  std::atomic<uint64_t> overCapacityDrops;
-  std::atomic<uint64_t> ipv6queries;
-  std::atomic<uint64_t> chainResends;
-  std::atomic<uint64_t> nsSetInvalidations;
-  std::atomic<uint64_t> ednsPingMatches;
-  std::atomic<uint64_t> ednsPingMismatches;
-  std::atomic<uint64_t> noPingOutQueries, noEdnsOutQueries;
-  std::atomic<uint64_t> packetCacheHits;
-  std::atomic<uint64_t> noPacketError;
-  std::atomic<uint64_t> ignoredCount;
-  std::atomic<uint64_t> emptyQueriesCount;
+  pdns::stat_t_trait<double> avgLatencyUsec;
+  pdns::stat_t_trait<double> avgLatencyOursUsec;
+  pdns::stat_t qcounter;     // not increased for unauth packets
+  pdns::stat_t ipv6qcounter;
+  pdns::stat_t tcpqcounter;
+  pdns::stat_t unauthorizedUDP;  // when this is increased, qcounter isn't
+  pdns::stat_t unauthorizedTCP;  // when this is increased, qcounter isn't
+  pdns::stat_t sourceDisallowedNotify;  // when this is increased, qcounter is also
+  pdns::stat_t zoneDisallowedNotify;  // when this is increased, qcounter is also
+  pdns::stat_t policyDrops;
+  pdns::stat_t tcpClientOverflow;
+  pdns::stat_t clientParseError;
+  pdns::stat_t serverParseError;
+  pdns::stat_t tooOldDrops;
+  pdns::stat_t truncatedDrops;
+  pdns::stat_t queryPipeFullDrops;
+  pdns::stat_t unexpectedCount;
+  pdns::stat_t caseMismatchCount;
+  pdns::stat_t spoofCount;
+  pdns::stat_t resourceLimits;
+  pdns::stat_t overCapacityDrops;
+  pdns::stat_t ipv6queries;
+  pdns::stat_t chainResends;
+  pdns::stat_t nsSetInvalidations;
+  pdns::stat_t ednsPingMatches;
+  pdns::stat_t ednsPingMismatches;
+  pdns::stat_t noPingOutQueries, noEdnsOutQueries;
+  pdns::stat_t packetCacheHits;
+  pdns::stat_t noPacketError;
+  pdns::stat_t ignoredCount;
+  pdns::stat_t emptyQueriesCount;
   time_t startupTime;
-  std::atomic<uint64_t> dnssecQueries;
-  std::atomic<uint64_t> dnssecAuthenticDataQueries;
-  std::atomic<uint64_t> dnssecCheckDisabledQueries;
-  std::atomic<uint64_t> variableResponses;
-  std::atomic<uint64_t> maxMThreadStackUsage;
-  std::atomic<uint64_t> dnssecValidations; // should be the sum of all dnssecResult* stats
-  std::map<vState, std::atomic<uint64_t> > dnssecResults;
-  std::map<vState, std::atomic<uint64_t> > xdnssecResults;
-  std::map<DNSFilterEngine::PolicyKind, std::atomic<uint64_t> > policyResults;
-  std::atomic<uint64_t> rebalancedQueries{0};
-  std::atomic<uint64_t> proxyProtocolInvalidCount{0};
-  std::atomic<uint64_t> nodLookupsDroppedOversize{0};
+  pdns::stat_t dnssecQueries;
+  pdns::stat_t dnssecAuthenticDataQueries;
+  pdns::stat_t dnssecCheckDisabledQueries;
+  pdns::stat_t variableResponses;
+  pdns::stat_t maxMThreadStackUsage;
+  pdns::stat_t dnssecValidations; // should be the sum of all dnssecResult* stats
+  std::map<vState, pdns::stat_t > dnssecResults;
+  std::map<vState, pdns::stat_t > xdnssecResults;
+  std::map<DNSFilterEngine::PolicyKind, pdns::stat_t > policyResults;
+  LockGuarded<std::unordered_map<std::string, pdns::stat_t>> policyHits;
+  pdns::stat_t rebalancedQueries{0};
+  pdns::stat_t proxyProtocolInvalidCount{0};
+  pdns::stat_t nodLookupsDroppedOversize{0};
+  pdns::stat_t dns64prefixanswers{0};
 
   RecursorStats() :
     answers("answers", { 1000, 10000, 100000, 1000000 }),
     auth4Answers("auth4answers", { 1000, 10000, 100000, 1000000 }),
     auth6Answers("auth6answers", { 1000, 10000, 100000, 1000000 }),
     ourtime("ourtime", { 1000, 2000, 4000, 8000, 16000, 32000 }),
-    cumulativeAnswers("cumul-answers-", 10, 19),
-    cumulativeAuth4Answers("cumul-auth4answers-", 1000, 13),
-    cumulativeAuth6Answers("cumul-auth6answers-", 1000, 13)
+    cumulativeAnswers("cumul-clientanswers-", 10, 19),
+    // These two will be merged when outputting
+    cumulativeAuth4Answers("cumul-authanswers-", 1000, 13),
+    cumulativeAuth6Answers("cumul-authanswers-", 1000, 13)
   {
   }
 };
@@ -1099,7 +1112,14 @@ public:
   {
     return d_fd;
   }
-
+  void setDropOnIdle()
+  {
+    d_dropOnIdle = true;
+  }
+  bool isDropOnIdle() const
+  {
+    return d_dropOnIdle;
+  }
   std::vector<ProxyProtocolValue> proxyProtocolValues;
   std::string data;
   const ComboAddress d_remote;
@@ -1117,7 +1137,8 @@ public:
   static unsigned int getCurrentConnections() { return s_currentConnections; }
 private:
   const int d_fd;
-  static AtomicCounter s_currentConnections; //!< total number of current TCP connections
+  static std::atomic<uint32_t> s_currentConnections; //!< total number of current TCP connections
+  bool d_dropOnIdle{false};
 };
 
 class ImmediateServFailException
@@ -1145,6 +1166,7 @@ extern thread_local std::unique_ptr<addrringbuf_t> t_servfailremotes, t_largeans
 
 extern thread_local std::unique_ptr<boost::circular_buffer<pair<DNSName,uint16_t> > > t_queryring, t_servfailqueryring, t_bogusqueryring;
 extern thread_local std::shared_ptr<NetmaskGroup> t_allowFrom;
+extern thread_local std::shared_ptr<NetmaskGroup> t_allowNotifyFrom;
 string doTraceRegex(vector<string>::const_iterator begin, vector<string>::const_iterator end);
 void parseACLs();
 extern RecursorStats g_stats;
@@ -1155,20 +1177,23 @@ extern std::atomic<uint32_t> g_maxCacheEntries, g_maxPacketCacheEntries;
 extern bool g_lowercaseOutgoing;
 
 
-std::string reloadAuthAndForwards();
+std::string reloadZoneConfiguration();
 typedef boost::function<void*(void)> pipefunc_t;
 void broadcastFunction(const pipefunc_t& func);
 void distributeAsyncFunction(const std::string& question, const pipefunc_t& func);
 
-int directResolve(const DNSName& qname, const QType qtype, const QClass qclass, vector<DNSRecord>& ret);
-int directResolve(const DNSName& qname, const QType qtype, const QClass qclass, vector<DNSRecord>& ret, bool qm);
+int directResolve(const DNSName& qname, const QType qtype, const QClass qclass, vector<DNSRecord>& ret, shared_ptr<RecursorLua4> pdl);
+int directResolve(const DNSName& qname, const QType qtype, const QClass qclass, vector<DNSRecord>& ret, shared_ptr<RecursorLua4> pdl, bool qm);
 int followCNAMERecords(std::vector<DNSRecord>& ret, const QType qtype, int oldret);
 int getFakeAAAARecords(const DNSName& qname, ComboAddress prefix, vector<DNSRecord>& ret);
 int getFakePTRRecords(const DNSName& qname, vector<DNSRecord>& ret);
 
 template<class T> T broadcastAccFunction(const boost::function<T*()>& func);
 
-std::shared_ptr<SyncRes::domainmap_t> parseAuthAndForwards();
+typedef std::unordered_set<DNSName> notifyset_t;
+std::tuple<std::shared_ptr<SyncRes::domainmap_t>, std::shared_ptr<notifyset_t>> parseZoneConfiguration();
+void* pleaseSupplantAllowNotifyFor(std::shared_ptr<notifyset_t> ns);
+
 uint64_t* pleaseGetNsSpeedsSize();
 uint64_t* pleaseGetFailedServersSize();
 uint64_t* pleaseGetEDNSStatusesSize();
@@ -1176,10 +1201,18 @@ uint64_t* pleaseGetConcurrentQueries();
 uint64_t* pleaseGetThrottleSize();
 uint64_t* pleaseGetPacketCacheHits();
 uint64_t* pleaseGetPacketCacheSize();
-uint64_t* pleaseWipePacketCache(const DNSName& canon, bool subtree, uint16_t qtype=0xffff);
 void doCarbonDump(void*);
 bool primeHints(time_t now = time(nullptr));
 void primeRootNSZones(bool, unsigned int depth);
+
+struct WipeCacheResult
+{
+  int record_count = 0;
+  int negative_record_count = 0;
+  int packet_count = 0;
+};
+
+struct WipeCacheResult wipeCaches(const DNSName& canon, bool subtree, uint16_t qtype);
 
 extern __thread struct timeval g_now;
 

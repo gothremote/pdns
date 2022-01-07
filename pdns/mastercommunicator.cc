@@ -46,27 +46,27 @@
 void CommunicatorClass::queueNotifyDomain(const DomainInfo& di, UeberBackend* B)
 {
   bool hasQueuedItem=false;
-  set<string> nsset, ips;
+  set<string> ips;
+  set<DNSName> nsset;
   DNSZoneRecord rr;
   FindNS fns;
-
 
   try {
   if (d_onlyNotify.size()) {
     B->lookup(QType(QType::NS), di.zone, di.id);
     while(B->get(rr))
-      nsset.insert(getRR<NSRecordContent>(rr.dr)->getNS().toString());
+      nsset.insert(getRR<NSRecordContent>(rr.dr)->getNS());
 
-    for(const auto & j : nsset) {
-      vector<string> nsips=fns.lookup(DNSName(j), B);
+    for(const auto & ns : nsset) {
+      vector<string> nsips=fns.lookup(ns, B);
       if(nsips.empty())
-        g_log<<Logger::Warning<<"Unable to queue notification of domain '"<<di.zone<<"': nameservers do not resolve!"<<endl;
+        g_log<<Logger::Warning<<"Unable to queue notification of domain '"<<di.zone<<"' to nameserver '"<<ns<<"': nameserver does not resolve!"<<endl;
       else
         for(const auto & nsip : nsips) {
           const ComboAddress caIp(nsip, 53);
           if(!d_preventSelfNotification || !AddressIsUs(caIp)) {
             if(!d_onlyNotify.match(&caIp))
-              g_log<<Logger::Notice<<"Skipped notification of domain '"<<di.zone<<"' to "<<j<<" because it does not match only-notify."<<endl;
+              g_log<<Logger::Notice<<"Skipped notification of domain '"<<di.zone<<"' to "<<ns<<" because "<<caIp<<" does not match only-notify."<<endl;
             else
               ips.insert(caIp.toStringWithPort());
           }
@@ -281,18 +281,22 @@ void CommunicatorClass::sendNotification(int sock, const DNSName& domain, const 
 
 void CommunicatorClass::drillHole(const DNSName &domain, const string &ip)
 {
-  std::lock_guard<std::mutex> l(d_holelock);
-  d_holes[make_pair(domain,ip)]=time(nullptr);
+  (*d_holes.lock())[pair(domain,ip)]=time(nullptr);
 }
 
 bool CommunicatorClass::justNotified(const DNSName &domain, const string &ip)
 {
-  std::lock_guard<std::mutex> l(d_holelock);
-  if(d_holes.find(make_pair(domain,ip))==d_holes.end()) // no hole
+  auto holes = d_holes.lock();
+  auto it = holes->find(pair(domain,ip));
+  if (it == holes->end()) {
+    // no hole
     return false;
+  }
 
-  if(d_holes[make_pair(domain,ip)]>time(nullptr)-900)    // recent hole
+  if (it->second > time(nullptr)-900) {
+    // recent hole
     return true;
+  }
 
   // do we want to purge this? XXX FIXME 
   return false;
