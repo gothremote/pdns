@@ -1,1 +1,1 @@
-../../../m4/pdns_check_libcrypto_falcon.m4
+../../../m4/pdns_check_libcrypto_pqc.m4
