@@ -38,6 +38,7 @@
 #include "dns.hh"
 #include "dnsbackend.hh"
 #include "ednsoptions.hh"
+#include "ednscookies.hh"
 #include "pdnsexception.hh"
 #include "dnspacket.hh"
 #include "logger.hh"
@@ -52,6 +53,8 @@
 #include "shuffle.hh"
 
 bool DNSPacket::s_doEDNSSubnetProcessing;
+bool DNSPacket::s_doEDNSCookieProcessing;
+string DNSPacket::s_EDNSCookieKey;
 uint16_t DNSPacket::s_udpTruncationThreshold;
  
 DNSPacket::DNSPacket(bool isQuery): d_isQuery(isQuery)
@@ -67,8 +70,49 @@ const string& DNSPacket::getString()
   return d_rawpacket;
 }
 
+string DNSPacket::getRemoteString() const
+{
+  string ret;
+
+  ret = getRemote().toString();
+
+  if (d_inner_remote) {
+    ret += "(" + d_inner_remote->toString() + ")";
+  }
+
+  if(hasEDNSSubnet()) {
+    ret += "<-" + getRealRemote().toString();
+  }
+
+  return ret;
+}
+
+string DNSPacket::getRemoteStringWithPort() const
+{
+  string ret;
+
+  ret = getRemote().toStringWithPort();
+
+  if (d_inner_remote) {
+    ret += "(" + d_inner_remote->toStringWithPort() + ")";
+  }
+
+  if(hasEDNSSubnet()) {
+    ret += "<-" + getRealRemote().toString();
+  }
+
+  return ret;
+}
+
 ComboAddress DNSPacket::getRemote() const
 {
+  return d_remote;
+}
+
+ComboAddress DNSPacket::getInnerRemote() const
+{
+  if (d_inner_remote)
+    return *d_inner_remote;
   return d_remote;
 }
 
@@ -195,7 +239,8 @@ void DNSPacket::setCompress(bool compress)
 
 bool DNSPacket::couldBeCached() const
 {
-  return !d_wantsnsid && qclass==QClass::IN && !d_havetsig;
+  return !d_wantsnsid && qclass==QClass::IN && !d_havetsig &&
+    !(d_haveednscookie && s_doEDNSCookieProcessing);
 }
 
 unsigned int DNSPacket::getMinTTL()
@@ -273,7 +318,7 @@ void DNSPacket::wrapup()
   if(d_wantsnsid) {
     const static string mode_server_id=::arg()["server-id"];
     if(mode_server_id != "disabled") {
-      opts.push_back(make_pair(EDNSOptionCode::NSID, mode_server_id));
+      opts.emplace_back(EDNSOptionCode::NSID, mode_server_id);
       optsize += EDNS_OPTION_CODE_SIZE + EDNS_OPTION_LENGTH_SIZE + mode_server_id.size();
     }
   }
@@ -285,6 +330,12 @@ void DNSPacket::wrapup()
     optsize += d_eso.source.isIPv4() ? 4 : 16;
   }
 
+  if (d_haveednscookie) {
+    if (d_eco.isWellFormed()) {
+        optsize += EDNSCookiesOpt::EDNSCookieOptSize;
+    }
+  }
+
   if (d_trc.d_algoName.countLabels())
   {
     // TSIG is not OPT, but we count it in optsize anyway
@@ -294,7 +345,7 @@ void DNSPacket::wrapup()
     static_assert(EVP_MAX_MD_SIZE <= 64, "EVP_MAX_MD_SIZE is overly huge on this system, please check");
   }
 
-  if(!d_rrs.empty() || !opts.empty() || d_haveednssubnet || d_haveednssection) {
+  if(!d_rrs.empty() || !opts.empty() || d_haveednssubnet || d_haveednssection || d_haveednscookie) {
     try {
       uint8_t maxScopeMask=0;
       for(pos=d_rrs.begin(); pos < d_rrs.end(); ++pos) {
@@ -322,7 +373,12 @@ void DNSPacket::wrapup()
         eso.scope = Netmask(eso.source.getNetwork(), maxScopeMask);
     
         string opt = makeEDNSSubnetOptsString(eso);
-        opts.push_back(make_pair(8, opt)); // 'EDNS SUBNET'
+        opts.emplace_back(8, opt); // 'EDNS SUBNET'
+      }
+
+      if (d_haveednscookie && d_eco.isWellFormed()) {
+        d_eco.makeServerCookie(s_EDNSCookieKey, getInnerRemote());
+        opts.emplace_back(EDNSOptionCode::COOKIE, d_eco.makeOptString());
       }
 
       if(!opts.empty() || d_haveednssection || d_dnssecOk)
@@ -369,6 +425,7 @@ std::unique_ptr<DNSPacket> DNSPacket::replyPacket() const
   r->setSocket(d_socket);
   r->d_anyLocal=d_anyLocal;
   r->setRemote(&d_remote);
+  r->d_inner_remote=d_inner_remote;
   r->setAnswer(true);  // this implies the allocation of the header
   r->setA(true); // and we are authoritative
   r->setRA(false); // no recursion available
@@ -386,8 +443,10 @@ std::unique_ptr<DNSPacket> DNSPacket::replyPacket() const
   r->d_wantsnsid = d_wantsnsid;
   r->d_dnssecOk = d_dnssecOk;
   r->d_eso = d_eso;
+  r->d_eco = d_eco;
   r->d_haveednssubnet = d_haveednssubnet;
   r->d_haveednssection = d_haveednssection;
+  r->d_haveednscookie = d_haveednscookie;
   r->d_ednsversion = 0;
   r->d_ednsrcode = 0;
 
@@ -423,7 +482,7 @@ int DNSPacket::noparse(const char *mesg, size_t length)
   d_rawpacket.assign(mesg,length); 
   if(length < 12) { 
     g_log << Logger::Debug << "Ignoring packet: too short ("<<length<<" < 12) from "
-      << d_remote.toStringWithPort()<< endl;
+      << getRemoteStringWithPort();
     return -1;
   }
   d_wantsnsid=false;
@@ -511,7 +570,7 @@ try
   d_wrapped=true;
   if(length < 12) { 
     g_log << Logger::Debug << "Ignoring packet: too short from "
-      << getRemote() << endl;
+      << getRemoteString() << endl;
     return -1;
   }
 
@@ -525,6 +584,8 @@ try
   d_havetsig = mdp.getTSIGPos();
   d_haveednssubnet = false;
   d_haveednssection = false;
+  d_haveednscookie = false;
+  d_ednscookievalid = false;
 
   if(getEDNSOpts(mdp, &edo)) {
     d_haveednssection=true;
@@ -547,6 +608,11 @@ try
           d_haveednssubnet=true;
         } 
       }
+      else if (s_doEDNSCookieProcessing && option.first == EDNSOptionCode::COOKIE) {
+        d_haveednscookie = true;
+        d_eco.makeFromString(option.second);
+        d_ednscookievalid = d_eco.isValid(s_EDNSCookieKey, d_remote);
+      }
       else {
         // cerr<<"Have an option #"<<iter->first<<": "<<makeHexDump(iter->second)<<endl;
       }
@@ -566,7 +632,7 @@ try
 
   if(!ntohs(d.qdcount)) {
     if(!d_tcp) {
-      g_log << Logger::Debug << "No question section in packet from " << getRemote() <<", RCode="<<RCode::to_s(d.rcode)<<endl;
+      g_log << Logger::Debug << "No question section in packet from " << getRemoteString() <<", RCode="<<RCode::to_s(d.rcode)<<endl;
       return -1;
     }
   }
@@ -593,9 +659,15 @@ void DNSPacket::setMaxReplyLen(int bytes)
 }
 
 //! Use this to set where this packet was received from or should be sent to
-void DNSPacket::setRemote(const ComboAddress *s)
+void DNSPacket::setRemote(const ComboAddress *outer, std::optional<ComboAddress> inner)
 {
-  d_remote=*s;
+  d_remote=*outer;
+  if (inner) {
+    d_inner_remote=*inner;
+  }
+  else {
+    d_inner_remote.reset();
+  }
 }
 
 bool DNSPacket::hasEDNSSubnet() const
@@ -608,11 +680,32 @@ bool DNSPacket::hasEDNS() const
   return d_haveednssection;
 }
 
+bool DNSPacket::hasEDNSCookie() const
+{
+  return d_haveednscookie;
+}
+
+bool DNSPacket::hasWellFormedEDNSCookie() const
+{
+  if (!d_haveednscookie) {
+    return false;
+  }
+  return d_eco.isWellFormed();
+}
+
+bool DNSPacket::hasValidEDNSCookie() const
+{
+  if (!hasWellFormedEDNSCookie()) {
+    return false;
+  }
+  return d_ednscookievalid;
+}
+
 Netmask DNSPacket::getRealRemote() const
 {
   if(d_haveednssubnet)
     return d_eso.source;
-  return Netmask(d_remote);
+  return Netmask(getInnerRemote());
 }
 
 void DNSPacket::setSocket(Utility::sock_t sock)

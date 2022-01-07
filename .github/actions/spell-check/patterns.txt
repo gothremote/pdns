@@ -56,3 +56,11 @@ C0FFEE
 [Vv]\d+(?:\b|(?=[a-zA-Z_]))
 # tar arguments
 \b(?:)tar(?:\s+-[a-zA-Z]+|\s[a-z]+)+
+
+# DoT: DNS over TLS is often combined with other words (images, links, ...), same for DoH
+DoT
+DoH
+
+# Contributors with non-ascii characters in their name
+Hoffst[^[:ascii:]]+tte
+Gri[^[:ascii:]]

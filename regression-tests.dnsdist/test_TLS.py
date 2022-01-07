@@ -14,6 +14,9 @@ class TLSTests(object):
         conn = self.openTLSConnection(self._tlsServerPort, self._serverName, self._caCert)
         return conn.getpeercert()
 
+    def getTLSProvider(self):
+        return self.sendConsoleCommand("getBind(0):getEffectiveTLSProvider()").rstrip()
+
     def testTLSSimple(self):
         """
         TLS: Single query
@@ -269,6 +272,9 @@ class TestOpenSSL(DNSDistTest, TLSTests):
     """
     _config_params = ['_consoleKeyB64', '_consolePort', '_testServerPort', '_tlsServerPort', '_serverCert', '_serverKey']
 
+    def testProvider(self):
+        self.assertEquals(self.getTLSProvider(), "openssl")
+
 class TestGnuTLS(DNSDistTest, TLSTests):
 
     _consoleKey = DNSDistTest.generateConsoleKey()
@@ -287,6 +293,9 @@ class TestGnuTLS(DNSDistTest, TLSTests):
     addAction(SNIRule("powerdns.com"), SpoofAction("1.2.3.4"))
     """
     _config_params = ['_consoleKeyB64', '_consolePort', '_testServerPort', '_tlsServerPort', '_serverCert', '_serverKey']
+
+    def testProvider(self):
+        self.assertEquals(self.getTLSProvider(), "gnutls")
 
 class TestDOTWithCache(DNSDistTest):
     _serverKey = 'server.key'
@@ -452,3 +461,21 @@ class TestProtocols(DNSDistTest):
         receivedQuery.id = query.id
         self.assertEqual(query, receivedQuery)
         self.assertEqual(response, receivedResponse)
+
+class TestPKCSTLSCertificate(DNSDistTest, TLSTests):
+    _consoleKey = DNSDistTest.generateConsoleKey()
+    _consoleKeyB64 = base64.b64encode(_consoleKey).decode('ascii')
+    _serverCert = 'server.p12'
+    _pkcsPassphrase = 'passw0rd'
+    _serverName = 'tls.tests.dnsdist.org'
+    _caCert = 'ca.pem'
+    _tlsServerPort = 8453
+    _config_template = """
+    setKey("%s")
+    controlSocket("127.0.0.1:%s")
+    newServer{address="127.0.0.1:%s"}
+    cert=newTLSCertificate("%s", {password="%s"})
+    addTLSLocal("127.0.0.1:%s", cert, "", { provider="openssl" })
+    addAction(SNIRule("powerdns.com"), SpoofAction("1.2.3.4"))
+    """
+    _config_params = ['_consoleKeyB64', '_consolePort', '_testServerPort', '_serverCert', '_pkcsPassphrase', '_tlsServerPort']

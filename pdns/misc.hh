@@ -136,10 +136,10 @@ vstringtok (Container &container, string const &in,
 
     // push token
     if (j == string::npos) {
-      container.push_back (make_pair(i, len));
+      container.emplace_back(i, len);
       return;
     } else
-      container.push_back (make_pair(i, j));
+      container.emplace_back(i, j);
 
     // set up for next loop
     i = j + 1;
@@ -149,7 +149,7 @@ vstringtok (Container &container, string const &in,
 size_t writen2(int fd, const void *buf, size_t count);
 inline size_t writen2(int fd, const std::string &s) { return writen2(fd, s.data(), s.size()); }
 size_t readn2(int fd, void* buffer, size_t len);
-size_t readn2WithTimeout(int fd, void* buffer, size_t len, const struct timeval& idleTimeout, const struct timeval& totalTimeout={0,0});
+size_t readn2WithTimeout(int fd, void* buffer, size_t len, const struct timeval& idleTimeout, const struct timeval& totalTimeout={0,0}, bool allowIncomplete=false);
 size_t writen2WithTimeout(int fd, const void * buffer, size_t len, const struct timeval& timeout);
 
 void toLowerInPlace(string& str);
@@ -304,6 +304,8 @@ inline void unixDie(const string &why)
 }
 
 string makeHexDump(const string& str);
+//! Convert the hexstring in to a byte string
+string makeBytesFromHex(const string &in);
 
 void normalizeTV(struct timeval& tv);
 const struct timeval operator+(const struct timeval& lhs, const struct timeval& rhs);
@@ -565,6 +567,7 @@ size_t getPipeBufferSize(int fd);
 bool setPipeBufferSize(int fd, size_t size);
 
 uint64_t udpErrorStats(const std::string& str);
+uint64_t udp6ErrorStats(const std::string& str);
 uint64_t tcpErrorStats(const std::string& str);
 uint64_t getRealMemoryUsage(const std::string&);
 uint64_t getSpecialMemoryUsage(const std::string&);
@@ -589,18 +592,21 @@ T valueOrEmpty(const P val) {
 
 
 // I'm not very OCD, but I appreciate loglines like "processing 1 delta", "processing 2 deltas" :-)
-template <typename Integer>
-const char* addS(Integer siz, typename std::enable_if<std::is_integral<Integer>::value>::type*P=0)
+template <typename Integer,
+typename std::enable_if_t<std::is_integral<Integer>::value, bool> = true>
+const char* addS(Integer siz, const char* singular = "", const char *plural = "s")
 {
-  if(!siz || siz > 1)
-    return "s";
-  else return "";
+  if (siz == 1) {
+    return singular;
+  }
+  return plural;
 }
 
-template<typename C>
-const char* addS(const C& c, typename std::enable_if<std::is_class<C>::value>::type*P=0)
+template <typename C,
+typename std::enable_if_t<std::is_class<C>::value, bool> = true>
+const char* addS(const C& c, const char* singular = "", const char *plural = "s")
 {
-  return addS(c.size());
+  return addS(c.size(), singular, plural);
 }
 
 template<typename C>
@@ -633,5 +639,54 @@ size_t parseSVCBValueList(const std::string &in, vector<std::string> &val);
 
 std::string makeLuaString(const std::string& in);
 
+bool constantTimeStringEquals(const std::string& a, const std::string& b);
+
 // Used in NID and L64 records
 struct NodeOrLocatorID { uint8_t content[8]; };
+
+struct FDWrapper
+{
+  FDWrapper()
+  {
+  }
+
+  FDWrapper(int desc): d_fd(desc)
+  {
+  }
+
+  ~FDWrapper()
+  {
+    if (d_fd != -1) {
+      close(d_fd);
+      d_fd = -1;
+    }
+  }
+
+  FDWrapper(FDWrapper&& rhs): d_fd(rhs.d_fd)
+  {
+    rhs.d_fd = -1;
+  }
+
+  FDWrapper& operator=(FDWrapper&& rhs)
+  {
+    if (d_fd != -1) {
+      close(d_fd);
+    }
+    d_fd = rhs.d_fd;
+    rhs.d_fd = -1;
+    return *this;
+  }
+
+  int getHandle() const
+  {
+    return d_fd;
+  }
+
+  operator int() const
+  {
+    return d_fd;
+  }
+
+private:
+  int d_fd{-1};
+};

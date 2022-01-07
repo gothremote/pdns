@@ -67,7 +67,7 @@
 
 size_t writen2(int fd, const void *buf, size_t count)
 {
-  const char *ptr = (char*)buf;
+  const char *ptr = reinterpret_cast<const char*>(buf);
   const char *eptr = ptr + count;
 
   ssize_t res;
@@ -110,7 +110,7 @@ size_t readn2(int fd, void* buffer, size_t len)
   return len;
 }
 
-size_t readn2WithTimeout(int fd, void* buffer, size_t len, const struct timeval& idleTimeout, const struct timeval& totalTimeout)
+size_t readn2WithTimeout(int fd, void* buffer, size_t len, const struct timeval& idleTimeout, const struct timeval& totalTimeout, bool allowIncomplete)
 {
   size_t pos = 0;
   struct timeval start{0,0};
@@ -123,6 +123,9 @@ size_t readn2WithTimeout(int fd, void* buffer, size_t len, const struct timeval&
     ssize_t got = read(fd, (char *)buffer + pos, len - pos);
     if (got > 0) {
       pos += (size_t) got;
+      if (allowIncomplete) {
+        break;
+      }
     }
     else if (got == 0) {
       throw runtime_error("EOF while reading message");
@@ -165,7 +168,7 @@ size_t writen2WithTimeout(int fd, const void * buffer, size_t len, const struct 
 {
   size_t pos = 0;
   do {
-    ssize_t written = write(fd, (char *)buffer + pos, len - pos);
+    ssize_t written = write(fd, reinterpret_cast<const char *>(buffer) + pos, len - pos);
 
     if (written > 0) {
       pos += (size_t) written;
@@ -224,7 +227,7 @@ uint32_t getLong(const unsigned char* p)
 
 uint32_t getLong(const char* p)
 {
-  return getLong((unsigned char *)p);
+  return getLong(reinterpret_cast<const unsigned char *>(p));
 }
 
 static bool ciEqual(const string& a, const string& b)
@@ -574,6 +577,22 @@ string makeHexDump(const string& str)
   return ret;
 }
 
+string makeBytesFromHex(const string &in) {
+  if (in.size() % 2 != 0) {
+    throw std::range_error("odd number of bytes in hex string");
+  }
+  string ret;
+  ret.reserve(in.size());
+  unsigned int num;
+  for (size_t i = 0; i < in.size(); i+=2) {
+    string numStr = in.substr(i, 2);
+    num = 0;
+    sscanf(numStr.c_str(), "%02x", &num);
+    ret.push_back((uint8_t)num);
+  }
+  return ret;
+}
+
 void normalizeTV(struct timeval& tv)
 {
   if(tv.tv_usec > 1000000) {
@@ -726,7 +745,7 @@ int makeIPv4sockaddr(const std::string& str, struct sockaddr_in* ret)
   if(!*(str.c_str() + pos + 1)) // trailing :
     return -1;
 
-  char *eptr = (char*)str.c_str() + str.size();
+  char *eptr = const_cast<char*>(str.c_str()) + str.size();
   int port = strtol(str.c_str() + pos + 1, &eptr, 10);
   if (port < 0 || port > 65535)
     return -1;
@@ -1124,26 +1143,79 @@ uint64_t udpErrorStats(const std::string& str)
 {
 #ifdef __linux__
   ifstream ifs("/proc/net/snmp");
-  if(!ifs)
+  if (!ifs) {
     return 0;
+  }
+
   string line;
-  vector<string> parts;
-  while(getline(ifs,line)) {
-    if(boost::starts_with(line, "Udp: ") && isdigit(line[5])) {
+  while (getline(ifs, line)) {
+    if (boost::starts_with(line, "Udp: ") && isdigit(line.at(5))) {
+      vector<string> parts;
       stringtok(parts, line, " \n\t\r");
-      if(parts.size() < 7)
-	break;
-      if(str=="udp-rcvbuf-errors")
-	return std::stoull(parts[5]);
-      else if(str=="udp-sndbuf-errors")
-	return std::stoull(parts[6]);
-      else if(str=="udp-noport-errors")
-	return std::stoull(parts[2]);
-      else if(str=="udp-in-errors")
-	return std::stoull(parts[3]);
-      else
-	return 0;
+
+      if (parts.size() < 7) {
+        break;
+      }
+
+      if (str == "udp-rcvbuf-errors") {
+        return std::stoull(parts.at(5));
+      }
+      else if (str == "udp-sndbuf-errors") {
+        return std::stoull(parts.at(6));
+      }
+      else if (str == "udp-noport-errors") {
+        return std::stoull(parts.at(2));
+      }
+      else if (str == "udp-in-errors") {
+        return std::stoull(parts.at(3));
+      }
+      else if (parts.size() >= 8 && str == "udp-in-csum-errors") {
+        return std::stoull(parts.at(7));
+      }
+      else {
+        return 0;
+      }
     }
+  }
+#endif
+  return 0;
+}
+
+uint64_t udp6ErrorStats(const std::string& str)
+{
+#ifdef __linux__
+  const std::map<std::string, std::string> keys = {
+    { "udp6-in-errors", "Udp6InErrors" },
+    { "udp6-recvbuf-errors", "Udp6RcvbufErrors" },
+    { "udp6-sndbuf-errors", "Udp6SndbufErrors" },
+    { "udp6-noport-errors", "Udp6NoPorts" },
+    { "udp6-in-csum-errors", "Udp6InCsumErrors" }
+  };
+
+  auto key = keys.find(str);
+  if (key == keys.end()) {
+    return 0;
+  }
+
+  ifstream ifs("/proc/net/snmp6");
+  if (!ifs) {
+    return 0;
+  }
+
+  std::string line;
+  while (getline(ifs, line)) {
+    if (!boost::starts_with(line, key->second)) {
+      continue;
+    }
+
+    std::vector<std::string> parts;
+    stringtok(parts, line, " \n\t\r");
+
+    if (parts.size() != 2) {
+      return 0;
+    }
+
+    return std::stoull(parts.at(1));
   }
 #endif
   return 0;
@@ -1282,6 +1354,9 @@ uint64_t getOpenFileDescriptors(const std::string&)
   closedir(dirhdl);
   return ret;
 
+#elif defined(__OpenBSD__)
+  // FreeBSD also has this in libopenbsd, but I don't know if that's available always
+  return getdtablecount();
 #else
   return 0;
 #endif
@@ -1642,3 +1717,36 @@ size_t parseSVCBValueList(const std::string &in, vector<std::string> &val) {
   parseSVCBValueListFromParsedRFC1035CharString(parsed, val);
   return ret;
 };
+
+#ifdef HAVE_CRYPTO_MEMCMP
+#include <openssl/crypto.h>
+#else /* HAVE_CRYPTO_MEMCMP */
+#ifdef HAVE_SODIUM_MEMCMP
+#include <sodium.h>
+#endif /* HAVE_SODIUM_MEMCMP */
+#endif /* HAVE_CRYPTO_MEMCMP */
+
+bool constantTimeStringEquals(const std::string& a, const std::string& b)
+{
+  if (a.size() != b.size()) {
+    return false;
+  }
+  const size_t size = a.size();
+#ifdef HAVE_CRYPTO_MEMCMP
+  return CRYPTO_memcmp(a.c_str(), b.c_str(), size) == 0;
+#else /* HAVE_CRYPTO_MEMCMP */
+#ifdef HAVE_SODIUM_MEMCMP
+  return sodium_memcmp(a.c_str(), b.c_str(), size) == 0;
+#else /* HAVE_SODIUM_MEMCMP */
+  const volatile unsigned char *_a = (const volatile unsigned char *) a.c_str();
+  const volatile unsigned char *_b = (const volatile unsigned char *) b.c_str();
+  unsigned char res = 0;
+
+  for (size_t idx = 0; idx < size; idx++) {
+    res |= _a[idx] ^ _b[idx];
+  }
+
+  return res == 0;
+#endif /* !HAVE_SODIUM_MEMCMP */
+#endif /* !HAVE_CRYPTO_MEMCMP */
+}

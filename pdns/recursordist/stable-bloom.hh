@@ -61,7 +61,7 @@ public:
       d_cells.set(i % d_num_cells);
     }
   }
-  bool test(const std::string& data)
+  bool test(const std::string& data) const
   {
     auto hashes = hash(data);
     for (auto& i : hashes) {
@@ -126,7 +126,7 @@ public:
     if (bitstr_len > 2 * 64 * 1024 * 1024U) { // twice the current size
       throw std::runtime_error("SBF: read failed (bitstr_len too big)");
     }
-    unique_ptr<char[]> bitcstr = make_unique<char[]>(bitstr_len);
+    auto bitcstr = std::make_unique<char[]>(bitstr_len);
     is.read(bitcstr.get(), bitstr_len);
     if (is.fail()) {
       throw std::runtime_error("SBF: read failed (file too short?)");
@@ -161,7 +161,7 @@ private:
   }
   // This is a double hash implementation returning an array of
   // k hashes
-  std::vector<uint32_t> hash(const std::string& data)
+  std::vector<uint32_t> hash(const std::string& data) const
   {
     uint32_t h1, h2;
     MurmurHash3_x86_32(data.c_str(), data.length(), 1, (void*)&h1);

@@ -22,6 +22,7 @@
 #include "config.h"
 #include "dnsdist.hh"
 #include "dnsdist-lua.hh"
+#include "dnsdist-svc.hh"
 
 #include "dolog.hh"
 
@@ -56,6 +57,7 @@ void setupLuaBindings(LuaContext& luaCtx, bool client)
       }
       return string("No exception");
     });
+#ifndef DISABLE_POLICIES_BINDINGS
   /* ServerPolicy */
   luaCtx.writeFunction("newServerPolicy", [](string name, ServerPolicy::policyfunc_t policy) { return std::make_shared<ServerPolicy>(name, policy, true);});
   luaCtx.registerMember("name", &ServerPolicy::d_name);
@@ -73,6 +75,7 @@ void setupLuaBindings(LuaContext& luaCtx, bool client)
   luaCtx.writeVariable("whashed", ServerPolicy{"whashed", whashed, false});
   luaCtx.writeVariable("chashed", ServerPolicy{"chashed", chashed, false});
   luaCtx.writeVariable("leastOutstanding", ServerPolicy{"leastOutstanding", leastOutstanding, false});
+#endif /* DISABLE_POLICIES_BINDINGS */
 
   /* ServerPool */
   luaCtx.registerFunction<void(std::shared_ptr<ServerPool>::*)(std::shared_ptr<DNSDistPacketCache>)>("setCache", [](std::shared_ptr<ServerPool> pool, std::shared_ptr<DNSDistPacketCache> cache) {
@@ -89,6 +92,7 @@ void setupLuaBindings(LuaContext& luaCtx, bool client)
   luaCtx.registerFunction("getECS", &ServerPool::getECS);
   luaCtx.registerFunction("setECS", &ServerPool::setECS);
 
+#ifndef DISABLE_DOWNSTREAM_BINDINGS
   /* DownstreamState */
   luaCtx.registerFunction<void(DownstreamState::*)(int)>("setQPS", [](DownstreamState& s, int lim) { s.qps = lim ? QPSLimiter(lim, lim) : QPSLimiter(); });
   luaCtx.registerFunction<void(std::shared_ptr<DownstreamState>::*)(string)>("addPool", [](std::shared_ptr<DownstreamState> s, string pool) {
@@ -125,7 +129,9 @@ void setupLuaBindings(LuaContext& luaCtx, bool client)
   luaCtx.registerMember("order", &DownstreamState::order);
   luaCtx.registerMember<const std::string(DownstreamState::*)>("name", [](const DownstreamState& backend) -> const std::string { return backend.getName(); }, [](DownstreamState& backend, const std::string& newName) { backend.setName(newName); });
   luaCtx.registerFunction<std::string(DownstreamState::*)()const>("getID", [](const DownstreamState& s) { return boost::uuids::to_string(s.id); });
+#endif /* DISABLE_DOWNSTREAM_BINDINGS */
 
+#ifndef DISABLE_DNSHEADER_BINDINGS
   /* dnsheader */
   luaCtx.registerFunction<void(dnsheader::*)(bool)>("setRD", [](dnsheader& dh, bool v) {
       dh.rd=v;
@@ -175,7 +181,9 @@ void setupLuaBindings(LuaContext& luaCtx, bool client)
   luaCtx.registerFunction<void(dnsheader::*)(bool)>("setQR", [](dnsheader& dh, bool v) {
       dh.qr=v;
     });
+#endif /* DISABLE_DNSHEADER_BINDINGS */
 
+#ifndef DISABLE_COMBO_ADDR_BINDINGS
   /* ComboAddress */
   luaCtx.writeFunction("newCA", [](const std::string& name) { return ComboAddress(name); });
   luaCtx.writeFunction("newCAFromRaw", [](const std::string& raw, boost::optional<uint16_t> port) {
@@ -213,7 +221,9 @@ void setupLuaBindings(LuaContext& luaCtx, bool client)
   luaCtx.registerFunction<bool(ComboAddress::*)()const>("isMappedIPv4", [](const ComboAddress& ca) { return ca.isMappedIPv4(); });
   luaCtx.registerFunction<ComboAddress(ComboAddress::*)()const>("mapToIPv4", [](const ComboAddress& ca) { return ca.mapToIPv4(); });
   luaCtx.registerFunction<bool(nmts_t::*)(const ComboAddress&)>("match", [](nmts_t& s, const ComboAddress& ca) { return s.match(ca); });
+#endif /* DISABLE_COMBO_ADDR_BINDINGS */
 
+#ifndef DISABLE_DNSNAME_BINDINGS
   /* DNSName */
   luaCtx.registerFunction("isPartOf", &DNSName::isPartOf);
   luaCtx.registerFunction<bool(DNSName::*)()>("chopOff", [](DNSName&dn ) { return dn.chopOff(); });
@@ -238,7 +248,9 @@ void setupLuaBindings(LuaContext& luaCtx, bool client)
   luaCtx.registerFunction("size",(size_t (DNSNameSet::*)() const) &DNSNameSet::size);
   luaCtx.registerFunction("clear",(void (DNSNameSet::*)()) &DNSNameSet::clear);
   luaCtx.registerFunction("empty",(bool (DNSNameSet::*)() const) &DNSNameSet::empty);
+#endif /* DISABLE_DNSNAME_BINDINGS */
 
+#ifndef DISABLE_SUFFIX_MATCH_BINDINGS
   /* SuffixMatchNode */
   luaCtx.registerFunction<void (SuffixMatchNode::*)(const boost::variant<DNSName, string, vector<pair<int, DNSName>>, vector<pair<int, string>>> &name)>("add", [](SuffixMatchNode &smn, const boost::variant<DNSName, string, vector<pair<int, DNSName>>, vector<pair<int, string>>> &name) {
       if (name.type() == typeid(DNSName)) {
@@ -296,7 +308,9 @@ void setupLuaBindings(LuaContext& luaCtx, bool client)
   });
 
   luaCtx.registerFunction("check",(bool (SuffixMatchNode::*)(const DNSName&) const) &SuffixMatchNode::check);
+#endif /* DISABLE_SUFFIX_MATCH_BINDINGS */
 
+#ifndef DISABLE_NETMASK_BINDINGS
   /* Netmask */
   luaCtx.writeFunction("newNetmask", [](boost::variant<std::string,ComboAddress> s, boost::optional<uint8_t> bits) {
     if (s.type() == typeid(ComboAddress)) {
@@ -344,20 +358,48 @@ void setupLuaBindings(LuaContext& luaCtx, bool client)
   luaCtx.registerFunction("clear", &NetmaskGroup::clear);
   luaCtx.registerFunction<string(NetmaskGroup::*)()const>("toString", [](const NetmaskGroup& nmg ) { return "NetmaskGroup " + nmg.toString(); });
   luaCtx.registerFunction<string(NetmaskGroup::*)()const>("__tostring", [](const NetmaskGroup& nmg ) { return "NetmaskGroup " + nmg.toString(); });
+#endif /* DISABLE_NETMASK_BINDINGS */
 
+#ifndef DISABLE_QPS_LIMITER_BINDINGS
   /* QPSLimiter */
   luaCtx.writeFunction("newQPSLimiter", [](int rate, int burst) { return QPSLimiter(rate, burst); });
   luaCtx.registerFunction("check", &QPSLimiter::check);
+#endif /* DISABLE_QPS_LIMITER_BINDINGS */
 
+#ifndef DISABLE_CLIENT_STATE_BINDINGS
   /* ClientState */
   luaCtx.registerFunction<std::string(ClientState::*)()const>("toString", [](const ClientState& fe) {
       setLuaNoSideEffect();
       return fe.local.toStringWithPort();
     });
-  luaCtx.registerFunction<std::string(ClientState::*)()>("__tostring", [](const ClientState& fe) {
+  luaCtx.registerFunction<std::string(ClientState::*)()const>("__tostring", [](const ClientState& fe) {
       setLuaNoSideEffect();
       return fe.local.toStringWithPort();
     });
+  luaCtx.registerFunction<std::string(ClientState::*)()const>("getType", [](const ClientState& fe) {
+      setLuaNoSideEffect();
+      return fe.getType();
+  });
+  luaCtx.registerFunction<std::string(ClientState::*)()const>("getConfiguredTLSProvider", [](const ClientState& fe) {
+      setLuaNoSideEffect();
+      if (fe.tlsFrontend != nullptr) {
+        return fe.tlsFrontend->getRequestedProvider();
+      }
+      else if (fe.dohFrontend != nullptr) {
+        return std::string("openssl");
+      }
+      return std::string();
+  });
+  luaCtx.registerFunction<std::string(ClientState::*)()const>("getEffectiveTLSProvider", [](const ClientState& fe) {
+      setLuaNoSideEffect();
+      if (fe.tlsFrontend != nullptr) {
+        return fe.tlsFrontend->getEffectiveProvider();
+      }
+      else if (fe.dohFrontend != nullptr) {
+        return std::string("openssl");
+      }
+      return std::string();
+  });
   luaCtx.registerMember("muted", &ClientState::muted);
 #ifdef HAVE_EBPF
   luaCtx.registerFunction<void(ClientState::*)(std::shared_ptr<BPFFilter>)>("attachFilter", [](ClientState& frontend, std::shared_ptr<BPFFilter> bpf) {
@@ -369,25 +411,95 @@ void setupLuaBindings(LuaContext& luaCtx, bool client)
       frontend.detachFilter();
     });
 #endif /* HAVE_EBPF */
+#endif /* DISABLE_CLIENT_STATE_BINDINGS */
 
   /* BPF Filter */
 #ifdef HAVE_EBPF
-  luaCtx.writeFunction("newBPFFilter", [client](uint32_t maxV4, uint32_t maxV6, uint32_t maxQNames) {
+  using bpfFilterMapParams = boost::variant<uint32_t, std::unordered_map<std::string, boost::variant<uint32_t, std::string>>>;
+  luaCtx.writeFunction("newBPFFilter", [client](bpfFilterMapParams v4Params, bpfFilterMapParams v6Params, bpfFilterMapParams qnameParams, boost::optional<bool> external) {
       if (client) {
         return std::shared_ptr<BPFFilter>(nullptr);
       }
-      return std::make_shared<BPFFilter>(maxV4, maxV6, maxQNames);
+
+      BPFFilter::MapConfiguration v4Config, v6Config, qnameConfig;
+
+      auto convertParamsToConfig = [](bpfFilterMapParams& params, BPFFilter::MapType type, BPFFilter::MapConfiguration& config) {
+        config.d_type = type;
+        if (params.type() == typeid(uint32_t)) {
+          config.d_maxItems = boost::get<uint32_t>(params);
+        }
+        else if (params.type() == typeid(std::unordered_map<std::string, boost::variant<uint32_t, std::string>>)) {
+          auto map = boost::get<std::unordered_map<std::string, boost::variant<uint32_t, std::string>>>(params);
+          if (map.count("maxItems")) {
+            config.d_maxItems = boost::get<uint32_t>(map.at("maxItems"));
+          }
+          if (map.count("pinnedPath")) {
+            config.d_pinnedPath = boost::get<std::string>(map.at("pinnedPath"));
+          }
+        }
+      };
+
+      convertParamsToConfig(v4Params, BPFFilter::MapType::IPv4, v4Config);
+      convertParamsToConfig(v6Params, BPFFilter::MapType::IPv6, v6Config);
+      convertParamsToConfig(qnameParams, BPFFilter::MapType::QNames, qnameConfig);
+
+      BPFFilter::MapFormat format = BPFFilter::MapFormat::Legacy;
+      if (external && *external) {
+        format = BPFFilter::MapFormat::WithActions;
+      }
+
+      return std::make_shared<BPFFilter>(v4Config, v6Config, qnameConfig, format, external.value_or(false));
     });
 
-  luaCtx.registerFunction<void(std::shared_ptr<BPFFilter>::*)(const ComboAddress& ca)>("block", [](std::shared_ptr<BPFFilter> bpf, const ComboAddress& ca) {
+  luaCtx.registerFunction<void(std::shared_ptr<BPFFilter>::*)(const ComboAddress& ca, boost::optional<uint32_t> action)>("block", [](std::shared_ptr<BPFFilter> bpf, const ComboAddress& ca, boost::optional<uint32_t> action) {
       if (bpf) {
-        return bpf->block(ca);
+        if (!action) {
+          return bpf->block(ca, BPFFilter::MatchAction::Drop);
+        }
+        else {
+          BPFFilter::MatchAction match;
+
+          switch (*action) {
+          case 0:
+            match = BPFFilter::MatchAction::Pass;
+            break;
+          case 1:
+            match = BPFFilter::MatchAction::Drop;
+            break;
+          case 2:
+            match = BPFFilter::MatchAction::Truncate;
+            break;
+          default:
+            throw std::runtime_error("Unsupported action for BPFFilter::block");
+          }
+          return bpf->block(ca, match);
+        }
       }
     });
 
-  luaCtx.registerFunction<void(std::shared_ptr<BPFFilter>::*)(const DNSName& qname, boost::optional<uint16_t> qtype)>("blockQName", [](std::shared_ptr<BPFFilter> bpf, const DNSName& qname, boost::optional<uint16_t> qtype) {
+  luaCtx.registerFunction<void(std::shared_ptr<BPFFilter>::*)(const DNSName& qname, boost::optional<uint16_t> qtype, boost::optional<uint32_t> action)>("blockQName", [](std::shared_ptr<BPFFilter> bpf, const DNSName& qname, boost::optional<uint16_t> qtype, boost::optional<uint32_t> action) {
       if (bpf) {
-        return bpf->block(qname, qtype ? *qtype : 255);
+        if (!action) {
+          return bpf->block(qname, BPFFilter::MatchAction::Drop, qtype.value_or(255));
+        }
+        else {
+          BPFFilter::MatchAction match;
+
+          switch (*action) {
+          case 0:
+            match = BPFFilter::MatchAction::Pass;
+            break;
+          case 1:
+            match = BPFFilter::MatchAction::Drop;
+            break;
+          case 2:
+            match = BPFFilter::MatchAction::Truncate;
+            break;
+          default:
+            throw std::runtime_error("Unsupported action for BPFFilter::blockQName");
+          }
+          return bpf->block(qname, match, qtype.value_or(255));
+        }
       }
     });
 
@@ -500,7 +612,8 @@ void setupLuaBindings(LuaContext& luaCtx, bool client)
     return values;
   });
 
-  luaCtx.writeFunction("newDOHResponseMapEntry", [](const std::string& regex, uint16_t status, const std::string& content, boost::optional<std::map<std::string, std::string>> customHeaders) {
+  luaCtx.writeFunction("newDOHResponseMapEntry", [](const std::string& regex, uint64_t status, const std::string& content, boost::optional<std::map<std::string, std::string>> customHeaders) {
+    checkParameterBound("newDOHResponseMapEntry", status, std::numeric_limits<uint16_t>::max());
     boost::optional<std::vector<std::pair<std::string, std::string>>> headers{boost::none};
     if (customHeaders) {
       headers = std::vector<std::pair<std::string, std::string>>();
@@ -509,5 +622,38 @@ void setupLuaBindings(LuaContext& luaCtx, bool client)
       }
     }
     return std::make_shared<DOHResponseMapEntry>(regex, status, PacketBuffer(content.begin(), content.end()), headers);
+  });
+
+  luaCtx.writeFunction("newSVCRecordParameters", [](uint64_t priority, const std::string& target, boost::optional<svcParamsLua_t> additionalParameters)
+  {
+    checkParameterBound("newSVCRecordParameters", priority, std::numeric_limits<uint16_t>::max());
+    SVCRecordParameters parameters;
+    if (additionalParameters) {
+      parameters = parseSVCParameters(*additionalParameters);
+    }
+    parameters.priority = priority;
+    parameters.target = DNSName(target);
+
+    return parameters;
+  });
+
+  luaCtx.writeFunction("getListOfNetworkInterfaces", []() {
+    std::vector<std::pair<int, std::string>> result;
+    auto itfs = getListOfNetworkInterfaces();
+    int counter = 1;
+    for (const auto& itf : itfs) {
+      result.push_back({counter++, itf});
+    }
+    return result;
+  });
+
+  luaCtx.writeFunction("getListOfAddressesOfNetworkInterface", [](const std::string& itf) {
+    std::vector<std::pair<int, std::string>> result;
+    auto addrs = getListOfAddressesOfNetworkInterface(itf);
+    int counter = 1;
+    for (const auto& addr : addrs) {
+      result.push_back({counter++, addr.toString()});
+    }
+    return result;
   });
 }

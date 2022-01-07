@@ -23,7 +23,7 @@ void DynBlockRulesGroup::apply(const struct timespec& now)
     return;
   }
 
-  boost::optional<NetmaskTree<DynBlock> > blocks;
+  boost::optional<NetmaskTree<DynBlock, AddressAndPortRange> > blocks;
   bool updated = false;
 
   for (const auto& entry : counts) {
@@ -104,20 +104,27 @@ void DynBlockRulesGroup::apply(const struct timespec& now)
 
   if (!statNodeRoot.empty()) {
     StatNode::Stat node;
-    std::unordered_set<DNSName> namesToBlock;
+    std::unordered_map<DNSName, std::optional<std::string>> namesToBlock;
     statNodeRoot.visit([this,&namesToBlock](const StatNode* node_, const StatNode::Stat& self, const StatNode::Stat& children) {
                          bool block = false;
+                         std::optional<std::string> reason;
 
                          if (d_smtVisitorFFI) {
-                           dnsdist_ffi_stat_node_t tmp(*node_, self, children);
+                           dnsdist_ffi_stat_node_t tmp(*node_, self, children, reason);
                            block = d_smtVisitorFFI(&tmp);
                          }
                          else {
-                           block = d_smtVisitor(*node_, self, children);
+                           auto ret = d_smtVisitor(*node_, self, children);
+                           block = std::get<0>(ret);
+                           if (block) {
+                             if (boost::optional<std::string> tmp = std::get<1>(ret)) {
+                               reason = std::move(*tmp);
+                             }
+                           }
                          }
 
                          if (block) {
-                           namesToBlock.insert(DNSName(node_->fullname));
+                           namesToBlock.insert({DNSName(node_->fullname), std::move(reason)});
                          }
                        },
       node);
@@ -125,8 +132,15 @@ void DynBlockRulesGroup::apply(const struct timespec& now)
     if (!namesToBlock.empty()) {
       updated = false;
       SuffixMatchTree<DynBlock> smtBlocks = g_dynblockSMT.getCopy();
-      for (const auto& name : namesToBlock) {
-        addOrRefreshBlockSMT(smtBlocks, now, name, d_suffixMatchRule, updated);
+      for (auto& [name, reason] : namesToBlock) {
+        if (reason) {
+          DynBlockRule rule(d_suffixMatchRule);
+          rule.d_blockReason = std::move(*reason);
+          addOrRefreshBlockSMT(smtBlocks, now, std::move(name), std::move(rule), updated);
+        }
+        else {
+          addOrRefreshBlockSMT(smtBlocks, now, std::move(name), d_suffixMatchRule, updated);
+        }
       }
       if (updated) {
         g_dynblockSMT.setState(std::move(smtBlocks));
@@ -160,9 +174,10 @@ bool DynBlockRulesGroup::checkIfResponseCodeMatches(const Rings::Response& respo
   return false;
 }
 
-void DynBlockRulesGroup::addOrRefreshBlock(boost::optional<NetmaskTree<DynBlock> >& blocks, const struct timespec& now, const ComboAddress& requestor, const DynBlockRule& rule, bool& updated, bool warning)
+void DynBlockRulesGroup::addOrRefreshBlock(boost::optional<NetmaskTree<DynBlock, AddressAndPortRange> >& blocks, const struct timespec& now, const AddressAndPortRange& requestor, const DynBlockRule& rule, bool& updated, bool warning)
 {
-  if (d_excludedSubnets.match(requestor)) {
+  /* network exclusions are address-based only (no port) */
+  if (d_excludedSubnets.match(requestor.getNetwork())) {
     /* do not add a block for excluded subnets */
     return;
   }
@@ -173,7 +188,7 @@ void DynBlockRulesGroup::addOrRefreshBlock(boost::optional<NetmaskTree<DynBlock>
   struct timespec until = now;
   until.tv_sec += rule.d_blockDuration;
   unsigned int count = 0;
-  const auto& got = blocks->lookup(Netmask(requestor));
+  const auto& got = blocks->lookup(requestor);
   bool expired = false;
   bool wasWarning = false;
   bool bpf = false;
@@ -209,10 +224,16 @@ void DynBlockRulesGroup::addOrRefreshBlock(boost::optional<NetmaskTree<DynBlock>
   db.blocks = count;
   db.warning = warning;
   if (!got || expired || wasWarning) {
-    if (db.action == DNSAction::Action::Drop && g_defaultBPFFilter) {
+    if (g_defaultBPFFilter &&
+        ((requestor.isIPv4() && requestor.getBits() == 32) || (requestor.isIPv6() && requestor.getBits() == 128)) &&
+        (db.action == DNSAction::Action::Drop || db.action == DNSAction::Action::Truncate)) {
       try {
-        g_defaultBPFFilter->block(requestor);
-        bpf = true;
+        BPFFilter::MatchAction action = db.action == DNSAction::Action::Drop ? BPFFilter::MatchAction::Drop : BPFFilter::MatchAction::Truncate;
+        if (g_defaultBPFFilter->supportsMatchAction(action)) {
+          /* the current BPF filter implementation only supports full addresses (/32 or /128) and no port */
+          g_defaultBPFFilter->block(requestor.getNetwork(), action);
+          bpf = true;
+        }
       }
       catch (const std::exception& e) {
         vinfolog("Unable to insert eBPF dynamic block for %s, falling back to regular dynamic block: %s", requestor.toString(), e.what());
@@ -226,7 +247,7 @@ void DynBlockRulesGroup::addOrRefreshBlock(boost::optional<NetmaskTree<DynBlock>
 
   db.bpf = bpf;
 
-  blocks->insert(Netmask(requestor)).second = std::move(db);
+  blocks->insert(requestor).second = std::move(db);
 
   updated = true;
 }
@@ -290,8 +311,8 @@ void DynBlockRulesGroup::processQueryRules(counts_t& counts, const struct timesp
   }
 
   for (const auto& shard : g_rings.d_shards) {
-    std::lock_guard<std::mutex> rl(shard->queryLock);
-    for(const auto& c : shard->queryRing) {
+    auto rl = shard->queryRing.lock();
+    for(const auto& c : *rl) {
       if (now < c.when) {
         continue;
       }
@@ -300,7 +321,7 @@ void DynBlockRulesGroup::processQueryRules(counts_t& counts, const struct timesp
       bool typeRuleMatches = checkIfQueryTypeMatches(c);
 
       if (qRateMatches || typeRuleMatches) {
-        auto& entry = counts[c.requestor];
+        auto& entry = counts[AddressAndPortRange(c.requestor, c.requestor.isIPv4() ? d_v4Mask : d_v6Mask, d_portMask)];
         if (qRateMatches) {
           ++entry.queries;
         }
@@ -349,8 +370,8 @@ void DynBlockRulesGroup::processResponseRules(counts_t& counts, StatNode& root, 
   }
 
   for (const auto& shard : g_rings.d_shards) {
-    std::lock_guard<std::mutex> rl(shard->respLock);
-    for(const auto& c : shard->respRing) {
+    auto rl = shard->respRing.lock();
+    for(const auto& c : *rl) {
       if (now < c.when) {
         continue;
       }
@@ -359,7 +380,7 @@ void DynBlockRulesGroup::processResponseRules(counts_t& counts, StatNode& root, 
         continue;
       }
 
-      auto& entry = counts[c.requestor];
+      auto& entry = counts[AddressAndPortRange(c.requestor, c.requestor.isIPv4() ? d_v4Mask : d_v6Mask, d_portMask)];
       ++entry.responses;
 
       bool respRateMatches = d_respRateRule.matches(c.when);
@@ -386,7 +407,7 @@ void DynBlockMaintenance::purgeExpired(const struct timespec& now)
 {
   {
     auto blocks = g_dynblockNMG.getLocal();
-    std::vector<Netmask> toRemove;
+    std::vector<AddressAndPortRange> toRemove;
     for (const auto& entry : *blocks) {
       if (!(now < entry.second.until)) {
         toRemove.push_back(entry.first);
@@ -427,9 +448,9 @@ void DynBlockMaintenance::purgeExpired(const struct timespec& now)
   }
 }
 
-std::map<std::string, std::list<std::pair<Netmask, unsigned int>>> DynBlockMaintenance::getTopNetmasks(size_t topN)
+std::map<std::string, std::list<std::pair<AddressAndPortRange, unsigned int>>> DynBlockMaintenance::getTopNetmasks(size_t topN)
 {
-  std::map<std::string, std::list<std::pair<Netmask, unsigned int>>> results;
+  std::map<std::string, std::list<std::pair<AddressAndPortRange, unsigned int>>> results;
   if (topN == 0) {
     return results;
   }
@@ -444,13 +465,13 @@ std::map<std::string, std::list<std::pair<Netmask, unsigned int>>> DynBlockMaint
     }
 
     if (topsForReason.size() < topN || topsForReason.front().second < value) {
-      auto newEntry = std::make_pair(entry.first, value);
+      auto newEntry = std::pair(entry.first, value);
 
       if (topsForReason.size() >= topN) {
         topsForReason.pop_front();
       }
 
-      topsForReason.insert(std::lower_bound(topsForReason.begin(), topsForReason.end(), newEntry, [](const std::pair<Netmask, unsigned int>& a, const std::pair<Netmask, unsigned int>& b) {
+      topsForReason.insert(std::lower_bound(topsForReason.begin(), topsForReason.end(), newEntry, [](const std::pair<AddressAndPortRange, unsigned int>& a, const std::pair<AddressAndPortRange, unsigned int>& b) {
         return a.second < b.second;
       }),
         newEntry);
@@ -471,7 +492,7 @@ std::map<std::string, std::list<std::pair<DNSName, unsigned int>>> DynBlockMaint
   blocks->visit([&results, topN](const SuffixMatchTree<DynBlock>& node) {
     auto& topsForReason = results[node.d_value.reason];
     if (topsForReason.size() < topN || topsForReason.front().second < node.d_value.blocks) {
-      auto newEntry = std::make_pair(node.d_value.domain, node.d_value.blocks.load());
+      auto newEntry = std::pair(node.d_value.domain, node.d_value.blocks.load());
 
       if (topsForReason.size() >= topN) {
         topsForReason.pop_front();
@@ -493,10 +514,9 @@ struct DynBlockEntryStat
   unsigned int lastSeenValue{0};
 };
 
-std::mutex DynBlockMaintenance::s_topsMutex;
 std::list<DynBlockMaintenance::MetricsSnapshot> DynBlockMaintenance::s_metricsData;
-std::map<std::string, std::list<std::pair<Netmask, unsigned int>>> DynBlockMaintenance::s_topNMGsByReason;
-std::map<std::string, std::list<std::pair<DNSName, unsigned int>>> DynBlockMaintenance::s_topSMTsByReason;
+
+LockGuarded<DynBlockMaintenance::Tops> DynBlockMaintenance::s_tops;
 size_t DynBlockMaintenance::s_topN{20};
 time_t DynBlockMaintenance::s_expiredDynBlocksPurgeInterval{60};
 
@@ -521,7 +541,7 @@ void DynBlockMaintenance::generateMetrics()
   }
 
   /* do NMG */
-  std::map<std::string, std::map<Netmask, DynBlockEntryStat>> nm;
+  std::map<std::string, std::map<AddressAndPortRange, DynBlockEntryStat>> nm;
   for (const auto& reason : s_metricsData.front().nmgData) {
     auto& reasonStat = nm[reason.first];
 
@@ -559,19 +579,19 @@ void DynBlockMaintenance::generateMetrics()
   }
 
   /* now we need to get the top N entries (for each "reason") based on our counters (sum of the last N entries) */
-  std::map<std::string, std::list<std::pair<Netmask, unsigned int>>> topNMGs;
+  std::map<std::string, std::list<std::pair<AddressAndPortRange, unsigned int>>> topNMGs;
   {
     for (const auto& reason : nm) {
       auto& topsForReason = topNMGs[reason.first];
       for (const auto& entry : reason.second) {
         if (topsForReason.size() < s_topN || topsForReason.front().second < entry.second.sum) {
           /* Note that this is a gauge, so we need to divide by the number of elapsed seconds */
-          auto newEntry = std::pair<Netmask, unsigned int>(entry.first, std::round(entry.second.sum / 60.0));
+          auto newEntry = std::pair<AddressAndPortRange, unsigned int>(entry.first, std::round(entry.second.sum / 60.0));
           if (topsForReason.size() >= s_topN) {
             topsForReason.pop_front();
           }
 
-          topsForReason.insert(std::lower_bound(topsForReason.begin(), topsForReason.end(), newEntry, [](const std::pair<Netmask, unsigned int>& a, const std::pair<Netmask, unsigned int>& b) {
+          topsForReason.insert(std::lower_bound(topsForReason.begin(), topsForReason.end(), newEntry, [](const std::pair<AddressAndPortRange, unsigned int>& a, const std::pair<AddressAndPortRange, unsigned int>& b) {
             return a.second < b.second;
           }),
             newEntry);
@@ -641,9 +661,9 @@ void DynBlockMaintenance::generateMetrics()
   }
 
   {
-    std::lock_guard<std::mutex> lock(s_topsMutex);
-    s_topNMGsByReason = std::move(topNMGs);
-    s_topSMTsByReason = std::move(topSMTs);
+    auto tops = s_tops.lock();
+    tops->topNMGsByReason = std::move(topNMGs);
+    tops->topSMTsByReason = std::move(topSMTs);
   }
 }
 
@@ -708,14 +728,12 @@ void DynBlockMaintenance::run()
   }
 }
 
-std::map<std::string, std::list<std::pair<Netmask, unsigned int>>> DynBlockMaintenance::getHitsForTopNetmasks()
+std::map<std::string, std::list<std::pair<AddressAndPortRange, unsigned int>>> DynBlockMaintenance::getHitsForTopNetmasks()
 {
-  std::lock_guard<std::mutex> lock(s_topsMutex);
-  return s_topNMGsByReason;
+  return s_tops.lock()->topNMGsByReason;
 }
 
 std::map<std::string, std::list<std::pair<DNSName, unsigned int>>> DynBlockMaintenance::getHitsForTopSuffixes()
 {
-  std::lock_guard<std::mutex> lock(s_topsMutex);
-  return s_topSMTsByReason;
+  return s_tops.lock()->topSMTsByReason;
 }

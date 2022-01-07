@@ -40,15 +40,15 @@ BOOST_AUTO_TEST_CASE(test_CIStringCompare) {
 
 BOOST_AUTO_TEST_CASE(test_CIStringPairCompare) {
         set<typedns_t, CIStringPairCompare> nsset2;
-        nsset2.insert(make_pair("ns.example.com", 1));
-        nsset2.insert(make_pair("abc", 1));
-        nsset2.insert(make_pair("", 1));
-        nsset2.insert(make_pair("def", 1));
-        nsset2.insert(make_pair("abc", 2));
-        nsset2.insert(make_pair("abc", 1));
-        nsset2.insert(make_pair("ns.example.com", 0));
-        nsset2.insert(make_pair("abc", 2));
-        nsset2.insert(make_pair("ABC", 2));
+        nsset2.emplace("ns.example.com", 1);
+        nsset2.emplace("abc", 1);
+        nsset2.emplace("", 1);
+        nsset2.emplace("def", 1);
+        nsset2.emplace("abc", 2);
+        nsset2.emplace("abc", 1);
+        nsset2.emplace("ns.example.com", 0);
+        nsset2.emplace("abc", 2);
+        nsset2.emplace("ABC", 2);
         BOOST_CHECK_EQUAL(nsset2.size(), 6U);
 
         ostringstream s;
@@ -389,6 +389,13 @@ BOOST_AUTO_TEST_CASE(test_parseSVCBValueList)
   parseSVCBValueList(R"FOO("foobar123 blabla bla\\\044baz quux456")FOO", out);
   BOOST_CHECK_EQUAL(out.size(), 1U);
   BOOST_CHECK_EQUAL(out[0], "foobar123 blabla bla,baz quux456");
+}
+
+BOOST_AUTO_TEST_CASE(test_makeBytesFromHex) {
+  string out = makeBytesFromHex("1234567890abcdef");
+  BOOST_CHECK_EQUAL(out, "\x12\x34\x56\x78\x90\xab\xcd\xef");
+
+  BOOST_CHECK_THROW(makeBytesFromHex("123"), std::range_error);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

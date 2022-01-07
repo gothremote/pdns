@@ -65,8 +65,8 @@ public:
     std::string d_str;
   };
 
-  void send(const Answer&, const std::string* remote = nullptr, unsigned int timeout = 5, int fd = -1);
-  RecursorControlChannel::Answer recv(std::string* remote = nullptr, unsigned int timeout = 5);
+  void send(int remote, const Answer&, unsigned int timeout = 5, int fd_to_pass = -1);
+  RecursorControlChannel::Answer recv(int fd, unsigned int timeout = 5);
 
   int d_fd;
   static std::atomic<bool> stop;
@@ -81,16 +81,22 @@ public:
   RecursorControlParser()
   {
   }
-  static void nop(void){}
+  static void nop(void) {}
   typedef void func_t(void);
 
   RecursorControlChannel::Answer getAnswer(int s, const std::string& question, func_t** func);
 };
 
+enum class StatComponent
+{
+  API,
+  Carbon,
+  RecControl,
+  SNMP
+};
 
-enum class StatComponent { API, Carbon, RecControl, SNMP };
-
-struct StatsMapEntry {
+struct StatsMapEntry
+{
   std::string d_prometheusName;
   std::string d_value;
 };
@@ -99,6 +105,7 @@ class PrefixDashNumberCompare
 {
 private:
   static std::pair<std::string, std::string> prefixAndTrailingNum(const std::string& a);
+
 public:
   bool operator()(const std::string& a, const std::string& b) const;
 };
@@ -107,10 +114,19 @@ typedef std::map<std::string, StatsMapEntry, PrefixDashNumberCompare> StatsMap;
 
 StatsMap getAllStatsMap(StatComponent component);
 
-extern std::mutex g_carbon_config_lock;
-std::vector<std::pair<DNSName, uint16_t> >* pleaseGetQueryRing();
-std::vector<std::pair<DNSName, uint16_t> >* pleaseGetServfailQueryRing();
-std::vector<std::pair<DNSName, uint16_t> >* pleaseGetBogusQueryRing();
+struct CarbonConfig
+{
+  std::string hostname;
+  std::string instance_name;
+  std::string namespace_name;
+  std::vector<std::string> servers;
+};
+
+extern GlobalStateHolder<CarbonConfig> g_carbonConfig;
+
+std::vector<std::pair<DNSName, uint16_t>>* pleaseGetQueryRing();
+std::vector<std::pair<DNSName, uint16_t>>* pleaseGetServfailQueryRing();
+std::vector<std::pair<DNSName, uint16_t>>* pleaseGetBogusQueryRing();
 std::vector<ComboAddress>* pleaseGetRemotes();
 std::vector<ComboAddress>* pleaseGetServfailRemotes();
 std::vector<ComboAddress>* pleaseGetBogusRemotes();

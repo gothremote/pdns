@@ -169,24 +169,24 @@ try
             g_lastquestionTime=pr.d_pheader.ts;
             g_clientQuestions++;
             totalQueries++;
-            counts[make_pair(mdp.d_qname, mdp.d_qtype)]++;
-            questions.insert(make_pair(mdp.d_qname, mdp.d_qtype));
+            counts[pair(mdp.d_qname, mdp.d_qtype)]++;
+            questions.emplace(mdp.d_qname, mdp.d_qtype);
           }
           else if(mdp.d_header.rd && mdp.d_header.qr) {
 	    rdacounts[pr.d_pheader.ts.tv_sec + 0.01*(pr.d_pheader.ts.tv_usec/10000)]++;
             g_lastanswerTime=pr.d_pheader.ts;
             g_clientResponses++;
-            answers.insert(make_pair(mdp.d_qname, mdp.d_qtype));
+            answers.emplace(mdp.d_qname, mdp.d_qtype);
           }
           else if(!mdp.d_header.rd && !mdp.d_header.qr) {
             g_lastquestionTime=pr.d_pheader.ts;
             g_serverQuestions++;
-            counts[make_pair(mdp.d_qname, mdp.d_qtype)]++;
-            questions.insert(make_pair(mdp.d_qname, mdp.d_qtype));
+            counts[pair(mdp.d_qname, mdp.d_qtype)]++;
+            questions.emplace(mdp.d_qname, mdp.d_qtype);
             totalQueries++;
           }
           else if(!mdp.d_header.rd && mdp.d_header.qr) {
-            answers.insert(make_pair(mdp.d_qname, mdp.d_qtype));
+            answers.emplace(mdp.d_qname, mdp.d_qtype);
             g_serverResponses++;
           }
           
@@ -233,7 +233,7 @@ try
     ofstream failed("failed");
     failed<<"name\ttype\tnumber\n";
     for(diff_t::const_iterator i = diff.begin(); i != diff.end() ; ++i) {
-      failed << i->first << "\t" << DNSRecordContent::NumberToType(i->second) << "\t"<< counts[make_pair(i->first, i->second)]<<"\n";
+      failed << i->first << "\t" << DNSRecordContent::NumberToType(i->second) << "\t"<< counts[pair(i->first, i->second)]<<"\n";
     }
 
     diff.clear();
@@ -245,7 +245,7 @@ try
     ofstream succeeded("succeeded");
     succeeded<<"name\ttype\tnumber\n";
     for(queries_t::const_iterator i = answers.begin(); i != answers.end() ; ++i) {
-      succeeded << i->first << "\t" <<DNSRecordContent::NumberToType(i->second) << "\t" << counts[make_pair(i->first, i->second)]<<"\n";
+      succeeded << i->first << "\t" <<DNSRecordContent::NumberToType(i->second) << "\t" << counts[pair(i->first, i->second)]<<"\n";
     }
   }
 }

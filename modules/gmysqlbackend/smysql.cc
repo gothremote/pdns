@@ -476,13 +476,16 @@ void SMySQL::connect()
 {
   int retry = 1;
 
-  std::lock_guard<std::mutex> l(s_myinitlock);
-  if (d_threadCleanup) {
-    threadcloser.enable();
-  }
+  {
+    std::lock_guard<std::mutex> l(s_myinitlock);
+    if (d_threadCleanup) {
+      threadcloser.enable();
+    }
 
-  if (!mysql_init(&d_db))
-    throw sPerrorException("Unable to initialize mysql driver");
+    if (!mysql_init(&d_db)) {
+      throw sPerrorException("Unable to initialize mysql driver");
+    }
+  }
 
   do {
 
@@ -549,7 +552,7 @@ SSqlException SMySQL::sPerrorException(const string& reason)
 
 std::unique_ptr<SSqlStatement> SMySQL::prepare(const string& query, int nparams)
 {
-  return std::unique_ptr<SSqlStatement>(new SMySQLStatement(query, s_dolog, nparams, &d_db));
+  return std::make_unique<SMySQLStatement>(query, s_dolog, nparams, &d_db);
 }
 
 void SMySQL::execute(const string& query)

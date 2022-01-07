@@ -77,6 +77,7 @@ Atomia
 aton
 attr
 atype
+authanswers
 AUTHIP
 Authoritativedoc
 auths
@@ -216,6 +217,7 @@ certusage
 cfea
 CFLAGS
 cgi
+CGNAT
 changelog
 changeme
 changeset
@@ -233,6 +235,7 @@ chroot
 chrooting
 CIDR
 classmethod
+clientanswers
 Cloos
 closesocket
 clusions
@@ -293,6 +296,7 @@ Cryptoki
 cryptopp
 cryptoshop
 css
+csum
 csv
 csync
 ctime
@@ -362,6 +366,7 @@ DIGESTALGOS
 Digitalus
 dijk
 dilinger
+Dimitrios
 Directi
 Disqus
 distro
@@ -389,6 +394,7 @@ dnsdistdoc
 dnsdomain
 dnsext
 dnsgram
+dnsheader
 dnskey
 dnsmessage
 dnsname
@@ -462,6 +468,7 @@ ecs
 ECSDA
 ecswho
 edb
+EDE
 editline
 edns
 ednsbufsiz
@@ -515,6 +522,7 @@ Faerch
 faf
 failedservers
 failover
+farsightsec
 favicon
 FBAE
 fbe
@@ -560,6 +568,7 @@ frontend
 fstrm
 fullname
 fulltoc
+fullycapable
 func
 Furnell
 Fusl
@@ -591,6 +600,7 @@ getdomaininfo
 getdomainkeys
 getdomainmetadata
 gethostname
+getifaddrs
 getlocaladdress
 getn
 getrandom
@@ -682,6 +692,7 @@ hmac
 Hmi
 Hoentjen
 Hofstaedtler
+Holger
 homepage
 Hooimeijer
 hostmaster
@@ -732,6 +743,7 @@ Inno
 innodb
 inode
 installable
+internic
 interop
 interoperability
 interoperation
@@ -952,6 +964,7 @@ mariadb
 Markmann
 Massar
 matchtype
+Mavrommatis
 maxdepth
 MAXINT
 maxlistdepth
@@ -1067,6 +1080,7 @@ Neue
 Neuf
 newcontent
 nextval
+nghttp
 nginx
 nic
 nimber
@@ -1074,6 +1088,7 @@ Nixu
 nkey
 nmg
 Nncqx
+NNNN
 noaction
 noad
 noall
@@ -1155,6 +1170,7 @@ openssl
 opensuse
 openwall
 Opmeer
+OPNUM
 optcode
 Opteron
 optmem
@@ -1190,6 +1206,7 @@ pathconfig
 pathto
 pawal
 Pbackend
+PCache
 pcap
 PCAPFILE
 pdf
@@ -1398,6 +1415,7 @@ rightsidebar
 Rijsdijk
 ringbuffer
 rkey
+rmem
 rname
 rng
 rocommunity
@@ -1448,6 +1466,7 @@ scopebits
 scopemask
 scriptable
 scriptlets
+scrypt
 sdb
 sdfoijdfio
 sdig
@@ -1508,6 +1527,7 @@ sigs
 SIGUSR
 singlethreaded
 Sipek
+siphash
 sizeof
 Sjoerd
 slapd
@@ -1569,6 +1589,7 @@ srv
 sshfp
 ssi
 ssl
+SSLKEYLOGFILE
 sslmode
 sslrootcert
 SSQ
@@ -1859,8 +1880,10 @@ Wzs
 Xander
 xchacha
 xdb
+XDP
 Xek
 Xeon
+XForwarded
 xfr
 xhtml
 xml
@@ -1885,6 +1908,7 @@ yubikey
 YYYYMMD
 YYYYMMDD
 YYYYMMDDSS
+wmem
 Zealey
 zeha
 Zengers
@@ -1901,6 +1925,7 @@ zonetransfer
 Zonneveld
 zsk
 zskroll
+ztc
 Zumstrull
 Zwane
 zzyzz

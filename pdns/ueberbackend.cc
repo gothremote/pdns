@@ -50,8 +50,7 @@
 
 extern StatBag S;
 
-vector<UeberBackend *>UeberBackend::instances;
-std::mutex UeberBackend::instances_lock;
+LockGuarded<vector<UeberBackend *>> UeberBackend::d_instances;
 
 // initially we are blocked
 bool UeberBackend::d_go=false;
@@ -285,9 +284,9 @@ void UeberBackend::updateZoneCache() {
   for (vector<DNSBackend*>::iterator i = backends.begin(); i != backends.end(); ++i )
   {
     vector<DomainInfo> zones;
-    (*i)->getAllDomains(&zones, true);
+    (*i)->getAllDomains(&zones, false, true);
     for(auto& di: zones) {
-      zone_indices.push_back({std::move(di.zone), (int)di.id});  // this cast should not be necessary
+      zone_indices.emplace_back(std::move(di.zone), (int)di.id); // this cast should not be necessary
     }
   }
   g_zoneCache.replace(zone_indices);
@@ -346,26 +345,38 @@ bool UeberBackend::getAuth(const DNSName &target, const QType& qtype, SOAData* s
   bool found = false;
   int cstat;
   DNSName shorter(target);
-  vector<pair<size_t, SOAData> > bestmatch (backends.size(), make_pair(target.wirelength()+1, SOAData()));
+  vector<pair<size_t, SOAData> > bestmatch (backends.size(), pair(target.wirelength()+1, SOAData()));
   do {
     int zoneId{-1};
     if(cachedOk && g_zoneCache.isEnabled()) {
       if (g_zoneCache.getEntry(shorter, zoneId)) {
         // Zone exists in zone cache, directly look up SOA.
-        // XXX: this code path and the cache lookup below should be merged; but that needs the code path below to also use ANY.
-        // Or it should just also use lookup().
         DNSZoneRecord zr;
         lookup(QType(QType::SOA), shorter, zoneId, nullptr);
         if (!get(zr)) {
-          // zone has somehow vanished
           DLOG(g_log << Logger::Info << "Backend returned no SOA for zone '" << shorter.toLogString() << "', which it reported as existing " << endl);
           continue;
         }
         if (zr.dr.d_name != shorter) {
           throw PDNSException("getAuth() returned an SOA for the wrong zone. Zone '"+zr.dr.d_name.toLogString()+"' is not equal to looked up zone '"+shorter.toLogString()+"'");
         }
+        // fill sd
         sd->qname = zr.dr.d_name;
-        fillSOAData(zr, *sd);
+        try {
+          fillSOAData(zr, *sd);
+        }
+        catch (...) {
+          g_log << Logger::Warning << "Backend returned a broken SOA for zone '" << shorter.toLogString() << "'" << endl;
+          while (get(zr))
+            ;
+          continue;
+        }
+        if (backends.size() == 1) {
+          sd->db = *backends.begin();
+        }
+        else {
+          sd->db = nullptr;
+        }
         // leave database handle in a consistent state
         while (get(zr))
           ;
@@ -520,8 +531,7 @@ bool UeberBackend::superMasterBackend(const string &ip, const DNSName &domain, c
 UeberBackend::UeberBackend(const string &pname)
 {
   {
-    std::lock_guard<std::mutex> l(instances_lock);
-    instances.push_back(this); // report to the static list of ourself
+    d_instances.lock()->push_back(this); // report to the static list of ourself
   }
 
   d_negcached=false;
@@ -542,9 +552,9 @@ static void del(DNSBackend* d)
 void UeberBackend::cleanup()
 {
   {
-    std::lock_guard<std::mutex> l(instances_lock);
-    remove(instances.begin(),instances.end(),this);
-    instances.resize(instances.size()-1);
+    auto instances = d_instances.lock();
+    remove(instances->begin(), instances->end(), this);
+    instances->resize(instances->size()-1);
   }
 
   for_each(backends.begin(),backends.end(),del);
@@ -667,10 +677,11 @@ void UeberBackend::lookup(const QType &qtype,const DNSName &qname, int zoneId, D
   d_handle.parent=this;
 }
 
-void UeberBackend::getAllDomains(vector<DomainInfo> *domains, bool include_disabled) {
+void UeberBackend::getAllDomains(vector<DomainInfo>* domains, bool getSerial, bool include_disabled)
+{
   for (auto & backend : backends)
   {
-    backend->getAllDomains(domains, include_disabled);
+    backend->getAllDomains(domains, getSerial, include_disabled);
   }
 }
 

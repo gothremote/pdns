@@ -32,6 +32,7 @@
 #include <sys/types.h>
 #include "responsestats.hh"
 
+#include "common_startup.hh"
 #include "dns.hh"
 #include "dnsbackend.hh"
 #include "dnspacket.hh"
@@ -40,6 +41,7 @@
 #include "logger.hh"
 #include "arguments.hh"
 #include "statbag.hh"
+#include "proxy-protocol.hh"
 
 #include "namespaces.hh"
 
@@ -116,11 +118,11 @@ void UDPNameserver::bindAddresses()
       throw PDNSException("Unable to set UDP socket " + locala.toStringWithPort() + " to non-blocking: "+stringerror());
 
     if(IsAnyAddress(locala)) {
-      setsockopt(s, IPPROTO_IP, GEN_IP_PKTINFO, &one, sizeof(one));
+      (void)setsockopt(s, IPPROTO_IP, GEN_IP_PKTINFO, &one, sizeof(one));
       if (locala.isIPv6()) {
-        setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));      // if this fails, we report an error in tcpreceiver too
+        (void)setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));      // if this fails, we report an error in tcpreceiver too
 #ifdef IPV6_RECVPKTINFO
-        setsockopt(s, IPPROTO_IPV6, IPV6_RECVPKTINFO, &one, sizeof(one));
+        (void)setsockopt(s, IPPROTO_IPV6, IPV6_RECVPKTINFO, &one, sizeof(one));
 #endif
       }
     }
@@ -148,13 +150,13 @@ void UDPNameserver::bindAddresses()
         g_localaddresses.push_back(locala);
 
     if(::bind(s, (sockaddr*)&locala, locala.getSocklen()) < 0) {
-      string binderror = stringerror();
+      int err = errno;
       close(s);
-      if( errno == EADDRNOTAVAIL && ! ::arg().mustDo("local-address-nonexist-fail") ) {
+      if (err == EADDRNOTAVAIL && !::arg().mustDo("local-address-nonexist-fail")) {
         g_log<<Logger::Error<<"Address " << locala << " does not exist on this server - skipping UDP bind" << endl;
         continue;
       } else {
-        g_log<<Logger::Error<<"Unable to bind UDP socket to '"+locala.toStringWithPort()+"': "<<binderror<<endl;
+        g_log<<Logger::Error<<"Unable to bind UDP socket to '"+locala.toStringWithPort()+"': "<<stringerror(err)<<endl;
         throw PDNSException("Unable to bind to UDP socket");
       }
     }
@@ -301,11 +303,31 @@ bool UDPNameserver::receive(DNSPacket& packet, std::string& buffer)
     packet.d_dt.setTimeval(recvtv);
   }
   else
-    packet.d_dt.set(); // timing    
+    packet.d_dt.set(); // timing
+
+  if (g_proxyProtocolACL.match(remote)) {
+    ComboAddress psource, pdestination;
+    bool proxyProto, tcp;
+    std::vector<ProxyProtocolValue> ppvalues;
+
+    buffer.resize(len);
+    ssize_t used = parseProxyHeader(buffer, proxyProto, psource, pdestination, tcp, ppvalues);
+    if (used <= 0 || (size_t) used > g_proxyProtocolMaximumSize || (len - used) > DNSPacket::s_udpTruncationThreshold) {
+      S.inc("corrupt-packets");
+      S.ringAccount("remotes-corrupt", packet.d_remote);
+      return false;
+    }
+    buffer.erase(0, used);
+    packet.d_inner_remote = psource;
+    packet.d_tcp = tcp;
+  }
+  else {
+    packet.d_inner_remote.reset();
+  }
 
   if(packet.parse(&buffer.at(0), (size_t) len)<0) {
     S.inc("corrupt-packets");
-    S.ringAccount("remotes-corrupt", packet.d_remote);
+    S.ringAccount("remotes-corrupt", packet.getInnerRemote());
 
     return false; // unable to parse
   }

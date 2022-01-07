@@ -228,7 +228,7 @@ namespace pdns {
 
 bool Resolver::tryGetSOASerial(DNSName *domain, ComboAddress* remote, uint32_t *theirSerial, uint32_t *theirInception, uint32_t *theirExpire, uint16_t* id)
 {
-  auto fds = std::unique_ptr<struct pollfd[]>(new struct pollfd[locals.size()]);
+  auto fds = std::make_unique<struct pollfd[]>(locals.size());
   size_t i = 0, k;
   int sock;
 
@@ -336,7 +336,6 @@ int Resolver::resolve(const ComboAddress& to, const DNSName &domain, int type, R
   catch(ResolverException &re) {
     throw ResolverException(re.reason+" from "+to.toLogString());
   }
-  return -1;
 }
 
 int Resolver::resolve(const ComboAddress& ipport, const DNSName &domain, int type, Resolver::res_t* res) {

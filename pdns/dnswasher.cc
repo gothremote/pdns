@@ -37,6 +37,8 @@ otherwise, obfuscate the response IP address
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
+
+#ifdef HAVE_IPCIPHER
 #include "statbag.hh"
 #include "dnspcap.hh"
 #include "iputils.hh"
@@ -73,7 +75,7 @@ public:
 
   static std::unique_ptr<IPObfuscator> make()
   {
-    return std::unique_ptr<IPObfuscator>(new IPSeqObfuscator());
+    return std::make_unique<IPSeqObfuscator>();
   }
 
   uint32_t obf4(uint32_t orig) override
@@ -133,7 +135,7 @@ public:
   {}
   static std::unique_ptr<IPObfuscator> make(std::string key, bool decrypt)
   {
-    return std::unique_ptr<IPObfuscator>(new IPCipherObfuscator(key, decrypt));
+    return std::make_unique<IPCipherObfuscator>(key, decrypt);
   }
 
   uint32_t obf4(uint32_t orig) override
@@ -272,3 +274,11 @@ catch(std::exception& e)
 {
   cerr<<"Fatal: "<<e.what()<<endl;
 }
+
+#else
+int main()
+{
+  cerr<<"dnswasher requires ipcipher support, which is not available"<<endl;
+  exit(1);
+}
+#endif /* HAVE_IPCIPHER */

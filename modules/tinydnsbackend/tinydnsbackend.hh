@@ -32,7 +32,6 @@
 #include <boost/multi_index_container.hpp>
 #include <boost/multi_index/hashed_index.hpp>
 #include <boost/multi_index/member.hpp>
-#include <mutex>
 
 using namespace ::boost;
 using namespace ::boost::multi_index;
@@ -71,7 +70,7 @@ public:
   void lookup(const QType& qtype, const DNSName& qdomain, int zoneId, DNSPacket* pkt_p = nullptr) override;
   bool list(const DNSName& target, int domain_id, bool include_disabled = false) override;
   bool get(DNSResourceRecord& rr) override;
-  void getAllDomains(vector<DomainInfo>* domains, bool include_disabled = false) override;
+  void getAllDomains(vector<DomainInfo>* domains, bool getSerial, bool include_disabled) override;
 
   //Master mode operation
   void getUpdatedMasters(vector<DomainInfo>* domains) override;
@@ -110,7 +109,6 @@ private:
   string d_suffix;
 
   // Statics
-  static std::mutex s_domainInfoLock;
-  static TDI_suffix_t s_domainInfo;
+  static LockGuarded<TDI_suffix_t> s_domainInfo;
   static uint32_t s_lastId; // used to give a domain an id.
 };

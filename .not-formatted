@@ -39,7 +39,6 @@
 ./pdns/decafsigners.cc
 ./pdns/delaypipe.cc
 ./pdns/delaypipe.hh
-./pdns/devpollmplexer.cc
 ./pdns/digests.hh
 ./pdns/distributor.hh
 ./pdns/dns.cc
@@ -69,7 +68,6 @@
 ./pdns/dnsdist-lua-inspection.cc
 ./pdns/dnsdist-lua-rules.cc
 ./pdns/dnsdist-lua-vars.cc
-./pdns/dnsdist-lua.cc
 ./pdns/dnsdist-lua.hh
 ./pdns/dnsdist-protobuf.cc
 ./pdns/dnsdist-protobuf.hh
@@ -156,13 +154,11 @@
 ./pdns/dynloader.cc
 ./pdns/dynmessenger.cc
 ./pdns/dynmessenger.hh
-./pdns/ednscookies.cc
 ./pdns/ednsoptions.cc
 ./pdns/ednsoptions.hh
 ./pdns/ednspadding.cc
 ./pdns/ednssubnet.cc
 ./pdns/ednssubnet.hh
-./pdns/epollmplexer.cc
 ./pdns/filterpo.cc
 ./pdns/filterpo.hh
 ./pdns/fstrm_logger.cc
@@ -191,7 +187,6 @@
 ./pdns/ixplore.cc
 ./pdns/json.cc
 ./pdns/json.hh
-./pdns/kqueuemplexer.cc
 ./pdns/kvresp.cc
 ./pdns/lazy_allocator.hh
 ./pdns/libssl.cc
@@ -211,7 +206,6 @@
 ./pdns/minicurl.hh
 ./pdns/misc.cc
 ./pdns/misc.hh
-./pdns/mplexer.hh
 ./pdns/mtasker.cc
 ./pdns/mtasker.hh
 ./pdns/mtasker_context.hh
@@ -237,8 +231,6 @@
 ./pdns/pdnsutil.cc
 ./pdns/pkcs11signers.cc
 ./pdns/pkcs11signers.hh
-./pdns/pollmplexer.cc
-./pdns/portsmplexer.cc
 ./pdns/protozero.cc
 ./pdns/protozero.hh
 ./pdns/proxy-protocol.cc
@@ -249,20 +241,7 @@
 ./pdns/query-local-address.hh
 ./pdns/rcpgenerator.cc
 ./pdns/rcpgenerator.hh
-./pdns/rec-carbon.cc
-./pdns/rec-lua-conf.cc
-./pdns/rec-lua-conf.hh
-./pdns/rec-snmp.cc
-./pdns/rec-snmp.hh
-./pdns/rec_channel.cc
-./pdns/rec_channel.hh
-./pdns/rec_channel_rec.cc
-./pdns/rec_control.cc
 ./pdns/receiver.cc
-./pdns/recpacketcache.cc
-./pdns/recpacketcache.hh
-./pdns/recursor_cache.cc
-./pdns/recursor_cache.hh
 ./pdns/remote_logger.cc
 ./pdns/remote_logger.hh
 ./pdns/resolve-context.hh
@@ -276,8 +255,6 @@
 ./pdns/saxfr.cc
 ./pdns/sdig.cc
 ./pdns/secpoll-auth.cc
-./pdns/secpoll-recursor.cc
-./pdns/secpoll-recursor.hh
 ./pdns/secpoll.cc
 ./pdns/secpoll.hh
 ./pdns/serialtweaker.cc
@@ -335,13 +312,11 @@
 ./pdns/test-lock_hh.cc
 ./pdns/test-lua_auth4_cc.cc
 ./pdns/test-misc_hh.cc
-./pdns/test-mplexer.cc
 ./pdns/test-nameserver_cc.cc
 ./pdns/test-packetcache_cc.cc
 ./pdns/test-packetcache_hh.cc
 ./pdns/test-proxy_protocol_cc.cc
 ./pdns/test-rcpgenerator_cc.cc
-./pdns/test-recpacketcache_cc.cc
 ./pdns/test-sha_hh.cc
 ./pdns/test-sholder_hh.cc
 ./pdns/test-signers.cc
@@ -368,8 +343,6 @@
 ./pdns/unix_utility.cc
 ./pdns/utility.hh
 ./pdns/uuid-utils.cc
-./pdns/validate-recursor.cc
-./pdns/validate-recursor.hh
 ./pdns/validate.cc
 ./pdns/validate.hh
 ./pdns/version.cc
@@ -380,8 +353,6 @@
 ./pdns/ws-api.hh
 ./pdns/ws-auth.cc
 ./pdns/ws-auth.hh
-./pdns/ws-recursor.cc
-./pdns/ws-recursor.hh
 ./pdns/xpf.cc
 ./pdns/xpf.hh
 ./pdns/zone2json.cc

@@ -8,17 +8,26 @@
 #include <fstream>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 #include <pthread.h>
 
 #include <openssl/conf.h>
+#ifndef OPENSSL_NO_ENGINE
+#include <openssl/engine.h>
+#endif
 #include <openssl/err.h>
 #include <openssl/ocsp.h>
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
+#include <openssl/pkcs12.h>
+#include <fcntl.h>
 
 #ifdef HAVE_LIBSODIUM
 #include <sodium.h>
 #endif /* HAVE_LIBSODIUM */
+
+#undef CERT
+#include "misc.hh"
 
 #if (OPENSSL_VERSION_NUMBER < 0x1010000fL || (defined LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER < 0x2090100fL)
 /* OpenSSL < 1.1.0 needs support for threading/locking in the calling application. */
@@ -59,6 +68,9 @@ static void openssl_thread_cleanup()
 #endif /* (OPENSSL_VERSION_NUMBER < 0x1010000fL || (defined LIBRESSL_VERSION_NUMBER) && LIBRESSL_VERSION_NUMBER < 0x2090100fL) */
 
 static std::atomic<uint64_t> s_users;
+#ifndef OPENSSL_NO_ENGINE
+static LockGuarded<std::unordered_map<std::string, std::unique_ptr<ENGINE, int(*)(ENGINE*)>>> s_engines;
+#endif
 static int s_ticketsKeyIndex{-1};
 static int s_countersIndex{-1};
 static int s_keyLogIndex{-1};
@@ -100,6 +112,13 @@ void registerOpenSSLUser()
 void unregisterOpenSSLUser()
 {
   if (s_users.fetch_sub(1) == 1) {
+#ifndef OPENSSL_NO_ENGINE
+    for (auto& [name, engine] : *s_engines.lock()) {
+      ENGINE_finish(engine.get());
+      engine.reset();
+    }
+    s_engines.lock()->clear();
+#endif
 #if (OPENSSL_VERSION_NUMBER < 0x1010000fL || (defined LIBRESSL_VERSION_NUMBER && LIBRESSL_VERSION_NUMBER < 0x2090100fL))
     ERR_free_strings();
 
@@ -113,6 +132,46 @@ void unregisterOpenSSLUser()
     openssl_thread_cleanup();
 #endif
   }
+}
+
+std::pair<bool, std::string> libssl_load_engine(const std::string& engineName, const std::optional<std::string>& defaultString)
+{
+#ifdef OPENSSL_NO_ENGINE
+  return { false, "OpenSSL has been built without engine support" };
+#else
+  if (s_users.load() == 0) {
+    /* We need to make sure that OpenSSL has been properly initialized before loading an engine.
+       This messes up our accounting a bit, so some memory might not be properly released when
+       the program exits when engines are in use. */
+    registerOpenSSLUser();
+  }
+
+  auto engines = s_engines.lock();
+  if (engines->count(engineName) > 0) {
+    return { false, "TLS engine already loaded" };
+  }
+
+  ENGINE* enginePtr = ENGINE_by_id(engineName.c_str());
+  if (enginePtr == nullptr) {
+    return { false, "unable to load TLS engine '" + engineName + "'" };
+  }
+
+  auto engine = std::unique_ptr<ENGINE, int(*)(ENGINE*)>(enginePtr, ENGINE_free);
+  enginePtr = nullptr;
+
+  if (!ENGINE_init(engine.get())) {
+    return { false, "Unable to init TLS engine '" + engineName + "'" };
+  }
+
+  if (defaultString) {
+    if (ENGINE_set_default_string(engine.get(), defaultString->c_str()) == 0) {
+      return { false, "error while setting the TLS engine default string" };
+    }
+  }
+
+  engines->insert({engineName, std::move(engine)});
+  return { true, "" };
+#endif
 }
 
 void* libssl_get_ticket_key_callback_data(SSL* s)
@@ -493,7 +552,7 @@ bool libssl_set_min_tls_version(std::unique_ptr<SSL_CTX, void(*)(SSL_CTX*)>& ctx
 
 OpenSSLTLSTicketKeysRing::OpenSSLTLSTicketKeysRing(size_t capacity)
 {
-  d_ticketKeys.set_capacity(capacity);
+  d_ticketKeys.write_lock()->set_capacity(capacity);
 }
 
 OpenSSLTLSTicketKeysRing::~OpenSSLTLSTicketKeysRing()
@@ -502,22 +561,20 @@ OpenSSLTLSTicketKeysRing::~OpenSSLTLSTicketKeysRing()
 
 void OpenSSLTLSTicketKeysRing::addKey(std::shared_ptr<OpenSSLTLSTicketKey> newKey)
 {
-  WriteLock wl(&d_lock);
-  d_ticketKeys.push_front(newKey);
+  d_ticketKeys.write_lock()->push_front(newKey);
 }
 
 std::shared_ptr<OpenSSLTLSTicketKey> OpenSSLTLSTicketKeysRing::getEncryptionKey()
 {
-  ReadLock rl(&d_lock);
-  return d_ticketKeys.front();
+  return d_ticketKeys.read_lock()->front();
 }
 
 std::shared_ptr<OpenSSLTLSTicketKey> OpenSSLTLSTicketKeysRing::getDecryptionKey(unsigned char name[TLS_TICKETS_KEY_NAME_SIZE], bool& activeKey)
 {
-  ReadLock rl(&d_lock);
-  for (auto& key : d_ticketKeys) {
+  auto keys = d_ticketKeys.read_lock();
+  for (auto& key : *keys) {
     if (key->nameMatches(name)) {
-      activeKey = (key == d_ticketKeys.front());
+      activeKey = (key == keys->front());
       return key;
     }
   }
@@ -526,8 +583,7 @@ std::shared_ptr<OpenSSLTLSTicketKey> OpenSSLTLSTicketKeysRing::getDecryptionKey(
 
 size_t OpenSSLTLSTicketKeysRing::getKeysCount()
 {
-  ReadLock rl(&d_lock);
-  return d_ticketKeys.size();
+  return d_ticketKeys.read_lock()->size();
 }
 
 void OpenSSLTLSTicketKeysRing::loadTicketsKeys(const std::string& keyFile)
@@ -705,11 +761,22 @@ std::unique_ptr<SSL_CTX, void(*)(SSL_CTX*)> libssl_init_server_context(const TLS
     SSL_CTX_sess_set_cache_size(ctx.get(), config.d_maxStoredSessions);
   }
 
+  long mode = 0;
 #ifdef SSL_MODE_RELEASE_BUFFERS
   if (config.d_releaseBuffers) {
-    SSL_CTX_set_mode(ctx.get(), SSL_MODE_RELEASE_BUFFERS);
+    mode |= SSL_MODE_RELEASE_BUFFERS;
   }
 #endif
+
+  if (config.d_asyncMode) {
+#ifdef SSL_MODE_ASYNC
+    mode |= SSL_MODE_ASYNC;
+#else
+    cerr<<"Warning: TLS async mode requested but not supported"<<endl;
+#endif
+  }
+
+  SSL_CTX_set_mode(ctx.get(), mode);
 
   /* we need to set this callback to acknowledge the server name sent by the client,
      otherwise it will not stored in the session and will not be accessible when the
@@ -719,25 +786,57 @@ std::unique_ptr<SSL_CTX, void(*)(SSL_CTX*)> libssl_init_server_context(const TLS
   std::vector<int> keyTypes;
   /* load certificate and private key */
   for (const auto& pair : config.d_certKeyPairs) {
-    if (SSL_CTX_use_certificate_chain_file(ctx.get(), pair.first.c_str()) != 1) {
-      ERR_print_errors_fp(stderr);
-      throw std::runtime_error("An error occurred while trying to load the TLS server certificate file: " + pair.first);
-    }
-    if (SSL_CTX_use_PrivateKey_file(ctx.get(), pair.second.c_str(), SSL_FILETYPE_PEM) != 1) {
-      ERR_print_errors_fp(stderr);
-      throw std::runtime_error("An error occurred while trying to load the TLS server private key file: " + pair.second);
+    if (!pair.d_key) {
+#if defined(HAVE_SSL_CTX_USE_CERT_AND_KEY) && HAVE_SSL_CTX_USE_CERT_AND_KEY == 1
+      // If no separate key is given, treat it as a pkcs12 file
+      auto fp = std::unique_ptr<FILE, int(*)(FILE*)>(fopen(pair.d_cert.c_str(), "r"), fclose);
+      if (!fp) {
+        throw std::runtime_error("Unable to open file " + pair.d_cert);
+      }
+      auto p12 = std::unique_ptr<PKCS12, void(*)(PKCS12*)>(d2i_PKCS12_fp(fp.get(), nullptr), PKCS12_free);
+      if (!p12) {
+        throw std::runtime_error("Unable to open PKCS12 file " + pair.d_cert);
+      }
+      EVP_PKEY *keyptr = nullptr;
+      X509 *certptr = nullptr;
+      STACK_OF(X509) *captr = nullptr;
+      if (!PKCS12_parse(p12.get(), (pair.d_password ? pair.d_password->c_str() : nullptr), &keyptr, &certptr, &captr))
+      {
+        ERR_print_errors_fp(stderr);
+        throw std::runtime_error("An error occured while parsing PKCS12 file " + pair.d_cert);
+      }
+      auto key = std::unique_ptr<EVP_PKEY, void(*)(EVP_PKEY*)>(keyptr, EVP_PKEY_free);
+      auto cert = std::unique_ptr<X509, void(*)(X509*)>(certptr, X509_free);
+      auto ca = std::unique_ptr<STACK_OF(X509), void(*)(STACK_OF(X509)*)>(captr, sk_X509_free);
+
+      if (SSL_CTX_use_cert_and_key(ctx.get(), cert.get(), key.get(), ca.get(), 1) != 1) {
+        ERR_print_errors_fp(stderr);
+        throw std::runtime_error("An error occurred while trying to load the TLS certificate and key from PKCS12 file " + pair.d_cert);
+      }
+#else
+      throw std::runtime_error("PKCS12 files are not supported by your openssl version");
+#endif /* HAVE_SSL_CTX_USE_CERT_AND_KEY */
+    } else {
+      if (SSL_CTX_use_certificate_chain_file(ctx.get(), pair.d_cert.c_str()) != 1) {
+        ERR_print_errors_fp(stderr);
+        throw std::runtime_error("An error occurred while trying to load the TLS server certificate file: " + pair.d_cert);
+      }
+      if (SSL_CTX_use_PrivateKey_file(ctx.get(), pair.d_key->c_str(), SSL_FILETYPE_PEM) != 1) {
+        ERR_print_errors_fp(stderr);
+        throw std::runtime_error("An error occurred while trying to load the TLS server private key file: " + pair.d_key.value());
+      }
     }
     if (SSL_CTX_check_private_key(ctx.get()) != 1) {
       ERR_print_errors_fp(stderr);
-      throw std::runtime_error("The key from '" + pair.second + "' does not match the certificate from '" + pair.first + "'");
+      throw std::runtime_error("The key from '" + pair.d_key.value() + "' does not match the certificate from '" + pair.d_cert + "'");
     }
     /* store the type of the new key, we might need it later to select the right OCSP stapling response */
     auto keyType = libssl_get_last_key_type(ctx);
     if (keyType < 0) {
-      throw std::runtime_error("The key from '" + pair.second + "' has an unknown type");
+      throw std::runtime_error("The key from '" + pair.d_key.value() + "' has an unknown type");
     }
     keyTypes.push_back(keyType);
-  }
+ }
 
   if (!config.d_ocspFiles.empty()) {
     try {
@@ -782,9 +881,15 @@ static void libssl_key_log_file_callback(const SSL* ssl, const char* line)
 std::unique_ptr<FILE, int(*)(FILE*)> libssl_set_key_log_file(std::unique_ptr<SSL_CTX, void(*)(SSL_CTX*)>& ctx, const std::string& logFile)
 {
 #ifdef HAVE_SSL_CTX_SET_KEYLOG_CALLBACK
-  auto fp = std::unique_ptr<FILE, int(*)(FILE*)>(fopen(logFile.c_str(), "a"), fclose);
+  int fd = open(logFile.c_str(),  O_WRONLY | O_CREAT | O_APPEND, 0600);
+  if (fd == -1) {
+    unixDie("Error opening TLS log file '" + logFile + "'");
+  }
+  auto fp = std::unique_ptr<FILE, int(*)(FILE*)>(fdopen(fd, "a"), fclose);
   if (!fp) {
-    throw std::runtime_error("Error opening TLS log file '" + logFile + "'");
+    int error = errno; // close might clobber errno
+    close(fd);
+    throw std::runtime_error("Error opening TLS log file '" + logFile + "': " + stringerror(error));
   }
 
   SSL_CTX_set_ex_data(ctx.get(), s_keyLogIndex, fp.get());
@@ -795,6 +900,40 @@ std::unique_ptr<FILE, int(*)(FILE*)> libssl_set_key_log_file(std::unique_ptr<SSL
   return std::unique_ptr<FILE, int(*)(FILE*)>(nullptr, fclose);
 #endif /* HAVE_SSL_CTX_SET_KEYLOG_CALLBACK */
 }
+
+/* called in a client context, if the client advertised more than one ALPN values and the server returned more than one as well, to select the one to use. */
+void libssl_set_npn_select_callback(SSL_CTX* ctx, int (*cb)(SSL* s, unsigned char** out, unsigned char* outlen, const unsigned char* in, unsigned int inlen, void* arg), void* arg)
+{
+#ifdef HAVE_SSL_CTX_SET_NEXT_PROTO_SELECT_CB
+  SSL_CTX_set_next_proto_select_cb(ctx, cb, arg);
+#endif
+}
+
+void libssl_set_alpn_select_callback(SSL_CTX* ctx, int (*cb)(SSL* s, const unsigned char** out, unsigned char* outlen, const unsigned char* in, unsigned int inlen, void* arg), void* arg)
+{
+#ifdef HAVE_SSL_CTX_SET_ALPN_SELECT_CB
+  SSL_CTX_set_alpn_select_cb(ctx, cb, arg);
+#endif
+}
+
+bool libssl_set_alpn_protos(SSL_CTX* ctx, const std::vector<std::vector<uint8_t>>& protos)
+{
+#ifdef HAVE_SSL_CTX_SET_ALPN_PROTOS
+  std::vector<uint8_t> wire;
+  for (const auto& proto : protos) {
+    if (proto.size() > std::numeric_limits<uint8_t>::max()) {
+      throw std::runtime_error("Invalid ALPN value");
+    }
+    uint8_t length = proto.size();
+    wire.push_back(length);
+    wire.insert(wire.end(), proto.begin(), proto.end());
+  }
+  return SSL_CTX_set_alpn_protos(ctx, wire.data(), wire.size()) == 0;
+#else
+  return false;
+#endif
+}
+
 
 std::string libssl_get_error_string()
 {

@@ -46,11 +46,9 @@ using namespace boost::assign;
 #include "namespaces.hh"
 
 
-DNSSECKeeper::keycache_t DNSSECKeeper::s_keycache;
-DNSSECKeeper::metacache_t DNSSECKeeper::s_metacache;
+SharedLockGuarded<DNSSECKeeper::keycache_t> DNSSECKeeper::s_keycache;
+SharedLockGuarded<DNSSECKeeper::metacache_t> DNSSECKeeper::s_metacache;
 int64_t DNSSECKeeper::s_metaCacheCleanActions = 0;
-ReadWriteLock DNSSECKeeper::s_metacachelock;
-ReadWriteLock DNSSECKeeper::s_keycachelock;
 AtomicCounter DNSSECKeeper::s_ops;
 time_t DNSSECKeeper::s_last_prune;
 size_t DNSSECKeeper::s_maxEntries = 0;
@@ -122,34 +120,29 @@ bool DNSSECKeeper::addKey(const DNSName& name, bool setSEPBit, int algorithm, in
 }
 
 void DNSSECKeeper::clearAllCaches() {
-  {
-    WriteLock l(&s_keycachelock);
-    s_keycache.clear();
-  }
-  WriteLock l(&s_metacachelock);
-  s_metacache.clear();
+  s_keycache.write_lock()->clear();
+  s_metacache.write_lock()->clear();
 }
 
-
+/* This function never fails, the return value is to simplify call chains
+   elsewhere so we can do mutate<cache> && clear<cache> */
 bool DNSSECKeeper::clearKeyCache(const DNSName& name)
 {
-  WriteLock l(&s_keycachelock);
-  s_keycache.erase(name);
+  s_keycache.write_lock()->erase(name);
   return true;
 }
 
 bool DNSSECKeeper::clearMetaCache(const DNSName& name)
 {
-  WriteLock l(&s_metacachelock);
-  s_metacache.erase(name);
+  s_metacache.write_lock()->erase(name);
   ++s_metaCacheCleanActions;
   return true;
 }
 
 void DNSSECKeeper::clearCaches(const DNSName& name)
 {
-  clearKeyCache(name);
-  clearMetaCache(name);
+  (void)clearKeyCache(name);
+  (void)clearMetaCache(name);
 }
 
 bool DNSSECKeeper::addKey(const DNSName& name, const DNSSECPrivateKey& dpk, int64_t& id, bool active, bool published)
@@ -166,8 +159,8 @@ bool DNSSECKeeper::addKey(const DNSName& name, const DNSSECPrivateKey& dpk, int6
 
 static bool keyCompareByKindAndID(const DNSSECKeeper::keyset_t::value_type& a, const DNSSECKeeper::keyset_t::value_type& b)
 {
-  return make_pair(!a.second.keyType, a.second.id) <
-         make_pair(!b.second.keyType, b.second.id);
+  return pair(!a.second.keyType, a.second.id) <
+         pair(!b.second.keyType, b.second.id);
 }
 
 DNSSECPrivateKey DNSSECKeeper::getKeyById(const DNSName& zname, unsigned int id)
@@ -247,9 +240,9 @@ bool DNSSECKeeper::getFromMeta(const DNSName& zname, const std::string& key, std
   METAValues meta;
 
   if (ttl) {
-    ReadLock l(&s_metacachelock);
-    auto iter = s_metacache.find(zname);
-    if(iter != s_metacache.end() && iter->d_ttd > now) {
+    auto metacache = s_metacache.read_lock();
+    auto iter = metacache->find(zname);
+    if(iter != metacache->end() && iter->d_ttd > now) {
       meta = iter->d_value;
       fromCache = true;
     }
@@ -276,11 +269,11 @@ bool DNSSECKeeper::getFromMeta(const DNSName& zname, const std::string& key, std
     nce.d_ttd = now + ttl;
     nce.d_value = std::move(meta);
     {
-      WriteLock l(&s_metacachelock);
+      auto metacache = s_metacache.write_lock();
       if(d_metaCacheCleanAction != s_metaCacheCleanActions) {
         return false;
       }
-      lruReplacingInsert<SequencedTag>(s_metacache, nce);
+      lruReplacingInsert<SequencedTag>(*metacache, nce);
     }
   }
 
@@ -324,12 +317,10 @@ void DNSSECKeeper::getSoaEdit(const DNSName& zname, std::string& value, bool use
 uint64_t DNSSECKeeper::dbdnssecCacheSizes(const std::string& str)
 {
   if(str=="meta-cache-size") {
-    ReadLock l(&s_metacachelock);
-    return s_metacache.size();
+    return s_metacache.read_lock()->size();
   }
   else if(str=="key-cache-size") {
-    ReadLock l(&s_keycachelock);
-    return s_keycache.size();
+    return s_keycache.read_lock()->size();
   }
   return (uint64_t)-1;
 }
@@ -556,10 +547,10 @@ DNSSECKeeper::keyset_t DNSSECKeeper::getKeys(const DNSName& zone, bool useCache)
   }
 
   if (useCache && ttl > 0) {
-    ReadLock l(&s_keycachelock);
-    keycache_t::const_iterator iter = s_keycache.find(zone);
+    auto keycache = s_keycache.read_lock();
+    auto iter = keycache->find(zone);
 
-    if(iter != s_keycache.end() && iter->d_ttd > now) {
+    if (iter != keycache->end() && iter->d_ttd > now) {
       keyset_t ret;
       ret.reserve(iter->d_keys.size());
       for(const keyset_t::value_type& value :  iter->d_keys)
@@ -616,7 +607,7 @@ DNSSECKeeper::keyset_t DNSSECKeeper::getKeys(const DNSName& zone, bool useCache)
     else
       kmd.keyType = ZSK;
 
-    retkeyset.push_back(make_pair(dpk, kmd));
+    retkeyset.emplace_back(dpk, kmd);
   }
   sort(retkeyset.begin(), retkeyset.end(), keyCompareByKindAndID);
 
@@ -626,8 +617,7 @@ DNSSECKeeper::keyset_t DNSSECKeeper::getKeys(const DNSName& zone, bool useCache)
     kce.d_keys = retkeyset;
     kce.d_ttd = now + ttl;
     {
-      WriteLock l(&s_keycachelock);
-      lruReplacingInsert<SequencedTag>(s_keycache, kce);
+      lruReplacingInsert<SequencedTag>(*(s_keycache.write_lock()), kce);
     }
   }
 
@@ -754,7 +744,7 @@ bool DNSSECKeeper::rectifyZone(const DNSName& zone, string& error, string& info,
     }
     // We don't have a *full* Ueberbackend, just a key-only one.
     // Let's create one and use it
-    b = std::unique_ptr<UeberBackend>(new UeberBackend());
+    b = std::make_unique<UeberBackend>();
     B = b.get();
   }
 
@@ -981,12 +971,10 @@ void DNSSECKeeper::cleanup()
 
   if(now.tv_sec - s_last_prune > (time_t)(30)) {
     {
-        WriteLock l(&s_metacachelock);
-        pruneCollection<SequencedTag>(*this, s_metacache, s_maxEntries);
+      pruneCollection<SequencedTag>(*this, (*s_metacache.write_lock()), s_maxEntries);
     }
     {
-        WriteLock l(&s_keycachelock);
-        pruneCollection<SequencedTag>(*this, s_keycache, s_maxEntries);
+      pruneCollection<SequencedTag>(*this, (*s_keycache.write_lock()), s_maxEntries);
     }
     s_last_prune = time(nullptr);
   }
@@ -996,7 +984,6 @@ void DNSSECKeeper::setMaxEntries(size_t maxEntries)
 {
   s_maxEntries = maxEntries;
 #if BOOST_VERSION >= 105600
-  WriteLock wl(&s_keycachelock);
-  s_keycache.get<KeyCacheTag>().reserve(s_maxEntries);
+  s_keycache.write_lock()->get<KeyCacheTag>().reserve(s_maxEntries);
 #endif /* BOOST_VERSION >= 105600 */
 }

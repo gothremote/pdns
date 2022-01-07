@@ -28,10 +28,12 @@
 #include "dnsdist.hh"
 #include "dnsdist-lua.hh"
 
+#include <boost/lexical_cast.hpp>
+
 void setupLuaBindingsPacketCache(LuaContext& luaCtx, bool client)
 {
   /* PacketCache */
-  luaCtx.writeFunction("newPacketCache", [client](size_t maxEntries, boost::optional<std::unordered_map<std::string, boost::variant<bool, size_t>>> vars) {
+  luaCtx.writeFunction("newPacketCache", [client](size_t maxEntries, boost::optional<std::unordered_map<std::string, boost::variant<bool, size_t, std::vector<std::pair<int, uint16_t>>>>> vars) {
 
       bool keepStaleData = false;
       size_t maxTTL = 86400;
@@ -43,7 +45,7 @@ void setupLuaBindingsPacketCache(LuaContext& luaCtx, bool client)
       bool dontAge = false;
       bool deferrableInsertLock = true;
       bool ecsParsing = false;
-      bool cookieHashing = false;
+      std::unordered_set<uint16_t> optionsToSkip{EDNSOptionCode::COOKIE};
 
       if (vars) {
 
@@ -88,7 +90,14 @@ void setupLuaBindingsPacketCache(LuaContext& luaCtx, bool client)
         }
 
         if (vars->count("cookieHashing")) {
-          cookieHashing = boost::get<bool>((*vars)["cookieHashing"]);
+          if (boost::get<bool>((*vars)["cookieHashing"])) {
+            optionsToSkip.erase(EDNSOptionCode::COOKIE);
+          }
+        }
+        if (vars->count("skipOptions")) {
+          for (auto option: boost::get<std::vector<std::pair<int, uint16_t>>>(vars->at("skipOptions"))) {
+            optionsToSkip.insert(option.second);
+          }
         }
       }
 
@@ -106,10 +115,12 @@ void setupLuaBindingsPacketCache(LuaContext& luaCtx, bool client)
       auto res = std::make_shared<DNSDistPacketCache>(maxEntries, maxTTL, minTTL, tempFailTTL, maxNegativeTTL, staleTTL, dontAge, numberOfShards, deferrableInsertLock, ecsParsing);
 
       res->setKeepStaleData(keepStaleData);
-      res->setCookieHashing(cookieHashing);
+      res->setSkippedOptions(optionsToSkip);
 
       return res;
     });
+
+#ifndef DISABLE_PACKETCACHE_BINDINGS
   luaCtx.registerFunction<std::string(std::shared_ptr<DNSDistPacketCache>::*)()const>("toString", [](const std::shared_ptr<DNSDistPacketCache>& cache) {
       if (cache) {
         return cache->toString();
@@ -202,4 +213,5 @@ void setupLuaBindingsPacketCache(LuaContext& luaCtx, bool client)
         g_outputBuffer += "Dumped " + std::to_string(records) + " records\n";
       }
     });
+#endif /* DISABLE_PACKETCACHE_BINDINGS */
 }

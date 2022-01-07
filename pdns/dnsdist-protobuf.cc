@@ -20,6 +20,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  */
 #include "config.h"
+
+#ifndef DISABLE_PROTOBUF
 #include "dnsdist.hh"
 #include "dnsdist-protobuf.hh"
 #include "protozero.hh"
@@ -78,12 +80,12 @@ void DNSDistProtoBufMessage::setBytes(size_t bytes)
 
 void DNSDistProtoBufMessage::setTime(time_t sec, uint32_t usec)
 {
-  d_time = std::make_pair(sec, usec);
+  d_time = std::pair(sec, usec);
 }
 
 void DNSDistProtoBufMessage::setQueryTime(time_t sec, uint32_t usec)
 {
-  d_queryTime = std::make_pair(sec, usec);
+  d_queryTime = std::pair(sec, usec);
 }
 
 void DNSDistProtoBufMessage::setQuestion(const DNSName& name, uint16_t qtype, uint16_t qclass)
@@ -124,7 +126,26 @@ void DNSDistProtoBufMessage::serialize(std::string& data) const
     m.setTime(ts.tv_sec, ts.tv_nsec / 1000);
   }
 
-  m.setRequest(d_dq.uniqueId ? *d_dq.uniqueId : getUniqueID(), d_requestor ? *d_requestor : *d_dq.remote, d_responder ? *d_responder : *d_dq.local, d_question ? d_question->d_name : *d_dq.qname, d_question ? d_question->d_type : d_dq.qtype, d_question ? d_question->d_class : d_dq.qclass, d_dq.getHeader()->id, (d_dq.getProtocol() == DNSQuestion::Protocol::DoH) ? true : d_dq.overTCP(), d_bytes ? *d_bytes : d_dq.getData().size());
+  const auto distProto = d_dq.getProtocol();
+  pdns::ProtoZero::Message::TransportProtocol protocol = pdns::ProtoZero::Message::TransportProtocol::UDP;
+
+  if (distProto == dnsdist::Protocol::DoTCP) {
+    protocol = pdns::ProtoZero::Message::TransportProtocol::TCP;
+  }
+  else if (distProto == dnsdist::Protocol::DoT) {
+    protocol = pdns::ProtoZero::Message::TransportProtocol::DoT;
+  }
+  else if (distProto == dnsdist::Protocol::DoH) {
+    protocol = pdns::ProtoZero::Message::TransportProtocol::DoH;
+  }
+  else if (distProto == dnsdist::Protocol::DNSCryptUDP) {
+    protocol = pdns::ProtoZero::Message::TransportProtocol::DNSCryptUDP;
+  }
+  else if (distProto == dnsdist::Protocol::DNSCryptTCP) {
+    protocol = pdns::ProtoZero::Message::TransportProtocol::DNSCryptTCP;
+  }
+
+  m.setRequest(d_dq.uniqueId ? *d_dq.uniqueId : getUniqueID(), d_requestor ? *d_requestor : *d_dq.remote, d_responder ? *d_responder : *d_dq.local, d_question ? d_question->d_name : *d_dq.qname, d_question ? d_question->d_type : d_dq.qtype, d_question ? d_question->d_class : d_dq.qclass, d_dq.getHeader()->id, protocol, d_bytes ? *d_bytes : d_dq.getData().size());
 
   if (d_serverIdentity) {
     m.setServerIdentity(*d_serverIdentity);
@@ -165,3 +186,5 @@ void DNSDistProtoBufMessage::serialize(std::string& data) const
 
   m.commitResponse();
 }
+
+#endif /* DISABLE_PROTOBUF */

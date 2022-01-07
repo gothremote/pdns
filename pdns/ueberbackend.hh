@@ -31,6 +31,7 @@
 
 #include "dnspacket.hh"
 #include "dnsbackend.hh"
+#include "lock.hh"
 #include "namespaces.hh"
 
 /** This is a very magic backend that allows us to load modules dynamically,
@@ -53,8 +54,7 @@ public:
   /** Tracks all created UeberBackend instances for us. We use this vector to notify
       existing threads of new modules 
   */
-  static vector<UeberBackend *>instances;
-  static std::mutex instances_lock;
+  static LockGuarded<vector<UeberBackend *>> d_instances;
 
   static bool loadmodule(const string &name);
   static bool loadModules(const vector<string>& modules, const string& path);
@@ -101,7 +101,7 @@ public:
   /** Load SOA info from backends, ignoring the cache.*/
   bool getSOAUncached(const DNSName &domain, SOAData &sd);
   bool get(DNSZoneRecord &r);
-  void getAllDomains(vector<DomainInfo> *domains, bool include_disabled=false);
+  void getAllDomains(vector<DomainInfo>* domains, bool getSerial, bool include_disabled);
 
   void getUnfreshSlaveInfos(vector<DomainInfo>* domains);
   void getUpdatedMasters(vector<DomainInfo>* domains);

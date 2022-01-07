@@ -8,8 +8,45 @@ Please upgrade to the PowerDNS Authoritative Server 4.0.0 from 3.4.2+.
 See the `3.X <https://doc.powerdns.com/3/authoritative/upgrading/>`__
 upgrade notes if your version is older than 3.4.2.
 
-4.4.x to 4.5.0 or master
+4.5.x to 4.6.0 or master
 ------------------------
+
+Automatic conversion of ``@`` signs in SOA
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Before version 4.5.0, PowerDNS would automatically replace ``@`` in the SOA RNAME with ``.``, making it easy for users to enter their hostmaster email address without having to think about syntax.
+However, this feature interacts badly with handling of presigned zones.
+In version 4.5.0, this feature was accidentally broken in the implementation of the zone cache.
+In 4.6.0, this automatic conversion is fully removed.
+If you still have ``@`` signs in any SOA RNAMEs, 4.6.0 will serve those out literally.
+You can find any stray ``@`` signs by running ``pdnsutil check-all-zones``.
+
+New default NSEC3 parameters
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Following `draft-ietf-dnsop-nsec3-guidance (Guidance for NSEC3 parameter settings) <https://datatracker.ietf.org/doc/html/draft-ietf-dnsop-nsec3-guidance>`__, the default NSEC3PARAM settings (see :ref:`dnssec-operational-nsec-modes-params`) in pdnsutil are now `1 0 0 -` instead of `1 0 1 ab`.
+
+SHA1 DSes
+^^^^^^^^^
+
+``pdnsutil show-zone`` and ``pdnsutil export-zone-ds`` no longer emit SHA1 DS records, unless ``--verbose`` is in use.
+
+Privileged port binding in Docker
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+In our Docker image, our binaries are no longer granted the ``net_bind_service`` capability, as this is unnecessary in many deployments.
+For more information, see the section `"Privileged ports" in Docker-README <https://github.com/PowerDNS/pdns/blob/master/Docker-README.md#privileged-ports>`__.
+
+4.4.x to 4.5.0
+--------------
+
+Automatic conversion of ``@`` signs in SOA
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Before version 4.5.0, PowerDNS would automatically replace ``@`` in the SOA RNAME with ``.``, making it easy for users to enter their hostmaster email address without having to think about syntax.
+In version 4.5.0, this feature was accidentally broken in the implementation of the zone cache, and the replacement would only happen if the zone cache was disabled.
+Note that in 4.6.0, this automatic conversion is fully removed.
+If you still have ``@`` signs in any SOA RNAMEs, 4.5.0 will serve those out literally if the zone cache is enabled.
 
 Record type changes
 ^^^^^^^^^^^^^^^^^^^

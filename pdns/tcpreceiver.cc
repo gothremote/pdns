@@ -58,6 +58,8 @@
 #include "namespaces.hh"
 #include "signingpipe.hh"
 #include "stubresolver.hh"
+#include "proxy-protocol.hh"
+#include "noinitvector.hh"
 extern AuthPacketCache PC;
 extern StatBag S;
 
@@ -66,24 +68,22 @@ extern StatBag S;
 \brief This file implements the tcpreceiver that receives and answers questions over TCP/IP
 */
 
-std::mutex TCPNameserver::s_plock;
 std::unique_ptr<Semaphore> TCPNameserver::d_connectionroom_sem{nullptr};
-std::unique_ptr<PacketHandler> TCPNameserver::s_P{nullptr};
+LockGuarded<std::unique_ptr<PacketHandler>> TCPNameserver::s_P{nullptr};
 unsigned int TCPNameserver::d_maxTCPConnections = 0;
 NetmaskGroup TCPNameserver::d_ng;
 size_t TCPNameserver::d_maxTransactionsPerConn;
 size_t TCPNameserver::d_maxConnectionsPerClient;
 unsigned int TCPNameserver::d_idleTimeout;
 unsigned int TCPNameserver::d_maxConnectionDuration;
-std::mutex TCPNameserver::s_clientsCountMutex;
-std::map<ComboAddress,size_t,ComboAddress::addressOnlyLessThan> TCPNameserver::s_clientsCount;
+LockGuarded<std::map<ComboAddress,size_t,ComboAddress::addressOnlyLessThan>> TCPNameserver::s_clientsCount;
 
 void TCPNameserver::go()
 {
   g_log<<Logger::Error<<"Creating backend connection for TCP"<<endl;
-  s_P.reset();
+  s_P.lock()->reset();
   try {
-    s_P=make_unique<PacketHandler>();
+    *(s_P.lock()) = make_unique<PacketHandler>();
   }
   catch(PDNSException &ae) {
     g_log<<Logger::Error<<"TCP server is unable to launch backends - will try again when questions come in: "<<ae.reason<<endl;
@@ -204,10 +204,15 @@ static bool maxConnectionDurationReached(unsigned int maxConnectionDuration, tim
 void TCPNameserver::decrementClientCount(const ComboAddress& remote)
 {
   if (d_maxConnectionsPerClient) {
-    std::lock_guard<std::mutex> lock(s_clientsCountMutex);
-    s_clientsCount[remote]--;
-    if (s_clientsCount[remote] == 0) {
-      s_clientsCount.erase(remote);
+    auto count = s_clientsCount.lock();
+    auto it = count->find(remote);
+    if (it == count->end()) {
+      // this is worrying, but nothing we can do at this point
+      return;
+    }
+    --it->second;
+    if (it->second == 0) {
+      count->erase(it);
     }
   }
 }
@@ -240,9 +245,59 @@ void TCPNameserver::doConnection(int fd)
   try {
     int mesgsize=65535;
     boost::scoped_array<char> mesg(new char[mesgsize]);
-    
+    std::optional<ComboAddress> inner_remote;
+    bool inner_tcp = false;
+
     DLOG(g_log<<"TCP Connection accepted on fd "<<fd<<endl);
     bool logDNSQueries= ::arg().mustDo("log-dns-queries");
+    if (g_proxyProtocolACL.match(remote)) {
+      unsigned int remainingTime = 0;
+      PacketBuffer proxyData;
+      proxyData.reserve(g_proxyProtocolMaximumSize);
+      ssize_t used;
+
+      // this for-loop ends by throwing, or by having gathered a complete proxy header
+      for (;;) {
+        used = isProxyHeaderComplete(proxyData);
+        if (used < 0) {
+          ssize_t origsize = proxyData.size();
+          proxyData.resize(origsize + -used);
+          if (maxConnectionDurationReached(d_maxConnectionDuration, start, remainingTime)) {
+            throw NetworkError("Error reading PROXYv2 header from TCP client "+remote.toString()+": maximum TCP connection duration exceeded");
+          }
+
+          try {
+            readnWithTimeout(fd, &proxyData[origsize], -used, d_idleTimeout, true, remainingTime);
+          }
+          catch(NetworkError& ae) {
+            throw NetworkError("Error reading PROXYv2 header from TCP client "+remote.toString()+": "+ae.what());
+          }
+        }
+        else if (used == 0) {
+          throw NetworkError("Error reading PROXYv2 header from TCP client "+remote.toString()+": PROXYv2 header was invalid");
+        }
+        else if (static_cast<size_t>(used) > g_proxyProtocolMaximumSize) {
+          throw NetworkError("Error reading PROXYv2 header from TCP client "+remote.toString()+": PROXYv2 header too big");
+        }
+        else { // used > 0 && used <= g_proxyProtocolMaximumSize
+          break;
+        }
+      }
+      ComboAddress psource, pdestination;
+      bool proxyProto, tcp;
+      std::vector<ProxyProtocolValue> ppvalues;
+
+      used = parseProxyHeader(proxyData, proxyProto, psource, pdestination, tcp, ppvalues);
+      if (used <= 0) {
+        throw NetworkError("Error reading PROXYv2 header from TCP client "+remote.toString()+": PROXYv2 header was invalid");
+      }
+      if (static_cast<size_t>(used) > g_proxyProtocolMaximumSize) {
+        throw NetworkError("Error reading PROXYv2 header from TCP client "+remote.toString()+": PROXYv2 header was oversized");
+      }
+      inner_remote = psource;
+      inner_tcp = tcp;
+    }
+
     for(;;) {
       unsigned int remainingTime = 0;
       transactions++;
@@ -288,10 +343,17 @@ void TCPNameserver::doConnection(int fd)
       packet=make_unique<DNSPacket>(true);
       packet->setRemote(&remote);
       packet->d_tcp=true;
+      if (inner_remote) {
+        packet->d_inner_remote = inner_remote;
+        packet->d_tcp = inner_tcp;
+      }
       packet->setSocket(fd);
       if(packet->parse(mesg.get(), pktlen)<0)
         break;
-      
+
+      if (packet->hasEDNSCookie())
+        S.inc("tcp-cookie-queries");
+
       if(packet->qtype.getCode()==QType::AXFR) {
         doAXFR(packet->qdomain, packet, fd);
         continue;
@@ -305,12 +367,7 @@ void TCPNameserver::doConnection(int fd)
       std::unique_ptr<DNSPacket> reply; 
       auto cached = make_unique<DNSPacket>(false);
       if(logDNSQueries)  {
-        string remote_text;
-        if(packet->hasEDNSSubnet())
-          remote_text = packet->getRemote().toString() + "<-" + packet->getRealRemote().toString();
-        else
-          remote_text = packet->getRemote().toString();
-        g_log << Logger::Notice<<"TCP Remote "<< remote_text <<" wants '" << packet->qdomain<<"|"<<packet->qtype.toString() <<
+        g_log << Logger::Notice<<"TCP Remote "<< packet->getRemoteString() <<" wants '" << packet->qdomain<<"|"<<packet->qtype.toString() <<
         "', do = " <<packet->d_dnssecOk <<", bufsize = "<< packet->getMaxReplyLen();
       }
 
@@ -334,13 +391,13 @@ void TCPNameserver::doConnection(int fd)
         }
       }
       {
-        std::lock_guard<std::mutex> l(s_plock);
-        if(!s_P) {
+        auto packetHandler = s_P.lock();
+        if (!*packetHandler) {
           g_log<<Logger::Warning<<"TCP server is without backend connections, launching"<<endl;
-          s_P=make_unique<PacketHandler>();
+          *packetHandler = make_unique<PacketHandler>();
         }
 
-        reply= s_P->doQuestion(*packet); // we really need to ask the backend :-)
+        reply = (*packetHandler)->doQuestion(*packet); // we really need to ask the backend :-)
       }
 
       if(!reply)  // unable to write an answer?
@@ -350,8 +407,7 @@ void TCPNameserver::doConnection(int fd)
     }
   }
   catch(PDNSException &ae) {
-    std::lock_guard<std::mutex> l(s_plock);
-    s_P.reset(); // on next call, backend will be recycled
+    s_P.lock()->reset(); // on next call, backend will be recycled
     g_log<<Logger::Error<<"TCP nameserver had error, cycling backend: "<<ae.reason<<endl;
   }
   catch(NetworkError &e) {
@@ -359,11 +415,13 @@ void TCPNameserver::doConnection(int fd)
   }
 
   catch(std::exception &e) {
-    g_log<<Logger::Error<<"TCP Connection Thread died because of STL error: "<<e.what()<<endl;
+    s_P.lock()->reset(); // on next call, backend will be recycled
+    g_log << Logger::Error << "TCP Connection Thread died because of STL error, cycling backend: " << e.what() << endl;
   }
   catch( ... )
   {
-    g_log << Logger::Error << "TCP Connection Thread caught unknown exception." << endl;
+    s_P.lock()->reset(); // on next call, backend will be recycled
+    g_log << Logger::Error << "TCP Connection Thread caught unknown exception, cycling backend." << endl;
   }
   d_connectionroom_sem->post();
 
@@ -377,25 +435,24 @@ void TCPNameserver::doConnection(int fd)
 }
 
 
-// call this method with s_plock held!
-bool TCPNameserver::canDoAXFR(std::unique_ptr<DNSPacket>& q, bool isAXFR)
+bool TCPNameserver::canDoAXFR(std::unique_ptr<DNSPacket>& q, bool isAXFR, std::unique_ptr<PacketHandler>& packetHandler)
 {
   if(::arg().mustDo("disable-axfr"))
     return false;
 
-  string logPrefix=string(isAXFR ? "A" : "I")+"XFR-out zone '"+q->qdomain.toLogString()+"', client '"+q->getRemote().toStringWithPort()+"', ";
+  string logPrefix=string(isAXFR ? "A" : "I")+"XFR-out zone '"+q->qdomain.toLogString()+"', client '"+q->getInnerRemote().toStringWithPort()+"', ";
 
   if(q->d_havetsig) { // if you have one, it must be good
     TSIGRecordContent trc;
     DNSName keyname;
     string secret;
-    if(!q->checkForCorrectTSIG(s_P->getBackend(), &keyname, &secret, &trc)) {
+    if(!q->checkForCorrectTSIG(packetHandler->getBackend(), &keyname, &secret, &trc)) {
       return false;
     } else {
       getTSIGHashEnum(trc.d_algoName, q->d_tsig_algo);
     }
 
-    DNSSECKeeper dk(s_P->getBackend());
+    DNSSECKeeper dk(packetHandler->getBackend());
     if(!dk.TSIGGrantsAccess(q->qdomain, keyname)) {
       g_log<<Logger::Warning<<logPrefix<<"denied: key with name '"<<keyname<<"' and algorithm '"<<getTSIGAlgoName(q->d_tsig_algo)<<"' does not grant access"<<endl;
       return false;
@@ -407,7 +464,7 @@ bool TCPNameserver::canDoAXFR(std::unique_ptr<DNSPacket>& q, bool isAXFR)
   }
   
   // cerr<<"checking allow-axfr-ips"<<endl;
-  if(!(::arg()["allow-axfr-ips"].empty()) && d_ng.match( (ComboAddress *) &q->d_remote )) {
+  if(!(::arg()["allow-axfr-ips"].empty()) && d_ng.match( q->getInnerRemote() )) {
     g_log<<Logger::Notice<<logPrefix<<"allowed: client IP is in allow-axfr-ips"<<endl;
     return true;
   }
@@ -416,10 +473,10 @@ bool TCPNameserver::canDoAXFR(std::unique_ptr<DNSPacket>& q, bool isAXFR)
 
   // cerr<<"doing per-zone-axfr-acls"<<endl;
   SOAData sd;
-  if(s_P->getBackend()->getSOAUncached(q->qdomain,sd)) {
+  if(packetHandler->getBackend()->getSOAUncached(q->qdomain,sd)) {
     // cerr<<"got backend and SOA"<<endl;
     vector<string> acl;
-    s_P->getBackend()->getDomainMetadata(q->qdomain, "ALLOW-AXFR-FROM", acl);
+    packetHandler->getBackend()->getDomainMetadata(q->qdomain, "ALLOW-AXFR-FROM", acl);
     for (const auto & i : acl) {
       // cerr<<"matching against "<<*i<<endl;
       if(pdns_iequals(i, "AUTO-NS")) {
@@ -433,10 +490,10 @@ bool TCPNameserver::canDoAXFR(std::unique_ptr<DNSPacket>& q, bool isAXFR)
           nsset.insert(DNSName(rr.content));
         }
         for(const auto & j: nsset) {
-          vector<string> nsips=fns.lookup(j, s_P->getBackend());
+          vector<string> nsips=fns.lookup(j, packetHandler->getBackend());
           for(const auto & nsip : nsips) {
             // cerr<<"got "<<*k<<" from AUTO-NS"<<endl;
-            if(nsip == q->getRemote().toString())
+            if(nsip == q->getInnerRemote().toString())
             {
               // cerr<<"got AUTO-NS hit"<<endl;
               g_log<<Logger::Notice<<logPrefix<<"allowed: client IP is in NSset"<<endl;
@@ -448,7 +505,7 @@ bool TCPNameserver::canDoAXFR(std::unique_ptr<DNSPacket>& q, bool isAXFR)
       else
       {
         Netmask nm = Netmask(i);
-        if(nm.match( (ComboAddress *) &q->d_remote ))
+        if(nm.match( q->getInnerRemote() ))
         {
           g_log<<Logger::Notice<<logPrefix<<"allowed: client IP is in per-zone ACL"<<endl;
           // cerr<<"hit!"<<endl;
@@ -460,7 +517,7 @@ bool TCPNameserver::canDoAXFR(std::unique_ptr<DNSPacket>& q, bool isAXFR)
 
   extern CommunicatorClass Communicator;
 
-  if(Communicator.justNotified(q->qdomain, q->getRemote().toString())) { // we just notified this ip
+  if(Communicator.justNotified(q->qdomain, q->getInnerRemote().toString())) { // we just notified this ip
     g_log<<Logger::Notice<<logPrefix<<"allowed: client IP is from recently notified secondary"<<endl;
     return true;
   }
@@ -491,7 +548,7 @@ namespace {
 /** do the actual zone transfer. Return 0 in case of error, 1 in case of success */
 int TCPNameserver::doAXFR(const DNSName &target, std::unique_ptr<DNSPacket>& q, int outsock)
 {
-  string logPrefix="AXFR-out zone '"+target.toLogString()+"', client '"+q->getRemote().toStringWithPort()+"', ";
+  string logPrefix="AXFR-out zone '"+target.toLogString()+"', client '"+q->getRemoteString()+"', ";
 
   std::unique_ptr<DNSPacket> outpacket= getFreshAXFRPacket(q);
   if(q->d_dnssecOk)
@@ -502,22 +559,22 @@ int TCPNameserver::doAXFR(const DNSName &target, std::unique_ptr<DNSPacket>& q, 
   // determine if zone exists and AXFR is allowed using existing backend before spawning a new backend.
   SOAData sd;
   {
-    std::lock_guard<std::mutex> l(s_plock);
+    auto packetHandler = s_P.lock();
     DLOG(g_log<<logPrefix<<"looking for SOA"<<endl);    // find domain_id via SOA and list complete domain. No SOA, no AXFR
-    if(!s_P) {
+    if(!*packetHandler) {
       g_log<<Logger::Warning<<"TCP server is without backend connections in doAXFR, launching"<<endl;
-      s_P=make_unique<PacketHandler>();
+      *packetHandler = make_unique<PacketHandler>();
     }
 
     // canDoAXFR does all the ACL checks, and has the if(disable-axfr) shortcut, call it first.
-    if (!canDoAXFR(q, true)) {
+    if (!canDoAXFR(q, true, *packetHandler)) {
       g_log<<Logger::Warning<<logPrefix<<"failed: client may not request AXFR"<<endl;
       outpacket->setRcode(RCode::NotAuth);
       sendPacket(outpacket,outsock);
       return 0;
     }
 
-    if(!s_P->getBackend()->getSOAUncached(target, sd)) {
+    if(!(*packetHandler)->getBackend()->getSOAUncached(target, sd)) {
       g_log<<Logger::Warning<<logPrefix<<"failed: not authoritative"<<endl;
       outpacket->setRcode(RCode::NotAuth);
       sendPacket(outpacket,outsock);
@@ -1023,7 +1080,7 @@ int TCPNameserver::doAXFR(const DNSName &target, std::unique_ptr<DNSPacket>& q, 
 
 int TCPNameserver::doIXFR(std::unique_ptr<DNSPacket>& q, int outsock)
 {
-  string logPrefix="IXFR-out zone '"+q->qdomain.toLogString()+"', client '"+q->getRemote().toStringWithPort()+"', ";
+  string logPrefix="IXFR-out zone '"+q->qdomain.toLogString()+"', client '"+q->getRemoteString()+"', ";
 
   std::unique_ptr<DNSPacket> outpacket=getFreshAXFRPacket(q);
   if(q->d_dnssecOk)
@@ -1067,22 +1124,22 @@ int TCPNameserver::doIXFR(std::unique_ptr<DNSPacket>& q, int outsock)
   bool securedZone;
   bool serialPermitsIXFR;
   {
-    std::lock_guard<std::mutex> l(s_plock);
+    auto packetHandler = s_P.lock();
     DLOG(g_log<<logPrefix<<"Looking for SOA"<<endl); // find domain_id via SOA and list complete domain. No SOA, no IXFR
-    if(!s_P) {
+    if(!*packetHandler) {
       g_log<<Logger::Warning<<"TCP server is without backend connections in doIXFR, launching"<<endl;
-      s_P=make_unique<PacketHandler>();
+      *packetHandler = make_unique<PacketHandler>();
     }
 
     // canDoAXFR does all the ACL checks, and has the if(disable-axfr) shortcut, call it first.
-    if(!canDoAXFR(q, false) || !s_P->getBackend()->getSOAUncached(q->qdomain, sd)) {
+    if(!canDoAXFR(q, false, *packetHandler) || !(*packetHandler)->getBackend()->getSOAUncached(q->qdomain, sd)) {
       g_log<<Logger::Warning<<logPrefix<<"failed: not authoritative"<<endl;
       outpacket->setRcode(RCode::NotAuth);
       sendPacket(outpacket,outsock);
       return 0;
     }
 
-    DNSSECKeeper dk(s_P->getBackend());
+    DNSSECKeeper dk((*packetHandler)->getBackend());
     DNSSECKeeper::clearCaches(q->qdomain);
     bool narrow;
     securedZone = dk.isSecuredZone(q->qdomain);
@@ -1260,13 +1317,13 @@ void TCPNameserver::thread()
           }
           else {
             if (d_maxConnectionsPerClient) {
-              std::lock_guard<std::mutex> lock(s_clientsCountMutex);
-              if (s_clientsCount[remote] >= d_maxConnectionsPerClient) {
+              auto clientsCount = s_clientsCount.lock();
+              if ((*clientsCount)[remote] >= d_maxConnectionsPerClient) {
                 g_log<<Logger::Notice<<"Limit of simultaneous TCP connections per client reached for "<< remote<<", dropping"<<endl;
                 close(fd);
                 continue;
               }
-              s_clientsCount[remote]++;
+              (*clientsCount)[remote]++;
             }
 
             d_connectionroom_sem->wait(); // blocks if no connections are available

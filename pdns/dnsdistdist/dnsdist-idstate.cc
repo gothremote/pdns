@@ -5,6 +5,7 @@ DNSResponse makeDNSResponseFromIDState(IDState& ids, PacketBuffer& data)
 {
   DNSResponse dr(&ids.qname, ids.qtype, ids.qclass, &ids.origDest, &ids.origRemote, data, ids.protocol, &ids.sentTime.d_start);
   dr.origFlags = ids.origFlags;
+  dr.cacheFlags = ids.cacheFlags;
   dr.ecsAdded = ids.ecsAdded;
   dr.ednsAdded = ids.ednsAdded;
   dr.useZeroScope = ids.useZeroScope;
@@ -13,6 +14,7 @@ DNSResponse makeDNSResponseFromIDState(IDState& ids, PacketBuffer& data)
   dr.skipCache = ids.skipCache;
   dr.cacheKey = ids.cacheKey;
   dr.cacheKeyNoECS = ids.cacheKeyNoECS;
+  dr.cacheKeyUDP = ids.cacheKeyUDP;
   dr.dnssecOK = ids.dnssecOK;
   dr.tempFailureTTL = ids.tempFailureTTL;
   dr.qTag = std::move(ids.qTag);
@@ -41,15 +43,17 @@ void setIDStateFromDNSQuestion(IDState& ids, DNSQuestion& dq, DNSName&& qname)
   ids.delayMsec = dq.delayMsec;
   ids.tempFailureTTL = dq.tempFailureTTL;
   ids.origFlags = dq.origFlags;
+  ids.cacheFlags = dq.cacheFlags;
   ids.cacheKey = dq.cacheKey;
   ids.cacheKeyNoECS = dq.cacheKeyNoECS;
+  ids.cacheKeyUDP = dq.cacheKeyUDP;
   ids.subnet = dq.subnet;
   ids.skipCache = dq.skipCache;
   ids.packetCache = dq.packetCache;
   ids.ednsAdded = dq.ednsAdded;
   ids.ecsAdded = dq.ecsAdded;
   ids.useZeroScope = dq.useZeroScope;
-  ids.qTag = dq.qTag;
+  ids.qTag = std::move(dq.qTag);
   ids.dnssecOK = dq.dnssecOK;
   ids.uniqueId = std::move(dq.uniqueId);
 

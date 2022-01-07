@@ -25,6 +25,10 @@
 #include "iputils.hh"
 #include <sys/socket.h> 
 
+#if HAVE_GETIFADDRS
+#include <ifaddrs.h>
+#endif
+
 /** these functions provide a very lightweight wrapper to the Berkeley sockets API. Errors -> exceptions! */
 
 static void RuntimeError(const boost::format& fmt)
@@ -389,7 +393,9 @@ size_t sendMsgWithOptions(int fd, const char* buffer, size_t len, const ComboAdd
   msgh.msg_flags = 0;
 
   size_t sent = 0;
+#ifdef MSG_FASTOPEN
   bool firstTry = true;
+#endif
 
   do {
 
@@ -410,7 +416,9 @@ size_t sendMsgWithOptions(int fd, const char* buffer, size_t len, const ComboAdd
       }
 
       /* partial write */
+ #ifdef MSG_FASTOPEN
       firstTry = false;
+ #endif
       iov.iov_len -= written;
       iov.iov_base = reinterpret_cast<void*>(reinterpret_cast<char*>(iov.iov_base) + written);
     }
@@ -437,7 +445,7 @@ size_t sendMsgWithOptions(int fd, const char* buffer, size_t len, const ComboAdd
   return 0;
 }
 
-template class NetmaskTree<bool>;
+template class NetmaskTree<bool, Netmask>;
 
 /* requires a non-blocking socket.
    On Linux, we could use MSG_DONTWAIT on a blocking socket
@@ -518,4 +526,81 @@ ComboAddress parseIPAndPort(const std::string& input, uint16_t port)
   default: // case 4
     return ComboAddress(input, port);
   }
+}
+
+void setSocketBuffer(int fd, int optname, uint32_t size)
+{
+  uint32_t psize = 0;
+  socklen_t len = sizeof(psize);
+
+  if (!getsockopt(fd, SOL_SOCKET, optname, &psize, &len) && psize > size) {
+    throw std::runtime_error("Not decreasing socket buffer size from " + std::to_string(psize) + " to " + std::to_string(size));
+  }
+
+  if (setsockopt(fd, SOL_SOCKET, optname, &size, sizeof(size)) < 0) {
+    throw std::runtime_error("Unable to raise socket buffer size to " + std::to_string(size) + ": " + stringerror());
+  }
+}
+
+void setSocketReceiveBuffer(int fd, uint32_t size)
+{
+  setSocketBuffer(fd, SO_RCVBUF, size);
+}
+
+void setSocketSendBuffer(int fd, uint32_t size)
+{
+  setSocketBuffer(fd, SO_SNDBUF, size);
+}
+
+std::set<std::string> getListOfNetworkInterfaces()
+{
+  std::set<std::string> result;
+#if HAVE_GETIFADDRS
+  struct ifaddrs *ifaddr;
+  if (getifaddrs(&ifaddr) == -1) {
+    return result;
+  }
+
+  for (struct ifaddrs *ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+    if (ifa->ifa_name == nullptr) {
+      continue;
+    }
+    result.insert(ifa->ifa_name);
+  }
+
+  freeifaddrs(ifaddr);
+#endif
+  return result;
+}
+
+std::vector<ComboAddress> getListOfAddressesOfNetworkInterface(const std::string& itf)
+{
+  std::vector<ComboAddress> result;
+#if HAVE_GETIFADDRS
+  struct ifaddrs *ifaddr;
+  if (getifaddrs(&ifaddr) == -1) {
+    return result;
+  }
+
+  for (struct ifaddrs *ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+    if (ifa->ifa_name == nullptr || strcmp(ifa->ifa_name, itf.c_str()) != 0) {
+      continue;
+    }
+    if (ifa->ifa_addr == nullptr || (ifa->ifa_addr->sa_family != AF_INET && ifa->ifa_addr->sa_family != AF_INET6)) {
+      continue;
+    }
+    ComboAddress addr;
+    try {
+      addr.setSockaddr(ifa->ifa_addr, ifa->ifa_addr->sa_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6));
+    }
+    catch (...) {
+      continue;
+    }
+
+    result.push_back(addr);
+  }
+
+  freeifaddrs(ifaddr);
+#endif
+  return result;
 }

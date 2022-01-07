@@ -24,7 +24,7 @@ CXXFLAGS="-g -O3 -Wall -Wextra -Wshadow -Wno-unused-parameter -Wmissing-declarat
 PDNS_WITH_LIBSODIUM
 PDNS_CHECK_DNSTAP([auto])
 PDNS_CHECK_RAGEL([dnslabeltext.cc], [www.dnsdist.org])
-PDNS_CHECK_LIBEDIT
+PDNS_WITH_LIBEDIT
 PDNS_CHECK_CLOCK_GETTIME
 
 PDNS_CHECK_OS
@@ -57,7 +57,7 @@ AC_SUBST([IPCRYPT_LIBS], ['$(top_builddir)/ext/ipcrypt/libipcrypt.la'])
 
 PDNS_WITH_LUA([mandatory])
 AS_IF([test "x$LUAPC" = "xluajit"], [
-  # export all symbols to be able to use the Lua FFI interface
+  # export all symbols with default visibility, to be able to use the Lua FFI interface
   AC_MSG_NOTICE([Adding -rdynamic to export all symbols for the Lua FFI interface])
   LDFLAGS="$LDFLAGS -rdynamic"
 ])
@@ -96,8 +96,11 @@ AS_IF([test "x$enable_dns_over_https" != "xno"], [
   ])
 ])
 
-PDNS_CHECK_CDB
+PDNS_WITH_NGHTTP2
+
+DNSDIST_WITH_CDB
 PDNS_CHECK_LMDB
+PDNS_ENABLE_IPCIPHER
 
 AX_CXX_COMPILE_STDCXX_17([noext], [mandatory])
 
@@ -180,9 +183,13 @@ AS_IF([test "x$systemd" != "xn"],
   [AC_MSG_NOTICE([systemd: yes])],
   [AC_MSG_NOTICE([systemd: no])]
 )
-AS_IF([test "x$LIBCRYPTO_LIBS" != "x"],
+AS_IF([test "x$HAVE_IPCIPHER" = "x1"],
   [AC_MSG_NOTICE([ipcipher: yes])],
   [AC_MSG_NOTICE([ipcipher: no])]
+)
+AS_IF([test "x$LIBEDIT_LIBS" != "x"],
+  [AC_MSG_NOTICE([libedit: yes])],
+  [AC_MSG_NOTICE([libedit: no])]
 )
 AS_IF([test "x$LIBSODIUM_LIBS" != "x"],
   [AC_MSG_NOTICE([libsodium: yes])],
@@ -223,6 +230,10 @@ AS_IF([test "x$enable_dns_over_tls" != "xno" -o "x$enable_dns_over_https" != "xn
     [AC_MSG_NOTICE([OpenSSL: yes])],
     [AC_MSG_NOTICE([OpenSSL: no])]
   )]
+)
+AS_IF([test "x$NGHTTP2_LIBS" != "x"],
+  [AC_MSG_NOTICE([nghttp2: yes])],
+  [AC_MSG_NOTICE([nghttp2: no])]
 )
 AS_IF([test "x$CDB_LIBS" != "x"],
   [AC_MSG_NOTICE([cdb: yes])],

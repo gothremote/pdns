@@ -35,6 +35,7 @@
 #include "lua-base4.hh"
 #include "proxy-protocol.hh"
 #include "noinitvector.hh"
+#include "rec-eventtrace.hh"
 
 #include <unordered_map>
 
@@ -51,6 +52,20 @@ struct LuaContext::Pusher<pdns_ffi_param*>
   static const int maxSize = 1;
 
   static PushedObject push(lua_State* state, pdns_ffi_param* ptr) noexcept
+  {
+    lua_pushlightuserdata(state, ptr);
+    return PushedObject{state, 1};
+  }
+};
+
+// pdns_postresolve_ffi_handle is a lightuserdata
+template <>
+struct LuaContext::Pusher<pdns_postresolve_ffi_handle*>
+{
+  static const int minSize = 1;
+  static const int maxSize = 1;
+
+  static PushedObject push(lua_State* state, pdns_postresolve_ffi_handle* ptr) noexcept
   {
     lua_pushlightuserdata(state, ptr);
     return PushedObject{state, 1};
@@ -78,6 +93,7 @@ public:
     const uint16_t qtype;
     const ComboAddress& local;
     const ComboAddress& remote;
+    const ComboAddress* fromAuthIP{nullptr};
     const struct dnsheader* dh{nullptr};
     const bool isTcp;
     const std::vector<pair<uint16_t, string>>* ednsOptions{nullptr};
@@ -185,14 +201,14 @@ public:
   unsigned int gettag_ffi(FFIParams&) const;
 
   void maintenance() const;
-  bool prerpz(DNSQuestion& dq, int& ret) const;
-  bool preresolve(DNSQuestion& dq, int& ret) const;
-  bool nxdomain(DNSQuestion& dq, int& ret) const;
-  bool nodata(DNSQuestion& dq, int& ret) const;
-  bool postresolve(DNSQuestion& dq, int& ret) const;
+  bool prerpz(DNSQuestion& dq, int& ret, RecEventTrace&) const;
+  bool preresolve(DNSQuestion& dq, int& ret, RecEventTrace&) const;
+  bool nxdomain(DNSQuestion& dq, int& ret, RecEventTrace&) const;
+  bool nodata(DNSQuestion& dq, int& ret, RecEventTrace&) const;
+  bool postresolve(DNSQuestion& dq, int& ret, RecEventTrace&) const;
 
-  bool preoutquery(const ComboAddress& ns, const ComboAddress& requestor, const DNSName& query, const QType& qtype, bool isTcp, vector<DNSRecord>& res, int& ret) const;
-  bool ipfilter(const ComboAddress& remote, const ComboAddress& local, const struct dnsheader&) const;
+  bool preoutquery(const ComboAddress& ns, const ComboAddress& requestor, const DNSName& query, const QType& qtype, bool isTcp, vector<DNSRecord>& res, int& ret, RecEventTrace& et) const;
+  bool ipfilter(const ComboAddress& remote, const ComboAddress& local, const struct dnsheader&, RecEventTrace&) const;
 
   bool policyHitEventFilter(const ComboAddress& remote, const DNSName& qname, const QType& qtype, bool tcp, DNSFilterEngine::Policy& policy, std::unordered_set<std::string>& tags, std::unordered_map<std::string, bool>& discardedPolicies) const;
 
@@ -203,8 +219,22 @@ public:
 
   typedef std::function<std::tuple<unsigned int, boost::optional<std::unordered_map<int, string>>, boost::optional<LuaContext::LuaObject>, boost::optional<std::string>, boost::optional<std::string>, boost::optional<std::string>, boost::optional<string>>(ComboAddress, Netmask, ComboAddress, DNSName, uint16_t, const EDNSOptionViewMap&, bool, const std::vector<std::pair<int, const ProxyProtocolValue*>>&)> gettag_t;
   gettag_t d_gettag; // public so you can query if we have this hooked
+
   typedef std::function<boost::optional<LuaContext::LuaObject>(pdns_ffi_param_t*)> gettag_ffi_t;
   gettag_ffi_t d_gettag_ffi;
+
+  struct PostResolveFFIHandle
+  {
+    PostResolveFFIHandle(DNSQuestion& dq) :
+      d_dq(dq)
+    {
+    }
+    DNSQuestion& d_dq;
+    bool d_ret{false};
+  };
+  bool postresolve_ffi(PostResolveFFIHandle&) const;
+  typedef std::function<bool(pdns_postresolve_ffi_handle_t*)> postresolve_ffi_t;
+  postresolve_ffi_t d_postresolve_ffi;
 
 protected:
   virtual void postPrepareContext() override;

@@ -22,15 +22,17 @@
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
-#include "rec_channel.hh"
+
 #include <iostream>
 #include <fcntl.h>
+
 #include "pdnsexception.hh"
 #include "arguments.hh"
-
+#include "credentials.hh"
 #include "namespaces.hh"
+#include "rec_channel.hh"
 
-ArgvMap &arg()
+ArgvMap& arg()
 {
   static ArgvMap arg;
   return arg;
@@ -38,45 +40,47 @@ ArgvMap &arg()
 
 static void initArguments(int argc, char** argv)
 {
-  arg().set("config-dir","Location of configuration directory (recursor.conf)")=SYSCONFDIR;
+  arg().set("config-dir", "Location of configuration directory (recursor.conf)") = SYSCONFDIR;
 
-  arg().set("socket-dir",string("Where the controlsocket will live, ")+LOCALSTATEDIR+"/pdns-recursor when unset and not chrooted" )="";
-  arg().set("chroot","switch to chroot jail")="";
-  arg().set("process","When controlling multiple recursors, the target process number")="";
-  arg().set("timeout", "Number of seconds to wait for the recursor to respond")="5";
-  arg().set("config-name","Name of this virtual configuration - will rename the binary image")="";
-  arg().setCmd("help","Provide this helpful message");
-  arg().setCmd("version","Show the version of this program");
+  arg().set("socket-dir", string("Where the controlsocket will live, ") + LOCALSTATEDIR + "/pdns-recursor when unset and not chrooted") = "";
+  arg().set("chroot", "switch to chroot jail") = "";
+  arg().set("process", "When controlling multiple recursors, the target process number") = "";
+  arg().set("timeout", "Number of seconds to wait for the recursor to respond") = "5";
+  arg().set("config-name", "Name of this virtual configuration - will rename the binary image") = "";
+  arg().setCmd("help", "Provide this helpful message");
+  arg().setCmd("version", "Show the version of this program");
 
-  arg().laxParse(argc,argv);  
-  if(arg().mustDo("help") || arg().getCommands().empty()) {
-    cout<<"syntax: rec_control [options] command, options as below: "<<endl<<endl;
-    cout<<arg().helpstring(arg()["help"])<<endl;
-    cout<<"In addition, 'rec_control help' can be used to retrieve a list\nof available commands from PowerDNS"<<endl;
+  arg().laxParse(argc, argv);
+  if (arg().mustDo("help") || arg().getCommands().empty()) {
+    cout << "syntax: rec_control [options] command, options as below: " << endl
+         << endl;
+    cout << arg().helpstring(arg()["help"]) << endl;
+    cout << "In addition, 'rec_control help' can be used to retrieve a list\nof available commands from PowerDNS" << endl;
     exit(arg().mustDo("help") ? 0 : 99);
   }
 
-  if(arg().mustDo("version")) {
-    cout<<"rec_control version "<<VERSION<<endl;
+  if (arg().mustDo("version")) {
+    cout << "rec_control version " << VERSION << endl;
     exit(0);
   }
 
-  string configname=::arg()["config-dir"]+"/recursor.conf";
+  string configname = ::arg()["config-dir"] + "/recursor.conf";
   if (::arg()["config-name"] != "")
-    configname=::arg()["config-dir"]+"/recursor-"+::arg()["config-name"]+".conf";
-  
+    configname = ::arg()["config-dir"] + "/recursor-" + ::arg()["config-name"] + ".conf";
+
   cleanSlashes(configname);
 
   arg().laxFile(configname.c_str());
 
-  arg().laxParse(argc,argv);   // make sure the commandline wins
+  arg().laxParse(argc, argv); // make sure the commandline wins
 
   if (::arg()["socket-dir"].empty()) {
     if (::arg()["chroot"].empty())
       ::arg().set("socket-dir") = std::string(LOCALSTATEDIR) + "/pdns-recursor";
     else
       ::arg().set("socket-dir") = ::arg()["chroot"] + "/";
-  } else if (!::arg()["chroot"].empty()) {
+  }
+  else if (!::arg()["chroot"].empty()) {
     ::arg().set("socket-dir") = ::arg()["chroot"] + "/" + ::arg()["socket-dir"];
   }
 }
@@ -91,24 +95,45 @@ int main(int argc, char** argv)
     "dump-failedservers",
     "dump-rpz",
     "dump-throttlemap",
-    "dump-non-resolving"
-  };
+    "dump-non-resolving"};
   try {
     initArguments(argc, argv);
-    RecursorControlChannel rccS;
-    string sockname="pdns_recursor";
+    string sockname = "pdns_recursor";
 
     if (arg()["config-name"] != "")
-      sockname+="-"+arg()["config-name"];
+      sockname += "-" + arg()["config-name"];
 
-    if(!arg()["process"].empty())
-      sockname+="."+arg()["process"];
+    if (!arg()["process"].empty())
+      sockname += "." + arg()["process"];
 
     sockname.append(".controlsocket");
 
-    rccS.connect(arg()["socket-dir"], sockname);
+    const vector<string>& commands = arg().getCommands();
 
-    const vector<string>&commands=arg().getCommands();
+    if (commands.size() >= 1 && commands.at(0) == "hash-password") {
+      uint64_t workFactor = CredentialsHolder::s_defaultWorkFactor;
+      if (commands.size() > 1) {
+        try {
+          workFactor = pdns_stou(commands.at(1));
+        }
+        catch (const std::exception& e) {
+          cerr << "Unable to parse the supplied work factor: " << e.what() << endl;
+          return EXIT_FAILURE;
+        }
+      }
+
+      auto password = CredentialsHolder::readFromTerminal();
+
+      try {
+        cout << hashPassword(password.getString(), workFactor, CredentialsHolder::s_defaultParallelFactor, CredentialsHolder::s_defaultBlockSize) << endl;
+        return EXIT_SUCCESS;
+      }
+      catch (const std::exception& e) {
+        cerr << "Error while hashing the supplied password: " << e.what() << endl;
+        return EXIT_FAILURE;
+      }
+    }
+
     string command;
     int fd = -1;
     unsigned int i = 0;
@@ -124,21 +149,24 @@ int main(int argc, char** argv)
             if (i + 2 < commands.size()) {
               ++i;
               command += " " + commands[i]; // add rpzname and continue with filename
-            } else {
+            }
+            else {
               throw PDNSException("Command needs a zone and file argument");
             }
           }
           ++i;
           if (commands[i] == "-") {
             fd = STDOUT_FILENO;
-          } else {
+          }
+          else {
             fd = open(commands[i].c_str(), O_CREAT | O_EXCL | O_WRONLY, 0660);
           }
           if (fd == -1) {
             int err = errno;
             throw PDNSException("Error opening dump file for writing: " + stringerror(err));
           }
-        } else {
+        }
+        else {
           throw PDNSException("Command needs a file argument");
         }
       }
@@ -146,19 +174,21 @@ int main(int argc, char** argv)
     }
 
     auto timeout = arg().asNum("timeout");
-    rccS.send({0, command}, nullptr, timeout, fd);
+    RecursorControlChannel rccS;
+    rccS.connect(arg()["socket-dir"], sockname);
+    rccS.send(rccS.d_fd, {0, command}, timeout, fd);
 
-    auto receive = rccS.recv(0, timeout);
+    auto receive = rccS.recv(rccS.d_fd, timeout);
     if (receive.d_ret != 0) {
       cerr << receive.d_str;
-    } else {
+    }
+    else {
       cout << receive.d_str;
     }
     return receive.d_ret;
   }
-  catch(PDNSException& ae) {
-    cerr<<"Fatal: "<<ae.reason<<"\n";
+  catch (PDNSException& ae) {
+    cerr << "Fatal: " << ae.reason << "\n";
     return 1;
   }
 }
-

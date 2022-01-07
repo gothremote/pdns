@@ -56,7 +56,7 @@ public:
       throw PDNSException("EOF on TCP read");
 
     len=ntohs(len);
-    std::unique_ptr<char[]> creply(new char[len]);
+    auto creply = std::make_unique<char[]>(len);
     int n=0;
     int numread;
     while(n<len) {
@@ -146,7 +146,7 @@ try
 	cerr<<"got rrsig "<<sig->d_signer<<"/"<<sig->d_tag<<endl;
 	vState state = getKeysFor(tro, sig->d_signer, keys);
 	cerr<<"! state = "<<state<<", now have "<<keys.size()<<" keys at "<<qname<<endl;
-        // dsmap.insert(make_pair(dsrc.d_tag, dsrc));
+        // dsmap.emplace(dsrc.d_tag, dsrc);
       }
     }
 

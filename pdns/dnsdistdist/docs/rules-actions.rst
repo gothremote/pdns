@@ -47,9 +47,12 @@ If this is not enough, try::
 
 or::
 
-  addAction(MaxQPSIPRule(5), TCAction())
+  addAction(AndRule{MaxQPSIPRule(5), TCPRule(false)}, TCAction())
 
 This will respectively drop traffic exceeding that 5 QPS limit per IP or range, or return it with TC=1, forcing clients to fall back to TCP.
+
+In that last one, note the use of :func:`TCPRule`.
+Without it, clients would get TC=1 even if they correctly fell back to TCP.
 
 To turn this per IP or range limit into a global limit, use ``NotRule(MaxQPSRule(5000))`` instead of :func:`MaxQPSIPRule`.
 
@@ -68,6 +71,9 @@ Note that the query name is presented without a trailing dot to the regex.
 The regex is applied case insensitively.
 
 Alternatively, if compiled in, :func:`RE2Rule` provides similar functionality, but against libre2.
+
+Note that to check if a name is in a list of domains, :func:`SuffixMatchNodeRule` is preferred over complex regular expressions or multiple instances of :func:`RegexRule`.
+The :func:`makeRule` convenience function can be used to create a :func:`SuffixMatchNodeRule`.
 
 Rule Generators
 ---------------
@@ -758,6 +764,21 @@ These ``DNSRule``\ s be one of the following items:
 
   :param string poolname: Pool to check
 
+.. function:: PoolOutstandingRule(poolname, limit)
+
+  .. versionadded:: 1.7.0
+
+  Check whether a pool has total outstanding queries above limit
+
+  .. code-block:: Lua
+
+    --- Send queries to spill over pool if default pool is under pressure
+    addAction(PoolOutstandingRule("", 5000), PoolAction("spillover"))
+
+  :param string poolname: Pool to check
+  :param int limit: Total outstanding limit
+
+
 Combining Rules
 ~~~~~~~~~~~~~~~
 
@@ -795,9 +816,12 @@ Actions
 
 :ref:`RulesIntro` need to be combined with an action for them to actually do something with the matched packets.
 Some actions allow further processing of rules, this is noted in their description. Most of these start with 'Set' with a few exceptions, mostly for logging actions. These exceptions are:
+
+- :func:`ClearRecordTypesResponseAction`
 - :func:`KeyValueStoreLookupAction`
 - :func:`DnstapLogAction`
 - :func:`DnstapLogResponseAction`
+- :func:`LimitTTLResponseAction`
 - :func:`LogAction`
 - :func:`NoneAction`
 - :func:`RemoteLogAction`
@@ -815,6 +839,30 @@ The following actions exist.
 .. function:: AllowResponseAction()
 
   Let these packets go through.
+
+.. function:: ClearRecordTypesResponseAction(types)
+
+  .. versionadded:: 1.8.0
+
+  Removes given type(s) records from the response. Beware you can accidentally turn the answer into a NODATA response
+  without a SOA record in the additional section in which case you may want to use :func:`NegativeAndSOAAction` to generate an answer,
+  see example bellow.
+  Subsequent rules are processed after this action.
+
+  .. code-block:: Lua
+
+    -- removes any HTTPS record in the response
+    addResponseAction(
+            QNameRule('www.example.com.'),
+            ClearRecordTypesResponseAction(DNSQType.HTTPS)
+    )
+    -- reply directly with NODATA and a SOA record as we know the answer will be empty
+    addAction(
+            AndRule{QNameRule('www.example.com.'), QTypeRule(DNSQType.HTTPS)},
+            NegativeAndSOAAction(false, 'example.com.', 3600, 'ns.example.com.', 'postmaster.example.com.', 1, 1800, 900, 604800, 86400)
+    )
+
+  :param int types: a single type or a list of types to remove
 
 .. function:: ContinueAction(action)
 
@@ -979,6 +1027,15 @@ The following actions exist.
   :param KeyValueStore kvs: The key value store to query
   :param KeyValueLookupKey lookupKey: The key to use for the lookup
   :param string destinationTag: The name of the tag to store the result into
+
+.. function:: LimitTTLResponseAction(min[, max])
+
+  .. versionadded:: 1.8.0
+
+  Cap the TTLs of the response to the given boundaries.
+
+  :param int min: The minimum allowed value
+  :param int max: The maximum allowed value
 
 .. function:: LogAction([filename[, binary[, append[, buffered[, verboseOnly[, includeTimestamp]]]]]])
 
@@ -1286,6 +1343,16 @@ The following actions exist.
   :param int v4: The IPv4 netmask length
   :param int v6: The IPv6 netmask length
 
+.. function:: SetEDNSOptionAction(option)
+
+  .. versionadded:: 1.7.0
+
+  Add arbitrary EDNS option and data to the query. Any existing EDNS content with the same option code will be overwritten.
+  Subsequent rules are processed after this action.
+
+  :param int option: The EDNS option number
+  :param string data: The EDNS0 option raw content
+
 .. function:: SetMacAddrAction(option)
 
   .. versionadded:: 1.6.0
@@ -1296,6 +1363,22 @@ The following actions exist.
   Note that this function was called :func:`MacAddrAction` before 1.6.0.
 
   :param int option: The EDNS0 option number
+
+.. function:: SetMaxTTLResponseAction(max)
+
+  .. versionadded:: 1.8.0
+
+  Cap the TTLs of the response to the given maximum.
+
+  :param int max: The maximum allowed value
+
+.. function:: SetMinTTLResponseAction(min)
+
+  .. versionadded:: 1.8.0
+
+  Cap the TTLs of the response to the given minimum.
+
+  :param int min: The minimum allowed value
 
 .. function:: SetNoRecurseAction()
 
@@ -1361,8 +1444,11 @@ The following actions exist.
 
   .. versionadded:: 1.6.0
 
+  .. versionchanged:: 1.7.0
+    Prior to 1.7.0 :func:`SetTagAction` would not overwrite an existing tag value if already set.
+
   Associate a tag named ``name`` with a value of ``value`` to this query, that will be passed on to the response.
-  This function will not overwrite an existing tag. If the tag already exists it will keep its original value.
+  This function will overwrite any existing tag value.
   Subsequent rules are processed after this action.
   Note that this function was called :func:`TagAction` before 1.6.0.
 
@@ -1373,8 +1459,11 @@ The following actions exist.
 
   .. versionadded:: 1.6.0
 
+  .. versionchanged:: 1.7.0
+    Prior to 1.7.0 :func:`SetTagResponseAction` would not overwrite an existing tag value if already set.
+
   Associate a tag named ``name`` with a value of ``value`` to this response.
-  This function will not overwrite an existing tag. If the tag already exists it will keep its original value.
+  This function will overwrite any existing tag value.
   Subsequent rules are processed after this action.
   Note that this function was called :func:`TagResponseAction` before 1.6.0.
 
@@ -1499,6 +1588,33 @@ The following actions exist.
   * ``ra``: bool - Set the RA bit to this value (true means the bit is set, false means it's cleared). Default is to copy the value of the RD bit from the incoming query.
   * ``ttl``: int - The TTL of the record.
 
+.. function:: SpoofSVCAction(svcParams [, options])
+
+  .. versionadded:: 1.7.0
+
+  Forge a response with the specified SVC record data. If the list contains more than one class:`SVCRecordParameters` (generated via :func:`newSVCRecordParameters`) object, they are all returned,
+  and should have different priorities.
+  The hints provided in the SVC parameters, if any, will also be added as A/AAAA records in the additional section, using the target name present in the parameters as owner name if it's not empty (root) and the qname instead.
+
+  :param list of class:`SVCRecordParameters` svcParams: The record data to return
+  :param table options: A table with key: value pairs with options.
+
+  Options:
+
+  * ``aa``: bool - Set the AA bit to this value (true means the bit is set, false means it's cleared). Default is to clear it.
+  * ``ad``: bool - Set the AD bit to this value (true means the bit is set, false means it's cleared). Default is to clear it.
+  * ``ra``: bool - Set the RA bit to this value (true means the bit is set, false means it's cleared). Default is to copy the value of the RD bit from the incoming query.
+  * ``ttl``: int - The TTL of the record.
+
+.. function:: SpoofPacketAction(rawPacket, len)
+
+  .. versionadded:: 1.8.0
+
+  Spoof a raw self-generated answer
+
+  :param string rawPacket: The raw wire-ready DNS answer
+  :param int len: The length of the packet
+
 .. function:: TagAction(name, value)
 
   .. deprecated:: 1.6.0
@@ -1523,7 +1639,12 @@ The following actions exist.
 
 .. function:: TCAction()
 
+  .. versionchanged:: 1.7.0
+    This action is now only performed over UDP transports.
+
   Create answer to query with the TC bit set, and the RA bit set to the value of RD in the query, to force the client to TCP.
+  Before 1.7.0 this action was performed even when the query had been received over TCP, which required the use of :func:`TCPRule` to
+  prevent the TC bit from being set over TCP transports.
 
 .. function:: TeeAction(remote[, addECS])
 

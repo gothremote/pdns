@@ -105,6 +105,7 @@ pdns_recursor_SOURCES = \
 	capabilities.cc capabilities.hh \
 	circular_buffer.hh \
 	comment.hh \
+	credentials.cc credentials.hh \
 	dns.hh dns.cc \
 	dns_random.hh dns_random.cc \
 	dnsbackend.hh \
@@ -158,10 +159,13 @@ pdns_recursor_SOURCES = \
 	query-local-address.hh query-local-address.cc \
 	rcpgenerator.cc rcpgenerator.hh \
 	rec-carbon.cc \
+	rec-eventtrace.cc rec-eventtrace.hh \
 	rec-lua-conf.hh rec-lua-conf.cc \
 	rec-protozero.cc rec-protozero.hh \
 	rec-snmp.hh rec-snmp.cc \
 	rec-taskqueue.cc rec-taskqueue.hh \
+        rec-tcpout.cc rec-tcpout.hh \
+        rec-zonetocache.cc rec-zonetocache.hh \
 	rec_channel.cc rec_channel.hh rec_metrics.hh \
 	rec_channel_rec.cc \
 	recpacketcache.cc recpacketcache.hh \
@@ -183,6 +187,7 @@ pdns_recursor_SOURCES = \
 	sortlist.cc sortlist.hh \
 	sstuff.hh \
 	stable-bloom.hh \
+	stat_t.hh \
 	svc-records.cc svc-records.hh \
 	syncres.cc syncres.hh \
 	taskqueue.cc taskqueue.hh \
@@ -220,6 +225,8 @@ pdns_recursor_LDADD = \
 	$(PROBDS_LIBS) \
 	$(LIBCAP_LIBS)
 
+rec_control_LDADD = $(LIBCRYPTO_LIBS)
+
 pdns_recursor_LDFLAGS = $(AM_LDFLAGS) \
 	$(LIBCRYPTO_LDFLAGS) $(BOOST_CONTEXT_LDFLAGS) \
 	$(BOOST_SYSTEM_LDFLAGS)
@@ -239,6 +246,7 @@ testrunner_SOURCES = \
 	base32.cc \
 	base64.cc base64.hh \
 	circular_buffer.hh \
+	credentials.cc credentials.hh \
 	dns.cc dns.hh \
 	dns_random.cc dns_random.hh \
 	dnslabeltext.cc \
@@ -270,6 +278,8 @@ testrunner_SOURCES = \
 	qtype.cc qtype.hh \
 	query-local-address.hh query-local-address.cc \
 	rcpgenerator.cc \
+	rec-eventtrace.cc rec-eventtrace.hh \
+	rec-zonetocache.cc rec-zonetocache.hh \
 	recpacketcache.cc recpacketcache.hh \
 	recursor_cache.cc recursor_cache.hh \
 	resolver.hh resolver.cc \
@@ -289,6 +299,7 @@ testrunner_SOURCES = \
 	test-base32_cc.cc \
 	test-base64_cc.cc \
 	test-common.hh \
+	test-credentials_cc.cc \
 	test-dns_random_hh.cc \
 	test-dnsname_cc.cc \
 	test-dnsparser_hh.cc \
@@ -306,6 +317,7 @@ testrunner_SOURCES = \
 	test-negcache_cc.cc \
 	test-packetcache_hh.cc \
 	test-rcpgenerator_cc.cc \
+	test-rec-zonetocache.cc \
 	test-recpacketcache_cc.cc \
 	test-recursorcache_cc.cc \
 	test-rpzloader_cc.cc \
@@ -364,10 +376,15 @@ if LIBSODIUM
 pdns_recursor_SOURCES += \
 	sodiumsigners.cc
 pdns_recursor_LDADD += $(LIBSODIUM_LIBS)
+
+rec_control_LDADD += $(LIBSODIUM_LIBS)
+
 testrunner_SOURCES += \
 	sodiumsigners.cc
 testrunner_LDADD += $(LIBSODIUM_LIBS)
 endif
+
+
 
 if LIBDECAF
 pdns_recursor_SOURCES += \
@@ -393,6 +410,11 @@ testrunner_SOURCES += kqueuemplexer.cc
 endif
 
 if HAVE_OPENBSD
+pdns_recursor_SOURCES += kqueuemplexer.cc
+testrunner_SOURCES += kqueuemplexer.cc
+endif
+
+if HAVE_DARWIN
 pdns_recursor_SOURCES += kqueuemplexer.cc
 testrunner_SOURCES += kqueuemplexer.cc
 endif
@@ -425,14 +447,23 @@ AM_CPPFLAGS += $(LIBSSL_CFLAGS)
 pdns_recursor_LDADD += $(LIBSSL_LIBS)
 endif
 
-if HAVE_GNUTLS
-AM_CPPFLAGS += $(GNUTLS_CFLAGS)
-pdns_recursor_LDADD += $(GNUTLS_LIBS)
+#if HAVE_GNUTLS
+#AM_CPPFLAGS += $(GNUTLS_CFLAGS)
+#pdns_recursor_LDADD += $(GNUTLS_LIBS)
+#endif
 endif
+if HAVE_LIBCURL
+pdns_recursor_SOURCES += minicurl.cc minicurl.hh
+pdns_recursor_LDADD += $(LIBCURL)
+testrunner_SOURCES += minicurl.cc minicurl.hh
+testrunner_LDADD += $(LIBCURL)
 endif
+
 
 rec_control_SOURCES = \
 	arguments.cc arguments.hh \
+	base64.cc base64.hh \
+	credentials.cc credentials.hh \
 	dnslabeltext.cc \
 	dnsname.hh dnsname.cc \
 	logger.cc \
@@ -514,7 +545,9 @@ if HAVE_SYSTEMD
 pdns-recursor.service: pdns-recursor.service.in
 	$(AM_V_GEN)sed -e 's![@]sbindir[@]!$(sbindir)!' -e 's![@]service_user[@]!$(service_user)!' -e 's![@]service_group[@]!$(service_group)!' < $< > $@
 if !HAVE_SYSTEMD_WITH_RUNTIME_DIR_ENV
+if HAVE_SYSTEMD_PERCENT_T
 	$(AM_V_GEN)sed -e 's!/pdns_recursor!& --socket-dir=%t/pdns-recursor!' -i $@
+endif
 endif
 if !HAVE_SYSTEMD_LOCK_PERSONALITY
 	$(AM_V_GEN)perl -ni -e 'print unless /^LockPersonality/' $@
@@ -574,10 +607,13 @@ endif
 pdns-recursor@.service: pdns-recursor.service
 	$(AM_V_GEN)sed -e 's!/pdns_recursor!& --config-name=%i!' \
 	  -e 's!Recursor!& %i!' \
-	  -e 's!RuntimeDirectory=.*!&-%i!' \
+	  -e 's!SyslogIdentifier=.*!&-%i!' \
 	  < $< > $@
+if HAVE_SYSTEMD_PERCENT_T
+	$(AM_V_GEN)sed -e 's!RuntimeDirectory=.*!&-%i!' -i $@
 if !HAVE_SYSTEMD_WITH_RUNTIME_DIR_ENV
 	$(AM_V_GEN)sed -e 's!--socket-dir=[^ ]\+!&-%i !' -i $@
+endif
 endif
 
 systemdsystemunitdir = $(SYSTEMD_DIR)

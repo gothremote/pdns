@@ -204,7 +204,7 @@ public:
 
     lookup_context_t ctx;
     if (p != NULL) {
-      ctx.emplace_back(lookup_context_t::value_type{"source_address", p->getRemote().toString()});
+      ctx.emplace_back(lookup_context_t::value_type{"source_address", p->getInnerRemote().toString()});
       ctx.emplace_back(lookup_context_t::value_type{"real_source_address", p->getRealRemote().toString()});
     }
 
@@ -298,7 +298,7 @@ public:
     return true;
   }
 
-  void getAllDomains(vector<DomainInfo>* domains, bool include_disabled = false) override
+  void getAllDomains(vector<DomainInfo>* domains, bool getSerial, bool include_disabled) override
   {
     if (f_get_all_domains == nullptr)
       return;

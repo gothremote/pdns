@@ -152,6 +152,13 @@ get-parameter *KEY* [*KEY*]...
 get-qtypelist
     Retrieves QType statistics. Queries from cache aren't being counted yet.
 
+hash-password [*WORK-FACTOR*]
+    Asks for a password then returns the hashed and salted version,
+    to use as a webserver password or API key. This command does
+    not contact the recursor but does the hashing inside rec_control.
+    An optional scrypt work factor can be specified, in power of two.
+    The default is 1024.
+
 help
     Shows a list of supported commands understood by the running
     :program:`pdns_recursor`
@@ -210,6 +217,9 @@ set-max-packetcache-entries *NUM*
 
 set-minimum-ttl *NUM*
     Set minimum-ttl-override to *NUM*.
+
+set-event-trace-enabled *NUM*
+    Set logging of event trace messages, 0 = disabled, 1 = protobuf, 2 = log file, 3 = both.
 
 top-queries
     Shows the top-20 queries. Statistics are over the last

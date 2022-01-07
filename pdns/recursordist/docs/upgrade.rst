@@ -7,6 +7,36 @@ When upgrading several versions, please read **all** notes applying to the upgra
 4.5.x to 4.6.0 or master
 ------------------------
 
+Offensive language
+^^^^^^^^^^^^^^^^^^
+Using the settings mentioned in :ref:`upgrade-offensive` now generates a warning. Please start using the new names.
+
+File descriptor usage
+^^^^^^^^^^^^^^^^^^^^^
+The number of file descriptors used by the Recursor has increased because the Recursor now keeps idle outgoing TCP/DoT connections open for a while.
+The extra file descriptors used compared to previous versions of the Recursor is :ref:`setting-tcp-out-max-idle-per-thread` times the number of worker threads (:ref:`threads`).
+
+New settings
+^^^^^^^^^^^^
+- The :ref:`setting-dot-to-auth-names` setting to list nameservers that should be contacted over DoT has been introduced.
+- The :ref:`setting-dot-to-port-853` setting to specify that nameservers or forwarders using port 853 should be contacted over DoT has been introduced.
+- The :ref:`setting-ignore-unknown-settings` setting has been introduced to make it easier to switch between recursor versions supporting different settings.
+- The :ref:`setting-webserver-hash-plaintext-credentials` has been introduced to avoid keeping cleartext sensitive information in memory.
+- The :ref:`setting-tcp-out-max-idle-ms`, :ref:`setting-tcp-out-max-idle-per-auth`, :ref:`setting-tcp-out-max-queries` and :ref:`setting-tcp-out-max-idle-per-thread` settings have been introduced to control the new TCP/DoT outgoing connections pooling. This mechanism keeps connections to authoritative servers or forwarders open for later re-use.
+- The :ref:`setting-structured-logging` setting has been introduced to prefer structured logging (the default) when both an old style and a structured log messages is available.
+- The :ref:`setting-max-include-depth` setting has been introduced to limit the number of nested ``$include`` directives while processing a zone file.
+- The :ref:`setting-allow-notify-for`, :ref:`setting-allow-notify-for-file`, :ref:`setting-allow-notify-from` and :ref:`setting-allow-notify-from-file` settings have been introduced, allowing incoming notify queries to clear cache entries.
+
+Deprecated and changed settings
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+-  The :ref:`setting-api-key` and :ref:`setting-webserver-password` settings now accept a hashed and salted version (if the support is available in the openssl library used).
+
+Privileged port binding in Docker
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+In our Docker image, our binaries are no longer granted the ``net_bind_service`` capability, as this is unnecessary in many deployments.
+For more information, see the section `"Privileged ports" in Docker-README <https://github.com/PowerDNS/pdns/blob/master/Docker-README.md#privileged-ports>`__.
+
 4.5.1 to 4.5.2
 --------------
 
@@ -16,6 +46,8 @@ Deprecated and changed settings
 
 4.4.x to 4.5.1
 --------------
+
+.. _upgrade-offensive:
 
 Offensive language
 ^^^^^^^^^^^^^^^^^^

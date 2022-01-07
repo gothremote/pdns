@@ -21,6 +21,7 @@
  */
 #pragma once
 
+#include "dnsparser.hh"
 #include <random>
 
 struct ResponseConfig
@@ -55,6 +56,10 @@ public:
   {
   }
 
+  SpoofAction(const char* rawresponse, size_t len): d_raw(rawresponse, rawresponse + len)
+  {
+  }
+
   SpoofAction(const vector<std::string>& raws): d_rawResponses(raws)
   {
   }
@@ -84,20 +89,58 @@ private:
   std::vector<ComboAddress> d_addrs;
   std::set<uint16_t> d_types;
   std::vector<std::string> d_rawResponses;
+  PacketBuffer d_raw;
   DNSName d_cname;
+};
+
+class LimitTTLResponseAction : public DNSResponseAction, public boost::noncopyable
+{
+public:
+  LimitTTLResponseAction() {}
+
+  LimitTTLResponseAction(uint32_t min, uint32_t max = std::numeric_limits<uint32_t>::max()) : d_min(min), d_max(max)
+  {
+  }
+
+  DNSResponseAction::Action operator()(DNSResponse* dr, std::string* ruleresult) const override
+  {
+    auto visitor = [&](uint8_t section, uint16_t qclass, uint16_t qtype, uint32_t ttl) {
+      if (d_min > 0) {
+        if (ttl < d_min) {
+          ttl = d_min;
+        }
+      }
+      if (ttl > d_max) {
+        ttl = d_max;
+      }
+      return ttl;
+    };
+    editDNSPacketTTL(reinterpret_cast<char *>(dr->getMutableData().data()), dr->getData().size(), visitor);
+    return DNSResponseAction::Action::None;
+  }
+
+  std::string toString() const override
+  {
+    return "limit ttl (" + std::to_string(d_min) + " <= ttl <= " + std::to_string(d_max) + ")";
+  }
+
+private:
+  uint32_t d_min{0};
+  uint32_t d_max{std::numeric_limits<uint32_t>::max()};
 };
 
 typedef boost::variant<string, vector<pair<int, string>>, std::shared_ptr<DNSRule>, DNSName, vector<pair<int, DNSName> > > luadnsrule_t;
 std::shared_ptr<DNSRule> makeRule(const luadnsrule_t& var);
-typedef std::unordered_map<std::string, boost::variant<std::string> > luaruleparams_t;
+typedef std::unordered_map<std::string, std::string> luaruleparams_t;
 void parseRuleParams(boost::optional<luaruleparams_t> params, boost::uuids::uuid& uuid, std::string& name, uint64_t& creationOrder);
+void checkParameterBound(const std::string& parameter, uint64_t value, size_t max = std::numeric_limits<uint16_t>::max());
 
-typedef NetmaskTree<DynBlock> nmts_t;
+typedef NetmaskTree<DynBlock, AddressAndPortRange> nmts_t;
 
 vector<std::function<void(void)>> setupLua(LuaContext& luaCtx, bool client, bool configCheck, const std::string& config);
 void setupLuaActions(LuaContext& luaCtx);
 void setupLuaBindings(LuaContext& luaCtx, bool client);
-void setupLuaBindingsDNSCrypt(LuaContext& luaCtx);
+void setupLuaBindingsDNSCrypt(LuaContext& luaCtx, bool client);
 void setupLuaBindingsDNSQuestion(LuaContext& luaCtx);
 void setupLuaBindingsKVS(LuaContext& luaCtx, bool client);
 void setupLuaBindingsPacketCache(LuaContext& luaCtx, bool client);

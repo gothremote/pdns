@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import copy
 import dns
 import socket
 import struct
@@ -110,7 +111,7 @@ def ProxyProtocolTCPResponder(port, fromQueue, toQueue):
 
           toQueue.put([payload, data], True, 2.0)
 
-          response = fromQueue.get(True, 2.0)
+          response = copy.deepcopy(fromQueue.get(True, 2.0))
           if not response:
             conn.close()
             break
@@ -142,36 +143,6 @@ class ProxyProtocolTest(DNSDistTest):
     _proxyResponderPort = proxyResponderPort
     _config_params = ['_proxyResponderPort']
 
-    def checkMessageProxyProtocol(self, receivedProxyPayload, source, destination, isTCP, values=[], v6=False, sourcePort=None, destinationPort=None):
-      proxy = ProxyProtocol()
-      self.assertTrue(proxy.parseHeader(receivedProxyPayload))
-      self.assertEqual(proxy.version, 0x02)
-      self.assertEqual(proxy.command, 0x01)
-      if v6:
-        self.assertEqual(proxy.family, 0x02)
-      else:
-        self.assertEqual(proxy.family, 0x01)
-      if not isTCP:
-        self.assertEqual(proxy.protocol, 0x02)
-      else:
-        self.assertEqual(proxy.protocol, 0x01)
-      self.assertGreater(proxy.contentLen, 0)
-
-      self.assertTrue(proxy.parseAddressesAndPorts(receivedProxyPayload))
-      self.assertEqual(proxy.source, source)
-      self.assertEqual(proxy.destination, destination)
-      if sourcePort:
-        self.assertEqual(proxy.sourcePort, sourcePort)
-      if destinationPort:
-        self.assertEqual(proxy.destinationPort, destinationPort)
-      else:
-        self.assertEqual(proxy.destinationPort, self._dnsDistPort)
-
-      self.assertTrue(proxy.parseAdditionalValues(receivedProxyPayload))
-      proxy.values.sort()
-      values.sort()
-      self.assertEqual(proxy.values, values)
-
 class TestProxyProtocol(ProxyProtocolTest):
     """
     dnsdist is configured to prepend a Proxy Protocol header to the query
@@ -190,6 +161,7 @@ class TestProxyProtocol(ProxyProtocolTest):
     addAction("values-action.proxy.tests.powerdns.com.", SetProxyProtocolValuesAction({ ["1"]="dnsdist", ["255"]="proxy-protocol"}))
     """
     _config_params = ['_proxyResponderPort']
+    _verboseMode = True
 
     def testProxyUDP(self):
         """
@@ -583,7 +555,6 @@ class TestProxyProtocolIncoming(ProxyProtocolTest):
 
         receivedQuery = dns.message.from_wire(receivedDNSData)
         receivedQuery.id = query.id
-        receivedResponse.id = response.id
         self.assertEqual(receivedQuery, query)
         self.assertEqual(receivedResponse, response)
         self.checkMessageProxyProtocol(receivedProxyPayload, srcAddr, destAddr, True, [ [0, b'foo'], [1, b'dnsdist'], [ 2, b'foo'], [3, b'proxy'], [ 42, b'bar'], [255, b'proxy-protocol'] ], True, srcPort, destPort)
@@ -630,7 +601,6 @@ class TestProxyProtocolIncoming(ProxyProtocolTest):
         destPort = 9999
         srcAddr = "2001:db8::8"
         srcPort = 8888
-        response = dns.message.make_response(query)
 
         tcpPayload = ProxyProtocol.getPayload(False, True, True, srcAddr, destAddr, srcPort, destPort, [ [ 2, b'foo'], [ 3, b'proxy'] ])
 
@@ -680,7 +650,6 @@ class TestProxyProtocolIncoming(ProxyProtocolTest):
 
           receivedQuery = dns.message.from_wire(receivedDNSData)
           receivedQuery.id = query.id
-          receivedResponse.id = response.id
           self.assertEqual(receivedQuery, query)
           self.assertEqual(receivedResponse, response)
           self.checkMessageProxyProtocol(receivedProxyPayload, srcAddr, destAddr, True, [ [0, b'foo'], [1, b'dnsdist'], [ 2, b'foo'], [3, b'proxy'], [ 42, b'bar'], [255, b'proxy-protocol'] ], True, srcPort, destPort)

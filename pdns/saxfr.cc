@@ -112,7 +112,7 @@ try
       throw PDNSException("tcp read failed");
 
     len=ntohs(len);
-    std::unique_ptr<char[]> creply(new char[len]);
+    auto creply = std::make_unique<char[]>(len);
     int n=0;
     int numread;
     while(n<len) {
@@ -183,7 +183,7 @@ try
         o<<"\t"<<i->first.d_content->getZoneRepresentation();
       }
 
-      records.push_back(make_pair(i->first.d_name,o.str()));
+      records.emplace_back(i->first.d_name, o.str());
 
       DNSName shorter(i->first.d_name);
       do {

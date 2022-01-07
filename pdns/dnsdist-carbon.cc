@@ -22,21 +22,16 @@
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
-#include "iputils.hh"
+
+#include "dnsdist-carbon.hh"
+#include "dnsdist.hh"
+
+#ifndef DISABLE_CARBON
 #include "dolog.hh"
 #include "sstuff.hh"
-
-#include "namespaces.hh"
-#include "dnsdist.hh"
 #include "threadname.hh"
 
 GlobalStateHolder<vector<CarbonConfig> > g_carbon;
-static time_t s_start = time(nullptr);
-
-uint64_t uptimeOfProcess(const std::string& str)
-{
-  return time(nullptr) - s_start;
-}
 
 void carbonDumpThread()
 {
@@ -107,6 +102,7 @@ void carbonDumpThread()
             str<<base<<"tcpmaxconcurrentconnections" << ' '<< state->tcpMaxConcurrentConnections.load() << " " << now << "\r\n";
             str<<base<<"tcpnewconnections" << ' '<< state->tcpNewConnections.load() << " " << now << "\r\n";
             str<<base<<"tcpreusedconnections" << ' '<< state->tcpReusedConnections.load() << " " << now << "\r\n";
+            str<<base<<"tlsresumptions" << ' '<< state->tlsResumptions.load() << " " << now << "\r\n";
             str<<base<<"tcpavgqueriesperconnection" << ' '<< state->tcpAvgQueriesPerConnection.load() << " " << now << "\r\n";
             str<<base<<"tcpavgconnectionduration" << ' '<< state->tcpAvgConnectionDuration.load() << " " << now << "\r\n";
           }
@@ -238,14 +234,14 @@ void carbonDumpThread()
 #endif /* HAVE_DNS_OVER_HTTPS */
 
           {
-            WriteLock wl(&g_qcount.queryLock);
             std::string qname;
-            for(auto &record: g_qcount.records) {
+            auto records = g_qcount.records.write_lock();
+            for (const auto &record : *records) {
               qname = record.first;
               boost::replace_all(qname, ".", "_");
               str<<"dnsdist.querycount." << qname << ".queries " << record.second << " " << now << "\r\n";
             }
-            g_qcount.records.clear();
+            records->clear();
           }
 
           const string msg = str.str();
@@ -276,4 +272,12 @@ void carbonDumpThread()
   {
     errlog("Carbon thread died");
   }
+}
+#endif /* DISABLE_CARBON */
+
+static time_t s_start = time(nullptr);
+
+uint64_t uptimeOfProcess(const std::string& str)
+{
+  return time(nullptr) - s_start;
 }

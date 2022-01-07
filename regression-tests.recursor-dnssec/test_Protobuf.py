@@ -172,13 +172,13 @@ class TestRecursorProtobuf(RecursorTest):
           # compare inBytes with length of query/response
           self.assertEqual(msg.inBytes, len(query.to_wire()))
 
-    def checkProtobufQuery(self, msg, protocol, query, qclass, qtype, qname, initiator='127.0.0.1'):
+    def checkProtobufQuery(self, msg, protocol, query, qclass, qtype, qname, initiator='127.0.0.1', to='127.0.0.1'):
         self.assertEqual(msg.type, dnsmessage_pb2.PBDNSMessage.DNSQueryType)
         self.checkProtobufBase(msg, protocol, query, initiator)
         # dnsdist doesn't fill the responder field for responses
         # because it doesn't keep the information around.
         self.assertTrue(msg.HasField('to'))
-        self.assertEqual(socket.inet_ntop(socket.AF_INET, msg.to), '127.0.0.1')
+        self.assertEqual(socket.inet_ntop(socket.AF_INET, msg.to), to)
         self.assertTrue(msg.HasField('question'))
         self.assertTrue(msg.question.HasField('qClass'))
         self.assertEqual(msg.question.qClass, qclass)
@@ -365,6 +365,40 @@ auth-zones=example=configs/%s/example.zone""" % _confdir
         rr = msg.response.rrs[1]
         # we have max-cache-ttl set to 15
         self.checkProtobufResponseRecord(rr, dns.rdataclass.IN, dns.rdatatype.A, 'a.example.', 15, checkTTL=False)
+        self.assertEqual(socket.inet_ntop(socket.AF_INET, rr.rdata), '192.0.2.42')
+        self.checkNoRemainingMessage()
+
+class ProtobufProxyTest(TestRecursorProtobuf):
+    """
+    This test makes sure that we correctly export addresses over protobuf when the proxy protocol is used.
+    """
+
+    _confdir = 'ProtobufProxy'
+    _config_template = """
+auth-zones=example=configs/%s/example.zone
+proxy-protocol-from=127.0.0.1/32
+allow-from=127.0.0.1,6.6.6.6
+""" % _confdir
+
+    def testA(self):
+        name = 'a.example.'
+        expected = dns.rrset.from_text(name, 0, dns.rdataclass.IN, 'A', '192.0.2.42')
+        query = dns.message.make_query(name, 'A', want_dnssec=True)
+        query.flags |= dns.flags.CD
+        res = self.sendUDPQueryWithProxyProtocol(query, False, '6.6.6.6', '7.7.7.7', 666, 777)
+
+        self.assertRRsetInAnswer(res, expected)
+
+        # check the protobuf messages corresponding to the UDP query and answer
+        msg = self.getFirstProtobufMessage()
+        self.checkProtobufQuery(msg, dnsmessage_pb2.PBDNSMessage.UDP, query, dns.rdataclass.IN, dns.rdatatype.A, name, '6.6.6.6', '7.7.7.7')
+        # then the response
+        msg = self.getFirstProtobufMessage()
+        self.checkProtobufResponse(msg, dnsmessage_pb2.PBDNSMessage.UDP, res, '6.6.6.6')
+        self.assertEqual(len(msg.response.rrs), 1)
+        rr = msg.response.rrs[0]
+        # we have max-cache-ttl set to 15
+        self.checkProtobufResponseRecord(rr, dns.rdataclass.IN, dns.rdatatype.A, name, 15)
         self.assertEqual(socket.inet_ntop(socket.AF_INET, rr.rdata), '192.0.2.42')
         self.checkNoRemainingMessage()
 
@@ -905,6 +939,7 @@ auth-zones=example=configs/%s/example.rpz.zone""" % _confdir
             authzone.write("""$ORIGIN example.
 @ 3600 IN SOA {soa}
 sub.test 3600 IN A 192.0.2.42
+ip  3600 IN A 33.22.11.99
 """.format(soa=cls._SOA))
 
         rpzFilePath = os.path.join(confdir, 'zone.rpz')
@@ -912,6 +947,7 @@ sub.test 3600 IN A 192.0.2.42
             rpzZone.write("""$ORIGIN zone.rpz.
 @ 3600 IN SOA {soa}
 *.test.example.zone.rpz. 60 IN CNAME rpz-passthru.
+24.0.11.22.33.rpz-ip     60 IN A 1.2.3.4
 """.format(soa=cls._SOA))
 
         super(ProtobufRPZTest, cls).generateRecursorConfig(confdir)
@@ -937,6 +973,25 @@ sub.test 3600 IN A 192.0.2.42
         # we have max-cache-ttl set to 15
         self.checkProtobufResponseRecord(rr, dns.rdataclass.IN, dns.rdatatype.A, name, 15)
         self.assertEqual(socket.inet_ntop(socket.AF_INET, rr.rdata), '192.0.2.42')
+        self.checkNoRemainingMessage()
+
+    def testB(self):
+        name = 'ip.example.'
+        expected = dns.rrset.from_text(name, 0, dns.rdataclass.IN, 'A', '1.2.3.4')
+        query = dns.message.make_query(name, 'A', want_dnssec=True)
+        query.flags |= dns.flags.CD
+        res = self.sendUDPQuery(query)
+        self.assertRRsetInAnswer(res, expected)
+
+        # check the protobuf messages corresponding to the UDP query and answer
+        msg = self.getFirstProtobufMessage()
+        self.checkProtobufQuery(msg, dnsmessage_pb2.PBDNSMessage.UDP, query, dns.rdataclass.IN, dns.rdatatype.A, name)
+
+        # then the response
+        msg = self.getFirstProtobufMessage()
+        self.checkProtobufResponse(msg, dnsmessage_pb2.PBDNSMessage.UDP, res)
+        self.checkProtobufPolicy(msg, dnsmessage_pb2.PBDNSMessage.PolicyType.RESPONSEIP, 'zone.rpz.', '24.0.11.22.33.rpz-ip.', '33.22.11.99', dnsmessage_pb2.PBDNSMessage.PolicyKind.Custom)
+        self.assertEqual(len(msg.response.rrs), 1)
         self.checkNoRemainingMessage()
 
 class ProtobufRPZTagsTest(TestRecursorProtobuf):
