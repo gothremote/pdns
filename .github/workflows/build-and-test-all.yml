@@ -36,7 +36,7 @@ jobs:
       - run: inv ci-autoconf
       - run: inv ci-auth-configure
       - run: inv ci-auth-make
-      - run: inv ci-auth-install-remotebackend-ruby-deps
+      - run: inv ci-auth-install-remotebackend-test-deps
       - run: inv ci-auth-run-unit-tests
       - run: inv ci-make-install
       - run: ccache -s
@@ -384,11 +384,23 @@ jobs:
       - run: inv install-dnsdist-test-deps
       - run: inv test-dnsdist
 
+  swagger-syntax-check:
+    runs-on: ubuntu-20.04
+    steps:
+      - uses: actions/checkout@v2.3.4
+        with:
+          fetch-depth: 5
+          submodules: recursive
+      - run: build-scripts/gh-actions-setup-inv  # this runs apt update+upgrade
+      - run: inv install-swagger-tools
+      - run: inv swagger-syntax-check
+
   collect:
     needs:
       - build-auth
       - build-dnsdist
       - build-recursor
+      - swagger-syntax-check
       - test-auth-api
       - test-auth-backend
       - test-dnsdist-regression

@@ -43,8 +43,7 @@
 #include "rpzloader.hh"
 #include "uuid-utils.hh"
 #include "tcpiohandler.hh"
-
-extern thread_local FDMultiplexer* t_fdm;
+#include "rec-main.hh"
 
 using json11::Json;
 
@@ -58,7 +57,7 @@ void productServerStatisticsFetch(map<string, string>& out)
   out.swap(ret);
 }
 
-boost::optional<uint64_t> productServerStatisticsFetch(const std::string& name)
+std::optional<uint64_t> productServerStatisticsFetch(const std::string& name)
 {
   return getStatByName(name);
 }
@@ -689,8 +688,11 @@ const std::map<std::string, MetricDefinition> MetricDefinitionStorage::d_metrics
    MetricDefinition(PrometheusMetricType::counter,
                     "Number of servers that sent an invalid EDNS PING response")},
   {"failed-host-entries",
-   MetricDefinition(PrometheusMetricType::counter,
-                    "Number of servers that failed to resolve")},
+   MetricDefinition(PrometheusMetricType::gauge,
+                    "Number of entries in the failed NS cache")},
+  {"non-resolving-nameserver-entries",
+   MetricDefinition(PrometheusMetricType::gauge,
+                    "Number of entries in the non-resolving NS name cache")},
   {"ignored-packets",
    MetricDefinition(PrometheusMetricType::counter,
                     "Number of non-query packets received on server sockets that should only get query packets")},
@@ -1372,7 +1374,7 @@ void AsyncWebServer::serveConnection(std::shared_ptr<Socket> client) const
       g_networkTimeoutMsec / 1000, static_cast<suseconds_t>(g_networkTimeoutMsec) % 1000 * 1000
     };
     std::shared_ptr<TLSCtx> tlsCtx{nullptr};
-    auto handler = std::make_shared<TCPIOHandler>("", client->releaseHandle(), timeout, tlsCtx, time(nullptr));
+    auto handler = std::make_shared<TCPIOHandler>("", false, client->releaseHandle(), timeout, tlsCtx, time(nullptr));
 
     PacketBuffer data;
     try {

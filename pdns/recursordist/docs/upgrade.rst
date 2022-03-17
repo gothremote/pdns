@@ -4,8 +4,26 @@ Upgrade Guide
 Before upgrading, it is advised to read the :doc:`changelog/index`.
 When upgrading several versions, please read **all** notes applying to the upgrade.
 
-4.5.x to 4.6.0 or master
-------------------------
+4.6.x to master
+---------------
+
+Zone to Cache Changes
+^^^^^^^^^^^^^^^^^^^^^
+The :ref:`ztc` feature now validates ``ZONEMD`` records. This means that zones containing invalid ``ZONEMD`` records will
+be rejected by default, while previously the ``ZONEMD`` records would be ignored. For more detail, refer to :ref:`ztc`.
+
+Asynchronous retrieval of ``AAAA`` records for nameservers
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+If IPv6 is enabled for outgoing queries using :ref:`setting-query-local-address`, the Recursor will schedule an asynchronous task to resolve IPv6 addresses of nameservers it did not otherwise learn.
+These addresses will then be used for future queries to authoritative nameservers.
+This has the consequence that authoritative nameservers will be contacted over IPv6 in more case than before.
+
+Deprecated and changed settings
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+-  The :ref:`setting-hint-file` gained a special value ``no`` to indicate that no hint file should not processed. The hint processing code is also made less verbose.
+
+4.5.x to 4.6.0
+--------------
 
 Offensive language
 ^^^^^^^^^^^^^^^^^^
@@ -14,7 +32,7 @@ Using the settings mentioned in :ref:`upgrade-offensive` now generates a warning
 File descriptor usage
 ^^^^^^^^^^^^^^^^^^^^^
 The number of file descriptors used by the Recursor has increased because the Recursor now keeps idle outgoing TCP/DoT connections open for a while.
-The extra file descriptors used compared to previous versions of the Recursor is :ref:`setting-tcp-out-max-idle-per-thread` times the number of worker threads (:ref:`threads`).
+The extra file descriptors used in comparison to previous versions of the Recursor is :ref:`setting-tcp-out-max-idle-per-thread` times the number of worker threads (:ref:`setting-threads`).
 
 New settings
 ^^^^^^^^^^^^
@@ -114,6 +132,10 @@ To conform better to the standard, RPZ processing has been modified.
 This has consequences for the points in the resolving process where matches are checked and callbacks are called.
 See :ref:`rpz` for details. Additionally a new type of callback has been introduced: :func:`policyEventFilter`.
 
+Dropping queries from Lua callbacks
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+The method to drop a query from a Lua callback has been changed.
+Previously, you could set `rcode` to `pdns.DROP`. See :ref:`hook-semantics` for the new method.
 
 Parsing of unknown record types
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

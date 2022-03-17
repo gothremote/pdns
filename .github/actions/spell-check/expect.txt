@@ -723,6 +723,7 @@ iers
 ietf
 ifdef
 ifportup
+ifurlextup
 ifurlup
 ihsinme
 IJajghd
@@ -1685,6 +1686,7 @@ Thessalonikefs
 Thiago
 thinko
 Thomassen
+threadmessage
 threadsafe
 throttlemap
 thrysoee
@@ -1918,6 +1920,7 @@ zilopbg
 Zmd
 zonecryptokey
 zonefile
+zonemd
 zonemetadata
 zonename
 zoneparser

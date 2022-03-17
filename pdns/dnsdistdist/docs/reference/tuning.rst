@@ -6,6 +6,7 @@ Tuning related functions
   .. versionadded:: 1.7.0
 
   Set how often, in seconds, the outgoing DoH connections to backends of a given worker thread are scanned to expunge the ones that are no longer usable. The default is 60 so once per minute and per worker thread.
+
   :param int interval: The interval in seconds.
 
 .. function:: setDoHDownstreamMaxIdleTime(max)
@@ -123,6 +124,26 @@ Tuning related functions
 
   :param int max: The maximum time in seconds.
 
+
+.. function:: setRandomizedIdsOverUDP(val)
+
+  .. versionadded:: 1.8.0
+
+  Setting this parameter to true (default is false) will randomize the IDs in outgoing UDP queries, at a small performance cost, ignoring the :func:`setMaxUDPOutstanding`
+  value. This is only useful if the path between dnsdist and the backend is not trusted and the 'TCP-only', DNS over TLS or DNS over HTTPS transports cannot be used.
+  See also :func:`setRandomizedOutgoingSockets`.
+  The default is to use a linearly increasing counter from 0 to 65535, wrapping back to 0 when necessary.
+
+.. function:: setRandomizedOutgoingSockets(val):
+
+  .. versionadded:: 1.8.0
+
+  Setting this parameter to true (default is false) will randomize the outgoing socket used when forwarding a query to a backend.
+  The default is to use a round-robin mechanism to select the outgoing socket.
+  This requires configuring the backend to use more than one outgoing socket via the ``sockets`` parameter of :func:`newServer`
+  to be of any use, and only makes sense if the path between dnsdist and the backend is not trusted and the 'TCP-only', DNS over
+  TLS or DNS over HTTPS transports cannot be used.
+  See also :func:`setRandomizedIdsOverUDP`.
 
 .. function:: setTCPInternalPipeBufferSize(size)
 

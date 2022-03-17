@@ -45,6 +45,7 @@ auth_build_deps = [    # FIXME: perhaps we should be stealing these from the deb
     'ruby-bundler',
     'ruby-dev',
     'sqlite3',
+    'unixodbc-dev',
 ]
 rec_build_deps = [
     'libcap-dev',
@@ -359,10 +360,11 @@ def ci_dnsdist_make(c):
     c.run('make -j4 -k V=1')
 
 @task
-def ci_auth_install_remotebackend_ruby_deps(c):
+def ci_auth_install_remotebackend_test_deps(c):
     with c.cd('modules/remotebackend'):
       # c.run('bundle config set path vendor/bundle')
       c.run('sudo ruby -S bundle install')
+    c.sudo('apt-get install -qq -y socat')
 
 @task
 def ci_auth_run_unit_tests(c):
@@ -464,7 +466,7 @@ backend_regress_tests = dict(
 @task
 def test_auth_backend(c, backend):
     if backend == 'remote':
-        ci_auth_install_remotebackend_ruby_deps(c)
+        ci_auth_install_remotebackend_test_deps(c)
 
     if backend == 'authpy':
         with c.cd('regression-tests.auth-py'):
@@ -510,6 +512,14 @@ def test_bulk_recursor(c, threads, mthreads, shards):
         c.run('unzip top-1m.csv.zip -d .')
         c.run('chmod +x /opt/pdns-recursor/bin/* /opt/pdns-recursor/sbin/*')
         c.run(f'DNSBULKTEST=/usr/bin/dnsbulktest RECURSOR=/opt/pdns-recursor/sbin/pdns_recursor RECCONTROL=/opt/pdns-recursor/bin/rec_control THRESHOLD=95 TRACE=no ./timestamp ./recursor-test 5300 100 {threads} {mthreads} {shards}')
+
+@task
+def install_swagger_tools(c):
+    c.run('npm install -g api-spec-converter')
+
+@task
+def swagger_syntax_check(c):
+    c.run('api-spec-converter docs/http-api/swagger/authoritative-api-swagger.yaml -f swagger_2 -t openapi_3 -s json -c')
 
 # this is run always
 def setup():

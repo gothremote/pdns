@@ -22,6 +22,9 @@
 #ifdef HAVE_CONFIG_H
 #include "config.h"
 #endif
+
+#include <boost/format.hpp>
+
 #include "utility.hh"
 #include "dnsrecords.hh"
 #include "iputils.hh"
@@ -82,8 +85,8 @@ bool DNSResourceRecord::operator==(const DNSResourceRecord& rhs)
   string rcontent=toLower(rhs.content);
 
   return
-    tie(qname, qtype, lcontent, ttl) ==
-    tie(rhs.qname, rhs.qtype, rcontent, rhs.ttl);
+    std::tie(qname, qtype, lcontent, ttl) ==
+    std::tie(rhs.qname, rhs.qtype, rcontent, rhs.ttl);
 }
 
 boilerplate_conv(A, conv.xfrIP(d_ip));
@@ -137,7 +140,9 @@ boilerplate_conv(AAAA, conv.xfrIP6(d_ip6); );
 boilerplate_conv(NS, conv.xfrName(d_content, true));
 boilerplate_conv(PTR, conv.xfrName(d_content, true));
 boilerplate_conv(CNAME, conv.xfrName(d_content, true));
+#if !defined(RECURSOR)
 boilerplate_conv(ALIAS, conv.xfrName(d_content, false));
+#endif
 boilerplate_conv(DNAME, conv.xfrName(d_content));
 boilerplate_conv(MB, conv.xfrName(d_madname, true));
 boilerplate_conv(MG, conv.xfrName(d_mgmname, true));
@@ -303,6 +308,13 @@ boilerplate_conv(KEY,
                  conv.xfr8BitInt(d_protocol); 
                  conv.xfr8BitInt(d_algorithm); 
                  conv.xfrBlob(d_certificate);
+                 );
+
+boilerplate_conv(ZONEMD,
+                 conv.xfr32BitInt(d_serial);
+                 conv.xfr8BitInt(d_scheme);
+                 conv.xfr8BitInt(d_hashalgo);
+                 conv.xfrHexBlob(d_digest, true); // keep reading across spaces
                  );
 
 boilerplate_conv(CERT,
@@ -920,7 +932,9 @@ void reportOtherTypes()
    MRRecordContent::report();
    AFSDBRecordContent::report();
    DNAMERecordContent::report();
+#if !defined(RECURSOR)
    ALIASRecordContent::report();
+#endif
    SPFRecordContent::report();
    NAPTRRecordContent::report();
    KXRecordContent::report();
@@ -963,6 +977,7 @@ void reportOtherTypes()
    L32RecordContent::report();
    L64RecordContent::report();
    LPRecordContent::report();
+   ZONEMDRecordContent::report();
 }
 
 void reportAllTypes()

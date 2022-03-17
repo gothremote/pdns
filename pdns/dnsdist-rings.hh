@@ -44,6 +44,10 @@ struct Rings {
     uint16_t qtype;
     // incoming protocol
     dnsdist::Protocol protocol;
+#if defined(DNSDIST_RINGS_WITH_MACADDRESS)
+    char macaddress[6];
+    bool hasmac{false};
+#endif
   };
   struct Response
   {
@@ -61,47 +65,23 @@ struct Rings {
 
   struct Shard
   {
-    LockGuarded<boost::circular_buffer<Query>> queryRing{boost::circular_buffer<Query>()};
-    LockGuarded<boost::circular_buffer<Response>> respRing{boost::circular_buffer<Response>()};
+    LockGuarded<boost::circular_buffer<Query>> queryRing;
+    LockGuarded<boost::circular_buffer<Response>> respRing;
   };
 
-  Rings(size_t capacity=10000, size_t numberOfShards=10, size_t nbLockTries=5, bool keepLockingStats=false): d_blockingQueryInserts(0), d_blockingResponseInserts(0), d_deferredQueryInserts(0), d_deferredResponseInserts(0), d_nbQueryEntries(0), d_nbResponseEntries(0), d_currentShardId(0), d_numberOfShards(numberOfShards), d_nbLockTries(nbLockTries), d_keepLockingStats(keepLockingStats)
+  Rings(size_t capacity=10000, size_t numberOfShards=10, size_t nbLockTries=5, bool keepLockingStats=false): d_blockingQueryInserts(0), d_blockingResponseInserts(0), d_deferredQueryInserts(0), d_deferredResponseInserts(0), d_nbQueryEntries(0), d_nbResponseEntries(0), d_currentShardId(0), d_capacity(capacity), d_numberOfShards(numberOfShards), d_nbLockTries(nbLockTries), d_keepLockingStats(keepLockingStats)
   {
-    setCapacity(capacity, numberOfShards);
   }
 
   std::unordered_map<int, vector<boost::variant<string,double> > > getTopBandwidth(unsigned int numentries);
   size_t numDistinctRequestors();
+  /* this function should not be called after init() has been called */
+  void setCapacity(size_t newCapacity, size_t numberOfShards);
+
   /* This function should only be called at configuration time before any query or response has been inserted */
-  void setCapacity(size_t newCapacity, size_t numberOfShards)
-  {
-    if (numberOfShards <= 1) {
-      d_nbLockTries = 0;
-    }
+  void init();
 
-    d_shards.resize(numberOfShards);
-    d_numberOfShards = numberOfShards;
-
-    /* resize all the rings */
-    for (auto& shard : d_shards) {
-      shard = std::make_unique<Shard>();
-      shard->queryRing.lock()->set_capacity(newCapacity / numberOfShards);
-      shard->respRing.lock()->set_capacity(newCapacity / numberOfShards);
-    }
-
-    /* we just recreated the shards so they are now empty */
-    d_nbQueryEntries = 0;
-    d_nbResponseEntries = 0;
-  }
-
-  void setNumberOfLockRetries(size_t retries)
-  {
-    if (d_numberOfShards <= 1) {
-      d_nbLockTries = 0;
-    } else {
-      d_nbLockTries = retries;
-    }
-  }
+  void setNumberOfLockRetries(size_t retries);
 
   size_t getNumberOfShards() const
   {
@@ -120,11 +100,22 @@ struct Rings {
 
   void insertQuery(const struct timespec& when, const ComboAddress& requestor, const DNSName& name, uint16_t qtype, uint16_t size, const struct dnsheader& dh, dnsdist::Protocol protocol)
   {
+#if defined(DNSDIST_RINGS_WITH_MACADDRESS)
+    char macaddress[6];
+    bool hasmac{false};
+    if (getMACAddress(requestor, macaddress, sizeof(macaddress)) == 0) {
+      hasmac = true;
+    }
+#endif
     for (size_t idx = 0; idx < d_nbLockTries; idx++) {
       auto& shard = getOneShard();
       auto lock = shard->queryRing.try_lock();
       if (lock.owns_lock()) {
+#if defined(DNSDIST_RINGS_WITH_MACADDRESS)
+        insertQueryLocked(*lock, when, requestor, name, qtype, size, dh, protocol, macaddress, sizeof(macaddress), hasmac);
+#else
         insertQueryLocked(*lock, when, requestor, name, qtype, size, dh, protocol);
+#endif
         return;
       }
       if (d_keepLockingStats) {
@@ -138,7 +129,11 @@ struct Rings {
     }
     auto& shard = getOneShard();
     auto lock = shard->queryRing.lock();
+#if defined(DNSDIST_RINGS_WITH_MACADDRESS)
+    insertQueryLocked(*lock, when, requestor, name, qtype, size, dh, protocol, macaddress, sizeof(macaddress), hasmac);
+#else
     insertQueryLocked(*lock, when, requestor, name, qtype, size, dh, protocol);
+#endif
   }
 
   void insertResponse(const struct timespec& when, const ComboAddress& requestor, const DNSName& name, uint16_t qtype, unsigned int usec, unsigned int size, const struct dnsheader& dh, const ComboAddress& backend, dnsdist::Protocol protocol)
@@ -180,6 +175,13 @@ struct Rings {
     d_deferredResponseInserts.store(0);
   }
 
+  /* this should be called in the unit tests, and never at runtime */
+  void reset()
+  {
+    clear();
+    d_initialized = false;
+  }
+
   /* load the content of the ring buffer from a file in the format emitted by grepq(),
      only useful for debugging purposes */
   size_t loadFromFile(const std::string& filepath, const struct timespec& now);
@@ -201,12 +203,24 @@ private:
     return d_shards[getShardId()];
   }
 
+#if defined(DNSDIST_RINGS_WITH_MACADDRESS)
+  void insertQueryLocked(boost::circular_buffer<Query>& ring, const struct timespec& when, const ComboAddress& requestor, const DNSName& name, uint16_t qtype, uint16_t size, const struct dnsheader& dh, dnsdist::Protocol protocol, const char* macaddress, size_t maclen, const bool hasmac)
+#else
   void insertQueryLocked(boost::circular_buffer<Query>& ring, const struct timespec& when, const ComboAddress& requestor, const DNSName& name, uint16_t qtype, uint16_t size, const struct dnsheader& dh, dnsdist::Protocol protocol)
+#endif
   {
     if (!ring.full()) {
       d_nbQueryEntries++;
     }
+#if defined(DNSDIST_RINGS_WITH_MACADDRESS)
+    Rings::Query query({requestor, name, when, dh, size, qtype, protocol, "", hasmac});
+    if (hasmac) {
+      memcpy(query.macaddress, macaddress, maclen);
+    }
+    ring.push_back(std::move(query));
+#else
     ring.push_back({requestor, name, when, dh, size, qtype, protocol});
+#endif
   }
 
   void insertResponseLocked(boost::circular_buffer<Response>& ring, const struct timespec& when, const ComboAddress& requestor, const DNSName& name, uint16_t qtype, unsigned int usec, unsigned int size, const struct dnsheader& dh, const ComboAddress& backend, dnsdist::Protocol protocol)
@@ -220,7 +234,9 @@ private:
   std::atomic<size_t> d_nbQueryEntries;
   std::atomic<size_t> d_nbResponseEntries;
   std::atomic<size_t> d_currentShardId;
+  std::atomic<bool> d_initialized{false};
 
+  size_t d_capacity;
   size_t d_numberOfShards;
   size_t d_nbLockTries = 5;
   bool d_keepLockingStats{false};

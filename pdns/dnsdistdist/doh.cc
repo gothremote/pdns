@@ -467,9 +467,9 @@ public:
     }
 
     double udiff = du->ids.sentTime.udiff();
-    vinfolog("Got answer from %s, relayed to %s (https), took %f usec", du->downstream->remote.toStringWithPort(), du->ids.origRemote.toStringWithPort(), udiff);
+    vinfolog("Got answer from %s, relayed to %s (https), took %f usec", du->downstream->d_config.remote.toStringWithPort(), du->ids.origRemote.toStringWithPort(), udiff);
 
-    handleResponseSent(du->ids, udiff, *dr.remote, du->downstream->remote, du->response.size(), cleartextDH, du->downstream->getProtocol());
+    handleResponseSent(du->ids, udiff, *dr.remote, du->downstream->d_config.remote, du->response.size(), cleartextDH, du->downstream->getProtocol());
 
     ++g_stats.responses;
     if (du->ids.cs) {
@@ -636,7 +636,7 @@ static void processDOHQuery(DOHUnitUniquePtr&& du)
       std::string proxyProtocolPayload;
       /* we need to do this _before_ creating the cross protocol query because
          after that the buffer will have been moved */
-      if (du->downstream->useProxyProtocol) {
+      if (du->downstream->d_config.useProxyProtocol) {
         proxyProtocolPayload = getProxyProtocolPayload(dq);
       }
 
@@ -661,33 +661,9 @@ static void processDOHQuery(DOHUnitUniquePtr&& du)
     }
 
     ComboAddress dest = du->ids.origDest;
-    unsigned int idOffset = (du->downstream->idOffset++) % du->downstream->idStates.size();
-    IDState* ids = &du->downstream->idStates[idOffset];
-    ids->age = 0;
-    DOHUnit* oldDU = nullptr;
-    if (ids->isInUse()) {
-      /* that means that the state was in use, possibly with an allocated
-         DOHUnit that we will need to handle, but we can't touch it before
-         confirming that we now own this state */
-      oldDU = ids->du;
-    }
-
-    /* we atomically replace the value, we now own this state */
-    int64_t generation = ids->generation++;
-    if (!ids->markAsUsed(generation)) {
-      /* the state was not in use.
-         we reset 'oldDU' because it might have still been in use when we read it. */
-      oldDU = nullptr;
-      ++du->downstream->outstanding;
-    }
-    else {
-      ids->du = nullptr;
-      /* we are reusing a state, no change in outstanding but if there was an existing DOHUnit we need
-         to handle it because it's about to be overwritten. */
-      ++du->downstream->reuseds;
-      ++g_stats.downstreamTimeouts;
-      handleDOHTimeout(DOHUnitUniquePtr(oldDU, DOHUnit::release));
-    }
+    unsigned int idOffset = 0;
+    int64_t generation;
+    IDState* ids = du->downstream->getIDState(idOffset, generation);
 
     ids->origFD = 0;
     /* increase the ref count since we are about to store the pointer */
@@ -717,14 +693,15 @@ static void processDOHQuery(DOHUnitUniquePtr&& du)
       ids->destHarvested = false;
     }
 
-    if (du->downstream->useProxyProtocol) {
+    if (du->downstream->d_config.useProxyProtocol) {
       size_t payloadSize = 0;
       if (addProxyProtocol(dq)) {
         du->proxyProtocolPayloadSize = payloadSize;
       }
     }
 
-    int fd = pickBackendSocketForSending(du->downstream);
+    int fd = du->downstream->pickSocketForSending();
+    ids->backendFD = fd;
     try {
       /* you can't touch du after this line, unless the call returned a non-negative value,
          because it might already have been freed */
@@ -1665,9 +1642,9 @@ void handleUDPResponseForDoH(DOHUnitUniquePtr&& du, PacketBuffer&& udpResponse, 
     }
 
     double udiff = du->ids.sentTime.udiff();
-    vinfolog("Got answer from %s, relayed to %s (https), took %f usec", du->downstream->remote.toStringWithPort(), du->ids.origRemote.toStringWithPort(), udiff);
+    vinfolog("Got answer from %s, relayed to %s (https), took %f usec", du->downstream->d_config.remote.toStringWithPort(), du->ids.origRemote.toStringWithPort(), udiff);
 
-    handleResponseSent(du->ids, udiff, *dr.remote, du->downstream->remote, du->response.size(), cleartextDH, du->downstream->getProtocol());
+    handleResponseSent(du->ids, udiff, *dr.remote, du->downstream->d_config.remote, du->response.size(), cleartextDH, du->downstream->getProtocol());
 
     ++g_stats.responses;
     if (du->ids.cs) {

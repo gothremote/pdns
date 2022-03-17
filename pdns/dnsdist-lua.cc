@@ -35,6 +35,7 @@
 #include "dnsdist-carbon.hh"
 #include "dnsdist-console.hh"
 #include "dnsdist-dynblocks.hh"
+#include "dnsdist-discovery.hh"
 #include "dnsdist-ecs.hh"
 #include "dnsdist-healthchecks.hh"
 #include "dnsdist-lua.hh"
@@ -50,9 +51,7 @@
 #include "dnsdist-web.hh"
 
 #include "base64.hh"
-#include "dnswriter.hh"
 #include "dolog.hh"
-#include "lock.hh"
 #include "sodcrypto.hh"
 
 #ifdef HAVE_LIBSSL
@@ -60,7 +59,7 @@
 #endif
 
 #include <boost/logic/tribool.hpp>
-#include <boost/lexical_cast.hpp>
+#include <boost/uuid/string_generator.hpp>
 
 #ifdef HAVE_SYSTEMD
 #include <systemd/sd-daemon.h>
@@ -306,7 +305,7 @@ static void setupLuaConfig(LuaContext& luaCtx, bool client, bool configCheck)
   });
 
   luaCtx.writeFunction("inConfigCheck", [configCheck]() {
-    return !configCheck;
+    return configCheck;
   });
 
   luaCtx.writeFunction("newServer",
@@ -314,8 +313,8 @@ static void setupLuaConfig(LuaContext& luaCtx, bool client, bool configCheck)
                          setLuaSideEffect();
 
                          newserver_t vars;
+                         DownstreamState::Config config;
 
-                         ComboAddress serverAddr;
                          std::string serverAddressStr;
                          if (auto addrStr = boost::get<string>(&pvars)) {
                            serverAddressStr = *addrStr;
@@ -327,32 +326,6 @@ static void setupLuaConfig(LuaContext& luaCtx, bool client, bool configCheck)
                            vars = boost::get<newserver_t>(pvars);
                            serverAddressStr = boost::get<string>(vars["address"]);
                          }
-
-                         try {
-                           serverAddr = ComboAddress(serverAddressStr, 53);
-                         }
-                         catch (const PDNSException& e) {
-                           g_outputBuffer = "Error creating new server: " + string(e.reason);
-                           errlog("Error creating new server with address %s: %s", serverAddressStr, e.reason);
-                           return std::shared_ptr<DownstreamState>();
-                         }
-                         catch (const std::exception& e) {
-                           g_outputBuffer = "Error creating new server: " + string(e.what());
-                           errlog("Error creating new server with address %s: %s", serverAddressStr, e.what());
-                           return std::shared_ptr<DownstreamState>();
-                         }
-
-                         if (IsAnyAddress(serverAddr)) {
-                           g_outputBuffer = "Error creating new server: invalid address for a downstream server.";
-                           errlog("Error creating new server: %s is not a valid address for a downstream server", serverAddressStr);
-                           return std::shared_ptr<DownstreamState>();
-                         }
-
-                         ComboAddress sourceAddr;
-                         std::string sourceItfName;
-                         unsigned int sourceItf = 0;
-                         size_t numberOfSockets = 1;
-                         std::set<int> cpus;
 
                          if (vars.count("source")) {
                            /* handle source in the following forms:
@@ -368,7 +341,7 @@ static void setupLuaConfig(LuaContext& luaCtx, bool client, bool configCheck)
                            if (pos == std::string::npos) {
                              /* no '@', try to parse that as a valid v4/v6 address */
                              try {
-                               sourceAddr = ComboAddress(source);
+                               config.sourceAddr = ComboAddress(source);
                                parsed = true;
                              }
                              catch (...) {
@@ -377,18 +350,18 @@ static void setupLuaConfig(LuaContext& luaCtx, bool client, bool configCheck)
 
                            if (parsed == false) {
                              /* try to parse as interface name, or v4/v6@itf */
-                             sourceItfName = source.substr(pos == std::string::npos ? 0 : pos + 1);
-                             unsigned int itfIdx = if_nametoindex(sourceItfName.c_str());
+                             config.sourceItfName = source.substr(pos == std::string::npos ? 0 : pos + 1);
+                             unsigned int itfIdx = if_nametoindex(config.sourceItfName.c_str());
 
                              if (itfIdx != 0) {
                                if (pos == 0 || pos == std::string::npos) {
                                  /* "eth0" or "@eth0" */
-                                 sourceItf = itfIdx;
+                                 config.sourceItf = itfIdx;
                                }
                                else {
                                  /* "192.0.2.1@eth0" */
-                                 sourceAddr = ComboAddress(source.substr(0, pos));
-                                 sourceItf = itfIdx;
+                                 config.sourceAddr = ComboAddress(source.substr(0, pos));
+                                 config.sourceItf = itfIdx;
                                }
 #ifdef SO_BINDTODEVICE
                                /* we need to retain CAP_NET_RAW to be able to set SO_BINDTODEVICE in the health checks */
@@ -396,77 +369,68 @@ static void setupLuaConfig(LuaContext& luaCtx, bool client, bool configCheck)
 #endif
                              }
                              else {
-                               warnlog("Dismissing source %s because '%s' is not a valid interface name", source, sourceItfName);
+                               warnlog("Dismissing source %s because '%s' is not a valid interface name", source, config.sourceItfName);
                              }
                            }
                          }
 
                          if (vars.count("sockets")) {
-                           numberOfSockets = std::stoul(boost::get<string>(vars["sockets"]));
-                           if (numberOfSockets == 0) {
+                           config.d_numberOfSockets = std::stoul(boost::get<string>(vars["sockets"]));
+                           if (config.d_numberOfSockets == 0) {
                              warnlog("Dismissing invalid number of sockets '%s', using 1 instead", boost::get<string>(vars["sockets"]));
-                             numberOfSockets = 1;
+                             config.d_numberOfSockets = 1;
                            }
                          }
 
-                         // create but don't connect the socket in client or check-config modes
-                         auto ret = std::make_shared<DownstreamState>(serverAddr, sourceAddr, sourceItf, sourceItfName);
-                         if (!(client || configCheck)) {
-                           infolog("Added downstream server %s", serverAddr.toStringWithPort());
-                         }
-
                          if (vars.count("qps")) {
-                           int qpsVal = std::stoi(boost::get<string>(vars["qps"]));
-                           ret->qps = QPSLimiter(qpsVal, qpsVal);
+                           config.d_qpsLimit = std::stoi(boost::get<string>(vars["qps"]));
                          }
 
                          if (vars.count("order")) {
-                           ret->order = std::stoi(boost::get<string>(vars["order"]));
+                           config.order = std::stoi(boost::get<string>(vars["order"]));
                          }
 
                          if (vars.count("weight")) {
                            try {
-                             int weightVal = std::stoi(boost::get<string>(vars["weight"]));
+                             config.d_weight = std::stoi(boost::get<string>(vars["weight"]));
 
-                             if (weightVal < 1) {
+                             if (config.d_weight < 1) {
                                errlog("Error creating new server: downstream weight value must be greater than 0.");
-                               return ret;
+                               return std::shared_ptr<DownstreamState>();
                              }
-
-                             ret->setWeight(weightVal);
                            }
                            catch (const std::exception& e) {
                              // std::stoi will throw an exception if the string isn't in a value int range
                              errlog("Error creating new server: downstream weight value must be between %s and %s", 1, std::numeric_limits<int>::max());
-                             return ret;
+                             return std::shared_ptr<DownstreamState>();
                            }
                          }
 
                          if (vars.count("retries")) {
-                           ret->d_retries = std::stoi(boost::get<string>(vars["retries"]));
+                           config.d_retries = std::stoi(boost::get<string>(vars["retries"]));
                          }
 
                          if (vars.count("checkInterval")) {
-                           ret->checkInterval = static_cast<unsigned int>(std::stoul(boost::get<string>(vars["checkInterval"])));
+                           config.checkInterval = static_cast<unsigned int>(std::stoul(boost::get<string>(vars["checkInterval"])));
                          }
 
                          if (vars.count("tcpConnectTimeout")) {
-                           ret->tcpConnectTimeout = std::stoi(boost::get<string>(vars["tcpConnectTimeout"]));
+                           config.tcpConnectTimeout = std::stoi(boost::get<string>(vars["tcpConnectTimeout"]));
                          }
 
                          if (vars.count("tcpSendTimeout")) {
-                           ret->tcpSendTimeout = std::stoi(boost::get<string>(vars["tcpSendTimeout"]));
+                           config.tcpSendTimeout = std::stoi(boost::get<string>(vars["tcpSendTimeout"]));
                          }
 
                          if (vars.count("tcpRecvTimeout")) {
-                           ret->tcpRecvTimeout = std::stoi(boost::get<string>(vars["tcpRecvTimeout"]));
+                           config.tcpRecvTimeout = std::stoi(boost::get<string>(vars["tcpRecvTimeout"]));
                          }
 
                          if (vars.count("tcpFastOpen")) {
                            bool fastOpen = boost::get<bool>(vars["tcpFastOpen"]);
                            if (fastOpen) {
 #ifdef MSG_FASTOPEN
-                             ret->tcpFastOpen = true;
+                             config.tcpFastOpen = true;
 #else
           warnlog("TCP Fast Open has been configured on downstream server %s but is not supported", boost::get<string>(vars["address"]));
 #endif
@@ -474,169 +438,226 @@ static void setupLuaConfig(LuaContext& luaCtx, bool client, bool configCheck)
                          }
 
                          if (vars.count("maxInFlight")) {
-                           ret->d_maxInFlightQueriesPerConn = std::stoi(boost::get<string>(vars["maxInFlight"]));
+                           config.d_maxInFlightQueriesPerConn = std::stoi(boost::get<string>(vars["maxInFlight"]));
                          }
 
                          if (vars.count("name")) {
-                           ret->setName(boost::get<string>(vars["name"]));
+                           config.name = boost::get<string>(vars["name"]);
                          }
 
                          if (vars.count("id")) {
-                           ret->setId(boost::lexical_cast<boost::uuids::uuid>(boost::get<string>(vars["id"])));
+                           config.id = boost::uuids::string_generator()(boost::get<string>(vars["id"]));
                          }
 
                          if (vars.count("checkName")) {
-                           ret->checkName = DNSName(boost::get<string>(vars["checkName"]));
+                           config.checkName = DNSName(boost::get<string>(vars["checkName"]));
                          }
 
                          if (vars.count("checkType")) {
-                           ret->checkType = boost::get<string>(vars["checkType"]);
+                           config.checkType = boost::get<string>(vars["checkType"]);
                          }
 
                          if (vars.count("checkClass")) {
-                           ret->checkClass = std::stoi(boost::get<string>(vars["checkClass"]));
+                           config.checkClass = std::stoi(boost::get<string>(vars["checkClass"]));
                          }
 
                          if (vars.count("checkFunction")) {
-                           ret->checkFunction = boost::get<DownstreamState::checkfunc_t>(vars["checkFunction"]);
+                           config.checkFunction = boost::get<DownstreamState::checkfunc_t>(vars["checkFunction"]);
                          }
 
                          if (vars.count("checkTimeout")) {
-                           ret->checkTimeout = std::stoi(boost::get<string>(vars["checkTimeout"]));
+                           config.checkTimeout = std::stoi(boost::get<string>(vars["checkTimeout"]));
                          }
 
                          if (vars.count("checkTCP")) {
-                           ret->d_tcpCheck = boost::get<bool>(vars.at("checkTCP"));
+                           config.d_tcpCheck = boost::get<bool>(vars.at("checkTCP"));
                          }
 
                          if (vars.count("setCD")) {
-                           ret->setCD = boost::get<bool>(vars["setCD"]);
+                           config.setCD = boost::get<bool>(vars["setCD"]);
                          }
 
                          if (vars.count("mustResolve")) {
-                           ret->mustResolve = boost::get<bool>(vars["mustResolve"]);
+                           config.mustResolve = boost::get<bool>(vars["mustResolve"]);
                          }
 
                          if (vars.count("useClientSubnet")) {
-                           ret->useECS = boost::get<bool>(vars["useClientSubnet"]);
+                           config.useECS = boost::get<bool>(vars["useClientSubnet"]);
                          }
 
                          if (vars.count("useProxyProtocol")) {
-                           ret->useProxyProtocol = boost::get<bool>(vars["useProxyProtocol"]);
+                           config.useProxyProtocol = boost::get<bool>(vars["useProxyProtocol"]);
                          }
 
                          if (vars.count("disableZeroScope")) {
-                           ret->disableZeroScope = boost::get<bool>(vars["disableZeroScope"]);
+                           config.disableZeroScope = boost::get<bool>(vars["disableZeroScope"]);
                          }
 
                          if (vars.count("ipBindAddrNoPort")) {
-                           ret->ipBindAddrNoPort = boost::get<bool>(vars["ipBindAddrNoPort"]);
+                           config.ipBindAddrNoPort = boost::get<bool>(vars["ipBindAddrNoPort"]);
                          }
 
                          if (vars.count("addXPF")) {
-                           ret->xpfRRCode = std::stoi(boost::get<string>(vars["addXPF"]));
+                           config.xpfRRCode = std::stoi(boost::get<string>(vars["addXPF"]));
                          }
 
                          if (vars.count("maxCheckFailures")) {
-                           ret->maxCheckFailures = std::stoi(boost::get<string>(vars["maxCheckFailures"]));
+                           config.maxCheckFailures = std::stoi(boost::get<string>(vars["maxCheckFailures"]));
                          }
 
                          if (vars.count("rise")) {
-                           ret->minRiseSuccesses = std::stoi(boost::get<string>(vars["rise"]));
+                           config.minRiseSuccesses = std::stoi(boost::get<string>(vars["rise"]));
                          }
 
                          if (vars.count("reconnectOnUp")) {
-                           ret->reconnectOnUp = boost::get<bool>(vars["reconnectOnUp"]);
+                           config.reconnectOnUp = boost::get<bool>(vars["reconnectOnUp"]);
                          }
 
                          if (vars.count("cpus")) {
                            for (const auto& cpu : boost::get<vector<pair<int, string>>>(vars["cpus"])) {
-                             cpus.insert(std::stoi(cpu.second));
+                             config.d_cpus.insert(std::stoi(cpu.second));
                            }
                          }
 
                          if (vars.count("tcpOnly")) {
-                           ret->d_tcpOnly = boost::get<bool>(vars.at("tcpOnly"));
+                           config.d_tcpOnly = boost::get<bool>(vars.at("tcpOnly"));
                          }
+
+                         std::shared_ptr<TLSCtx> tlsCtx;
+                         if (vars.count("ciphers")) {
+                           config.d_tlsParams.d_ciphers = boost::get<string>(vars.at("ciphers"));
+                         }
+                         if (vars.count("ciphers13")) {
+                           config.d_tlsParams.d_ciphers13 = boost::get<string>(vars.at("ciphers13"));
+                         }
+                         if (vars.count("caStore")) {
+                           config.d_tlsParams.d_caStore = boost::get<string>(vars.at("caStore"));
+                         }
+                         if (vars.count("validateCertificates")) {
+                           config.d_tlsParams.d_validateCertificates = boost::get<bool>(vars.at("validateCertificates"));
+                         }
+                         if (vars.count("releaseBuffers")) {
+                           config.d_tlsParams.d_releaseBuffers = boost::get<bool>(vars.at("releaseBuffers"));
+                         }
+                         if (vars.count("enableRenegotiation")) {
+                           config.d_tlsParams.d_enableRenegotiation = boost::get<bool>(vars.at("enableRenegotiation"));
+                         }
+                         if (vars.count("subjectName")) {
+                           config.d_tlsSubjectName = boost::get<string>(vars.at("subjectName"));
+                         }
+                         else if (vars.count("subjectAddr")) {
+                           try {
+                             ComboAddress ca(boost::get<string>(vars.at("subjectAddr")));
+                             config.d_tlsSubjectName = ca.toString();
+                             config.d_tlsSubjectIsAddr = true;
+                           }
+                           catch (const std::exception& e) {
+                             errlog("Error creating new server: downstream subjectAddr value must be a valid IP address");
+                             return std::shared_ptr<DownstreamState>();
+                           }
+                         }
+
+                         uint16_t serverPort = 53;
 
                          if (vars.count("tls")) {
-                           TLSContextParameters tlsParams;
-                           std::string ciphers;
-                           std::string ciphers13;
-
-                           tlsParams.d_provider = boost::get<string>(vars.at("tls"));
-
-                           if (vars.count("ciphers")) {
-                             tlsParams.d_ciphers = boost::get<string>(vars.at("ciphers"));
-                           }
-                           if (vars.count("ciphers13")) {
-                             tlsParams.d_ciphers13 = boost::get<string>(vars.at("ciphers13"));
-                           }
-                           if (vars.count("caStore")) {
-                             tlsParams.d_caStore = boost::get<string>(vars.at("caStore"));
-                           }
-                           if (vars.count("validateCertificates")) {
-                             tlsParams.d_validateCertificates = boost::get<bool>(vars.at("validateCertificates"));
-                           }
-                           if (vars.count("releaseBuffers")) {
-                             tlsParams.d_releaseBuffers = boost::get<bool>(vars.at("releaseBuffers"));
-                           }
-                           if (vars.count("enableRenegotiation")) {
-                             tlsParams.d_enableRenegotiation = boost::get<bool>(vars.at("enableRenegotiation"));
-                           }
-                           if (vars.count("subjectName")) {
-                             ret->d_tlsSubjectName = boost::get<string>(vars.at("subjectName"));
-                           }
-
-                           ret->d_tlsCtx = getTLSContext(tlsParams);
+                           serverPort = 853;
+                           config.d_tlsParams.d_provider = boost::get<string>(vars.at("tls"));
+                           tlsCtx = getTLSContext(config.d_tlsParams);
 
                            if (vars.count("dohPath")) {
-#ifdef HAVE_NGHTTP2
-                             ret->d_dohPath = boost::get<string>(vars.at("dohPath"));
-                             if (ret->d_tlsCtx) {
-                               setupDoHClientProtocolNegotiation(ret->d_tlsCtx);
-                             }
+#ifndef HAVE_NGHTTP2
+                             throw std::runtime_error("Outgoing DNS over HTTPS support requested (via 'dohPath' on newServer()) but nghttp2 support is not available");
+#endif
 
-                             if (g_configurationDone && g_outgoingDoHWorkerThreads && *g_outgoingDoHWorkerThreads == 0) {
-                               throw std::runtime_error("Error: setOutgoingDoHWorkerThreads() is set to 0 so no outgoing DoH worker thread is available to serve queries");
-                             }
-
-                             if (!g_outgoingDoHWorkerThreads || *g_outgoingDoHWorkerThreads == 0) {
-                               g_outgoingDoHWorkerThreads = 1;
-                             }
+                             serverPort = 443;
+                             config.d_dohPath = boost::get<string>(vars.at("dohPath"));
 
                              if (vars.count("addXForwardedHeaders")) {
-                               ret->d_addXForwardedHeaders = boost::get<bool>(vars.at("addXForwardedHeaders"));
+                               config.d_addXForwardedHeaders = boost::get<bool>(vars.at("addXForwardedHeaders"));
                              }
-#else /* HAVE_NGHTTP2 */
-          throw std::runtime_error("Outgoing DNS over HTTPS support requested (via 'dohPath' on newServer()) but nghttp2 support is not available");
-#endif /* HAVE_NGHTTP2 */
-                           }
-                           else {
-                             setupDoTProtocolNegotiation(ret->d_tlsCtx);
                            }
                          }
 
-                         if (!ret->isTCPOnly() && !(client || configCheck)) {
-                           if (!IsAnyAddress(ret->remote)) {
-                             ret->connectUDPSockets(numberOfSockets);
+                         try {
+                           config.remote = ComboAddress(serverAddressStr, serverPort);
+                         }
+                         catch (const PDNSException& e) {
+                           g_outputBuffer = "Error creating new server: " + string(e.reason);
+                           errlog("Error creating new server with address %s: %s", serverAddressStr, e.reason);
+                           return std::shared_ptr<DownstreamState>();
+                         }
+                         catch (const std::exception& e) {
+                           g_outputBuffer = "Error creating new server: " + string(e.what());
+                           errlog("Error creating new server with address %s: %s", serverAddressStr, e.what());
+                           return std::shared_ptr<DownstreamState>();
+                         }
+
+                         if (IsAnyAddress(config.remote)) {
+                           g_outputBuffer = "Error creating new server: invalid address for a downstream server.";
+                           errlog("Error creating new server: %s is not a valid address for a downstream server", serverAddressStr);
+                           return std::shared_ptr<DownstreamState>();
+                         }
+
+                         if (vars.count("pool")) {
+                           if (auto* pool = boost::get<string>(&vars["pool"])) {
+                             config.pools.insert(*pool);
                            }
+                           else {
+                             auto pools = boost::get<vector<pair<int, string>>>(vars["pool"]);
+                             for (auto& p : pools) {
+                               config.pools.insert(p.second);
+                             }
+                           }
+                         }
+
+                         bool autoUpgrade = false;
+                         bool keepAfterUpgrade = false;
+                         uint32_t upgradeInterval = 3600;
+                         uint16_t upgradeDoHKey = dnsdist::ServiceDiscovery::s_defaultDoHSVCKey;
+                         std::string upgradePool;
+
+                         if (vars.count("autoUpgrade") && boost::get<bool>(vars.at("autoUpgrade"))) {
+                           autoUpgrade = true;
+
+                           if (vars.count("autoUpgradeInterval")) {
+                             try {
+                               upgradeInterval = static_cast<uint32_t>(std::stoul(boost::get<string>(vars.at("autoUpgradeInterval"))));
+                             }
+                             catch (const std::exception& e) {
+                               warnlog("Error parsing 'autoUpgradeInterval' value: %s", e.what());
+                             }
+                           }
+                           if (vars.count("autoUpgradeKeep")) {
+                             keepAfterUpgrade = boost::get<bool>(vars.at("autoUpgradeKeep"));
+                           }
+                           if (vars.count("autoUpgradePool")) {
+                             upgradePool = boost::get<string>(vars.at("autoUpgradePool"));
+                           }
+                           if (vars.count("autoUpgradeDoHKey")) {
+                             try {
+                               upgradeDoHKey = static_cast<uint16_t>(std::stoul(boost::get<string>(vars.at("autoUpgradeDoHKey"))));
+                             }
+                             catch (const std::exception& e) {
+                               warnlog("Error parsing 'autoUpgradeDoHKey' value: %s", e.what());
+                             }
+                           }
+                         }
+
+                         // create but don't connect the socket in client or check-config modes
+                         auto ret = std::make_shared<DownstreamState>(std::move(config), std::move(tlsCtx), !(client || configCheck));
+                         if (!(client || configCheck)) {
+                           infolog("Added downstream server %s", ret->d_config.remote.toStringWithPort());
+                         }
+
+                         if (autoUpgrade) {
+                           dnsdist::ServiceDiscovery::addUpgradeableServer(ret, upgradeInterval, upgradePool, upgradeDoHKey, keepAfterUpgrade);
                          }
 
                          /* this needs to be done _AFTER_ the order has been set,
                             since the server are kept ordered inside the pool */
                          auto localPools = g_pools.getCopy();
-                         if (vars.count("pool")) {
-                           if (auto* pool = boost::get<string>(&vars["pool"])) {
-                             ret->pools.insert(*pool);
-                           }
-                           else {
-                             auto pools = boost::get<vector<pair<int, string>>>(vars["pool"]);
-                             for (auto& p : pools) {
-                               ret->pools.insert(p.second);
-                             }
-                           }
-                           for (const auto& poolName : ret->pools) {
+                         if (!ret->d_config.pools.empty()) {
+                           for (const auto& poolName : ret->d_config.pools) {
                              addServerToPool(localPools, poolName, ret);
                            }
                          }
@@ -646,28 +667,20 @@ static void setupLuaConfig(LuaContext& luaCtx, bool client, bool configCheck)
                          g_pools.setState(localPools);
 
                          if (ret->connected) {
-                           ret->threadStarted.test_and_set();
-
                            if (g_launchWork) {
-                             g_launchWork->push_back([ret, cpus]() {
-                               ret->tid = thread(responderThread, ret);
-                               if (!cpus.empty()) {
-                                 mapThreadToCPUList(ret->tid.native_handle(), cpus);
-                               }
+                             g_launchWork->push_back([ret]() {
+                               ret->start();
                              });
                            }
                            else {
-                             ret->tid = thread(responderThread, ret);
-                             if (!cpus.empty()) {
-                               mapThreadToCPUList(ret->tid.native_handle(), cpus);
-                             }
+                             ret->start();
                            }
                          }
 
                          auto states = g_dstates.getCopy();
                          states.push_back(ret);
                          std::stable_sort(states.begin(), states.end(), [](const decltype(ret)& a, const decltype(ret)& b) {
-                           return a->order < b->order;
+                           return a->d_config.order < b->d_config.order;
                          });
                          g_dstates.setState(states);
                          return ret;
@@ -684,7 +697,7 @@ static void setupLuaConfig(LuaContext& luaCtx, bool client, bool configCheck)
                          else if (auto str = boost::get<std::string>(&var)) {
                            const auto uuid = getUniqueID(*str);
                            for (auto& state : states) {
-                             if (state->id == uuid) {
+                             if (*state->d_config.id == uuid) {
                                server = state;
                              }
                            }
@@ -697,7 +710,7 @@ static void setupLuaConfig(LuaContext& luaCtx, bool client, bool configCheck)
                            throw std::runtime_error("unable to locate the requested server");
                          }
                          auto localPools = g_pools.getCopy();
-                         for (const string& poolName : server->pools) {
+                         for (const string& poolName : server->d_config.pools) {
                            removeServerFromPool(localPools, poolName, server);
                          }
                          /* the server might also be in the default pool */
@@ -904,16 +917,17 @@ static void setupLuaConfig(LuaContext& luaCtx, bool client, bool configCheck)
       for (const auto& s : *states) {
         string status = s->getStatus();
         string pools;
-        for (auto& p : s->pools) {
-          if (!pools.empty())
+        for (const auto& p : s->d_config.pools) {
+          if (!pools.empty()) {
             pools += " ";
+          }
           pools += p;
         }
         if (showUUIDs) {
-          ret << (fmt % counter % s->getName() % s->remote.toStringWithPort() % status % s->queryLoad % s->qps.getRate() % s->order % s->weight % s->queries.load() % s->reuseds.load() % (s->dropRate) % (s->latencyUsec / 1000.0) % s->outstanding.load() % pools % s->id) << endl;
+          ret << (fmt % counter % s->getName() % s->d_config.remote.toStringWithPort() % status % s->queryLoad % s->qps.getRate() % s->d_config.order % s->d_config.d_weight % s->queries.load() % s->reuseds.load() % (s->dropRate) % (s->latencyUsec / 1000.0) % s->outstanding.load() % pools % *s->d_config.id) << endl;
         }
         else {
-          ret << (fmt % counter % s->getName() % s->remote.toStringWithPort() % status % s->queryLoad % s->qps.getRate() % s->order % s->weight % s->queries.load() % s->reuseds.load() % (s->dropRate) % (s->latencyUsec / 1000.0) % s->outstanding.load() % pools) << endl;
+          ret << (fmt % counter % s->getName() % s->d_config.remote.toStringWithPort() % status % s->queryLoad % s->qps.getRate() % s->d_config.order % s->d_config.d_weight % s->queries.load() % s->reuseds.load() % (s->dropRate) % (s->latencyUsec / 1000.0) % s->outstanding.load() % pools) << endl;
         }
         totQPS += s->queryLoad;
         totQueries += s->queries.load();
@@ -962,7 +976,7 @@ static void setupLuaConfig(LuaContext& luaCtx, bool client, bool configCheck)
     if (auto str = boost::get<std::string>(&i)) {
       const auto uuid = getUniqueID(*str);
       for (auto& state : states) {
-        if (state->id == uuid) {
+        if (*state->d_config.id == uuid) {
           return state;
         }
       }
@@ -1281,7 +1295,7 @@ static void setupLuaConfig(LuaContext& luaCtx, bool client, bool configCheck)
 
   luaCtx.writeFunction("setTCPSendTimeout", [](int timeout) { g_tcpSendTimeout = timeout; });
 
-  luaCtx.writeFunction("setUDPTimeout", [](int timeout) { g_udpTimeout = timeout; });
+  luaCtx.writeFunction("setUDPTimeout", [](int timeout) { DownstreamState::s_udpTimeout = timeout; });
 
   luaCtx.writeFunction("setMaxUDPOutstanding", [](uint64_t max) {
     if (!g_configurationDone) {
@@ -1673,7 +1687,7 @@ static void setupLuaConfig(LuaContext& luaCtx, bool client, bool configCheck)
             servers += server.second->getName();
             servers += " ";
           }
-          servers += server.second->remote.toStringWithPort();
+          servers += server.second->d_config.remote.toStringWithPort();
         }
 
         ret << (fmt % name % cache % policy % servers) << endl;
@@ -2287,6 +2301,7 @@ static void setupLuaConfig(LuaContext& luaCtx, bool client, bool configCheck)
 #endif
     return result;
   });
+
   luaCtx.writeFunction("addDOHLocal", [client](const std::string& addr, boost::optional<boost::variant<std::string, std::shared_ptr<TLSCertKeyPair>, std::vector<std::pair<int, std::string>>, std::vector<std::pair<int, std::shared_ptr<TLSCertKeyPair>>>>> certFiles, boost::optional<boost::variant<std::string, std::vector<std::pair<int, std::string>>>> keyFiles, boost::optional<boost::variant<std::string, vector<pair<int, std::string>>>> urls, boost::optional<localbind_t> vars) {
     if (client) {
       return;
@@ -2780,6 +2795,14 @@ static void setupLuaConfig(LuaContext& luaCtx, bool client, bool configCheck)
     g_socketUDPRecvBuffer = recv;
   });
 
+  luaCtx.writeFunction("setRandomizedOutgoingSockets", [](bool randomized) {
+    DownstreamState::s_randomizeSockets = randomized;
+  });
+
+  luaCtx.writeFunction("setRandomizedIdsOverUDP", [](bool randomized) {
+    DownstreamState::s_randomizeIDs = randomized;
+  });
+
 #if defined(HAVE_LIBSSL)
   luaCtx.writeFunction("loadTLSEngine", [client](const std::string& engineName, boost::optional<std::string> defaultString) {
     if (client) {
@@ -2794,7 +2817,10 @@ static void setupLuaConfig(LuaContext& luaCtx, bool client, bool configCheck)
   });
 #endif /* HAVE_LIBSSL */
 
-  luaCtx.writeFunction("newThread", [](const std::string& code) {
+  luaCtx.writeFunction("newThread", [client, configCheck](const std::string& code) {
+    if (client || configCheck) {
+      return;
+    }
     std::thread newThread(LuaThread, code);
     newThread.detach();
   });

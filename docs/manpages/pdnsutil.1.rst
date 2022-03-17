@@ -165,6 +165,10 @@ add-record *ZONE* *NAME* *TYPE* [*TTL*] *CONTENT*
     and optional *TTL*. If *TTL* is not set, default will be used. 
 add-autoprimary *IP* *NAMESERVER* [*ACCOUNT*]
     Add a autoprimary entry into the backend. This enables receiving zone updates from other servers.
+remove-autoprimary *IP* *NAMESERVER*
+    Remove an autoprimary from backend. Not supported by BIND backend.
+list-autoprimaries
+    List all autoprimaries.
 create-zone *ZONE*
     Create an empty zone named *ZONE*.
 create-secondary-zone *ZONE* *PRIMARY* [*PRIMARY*]..
@@ -252,6 +256,8 @@ unset-presigned *ZONE*
     Disables presigned operation for *ZONE*.
 raw-lua-from-content *TYPE* *CONTENT*  
     Display record contents in a form suitable for dnsdist's `SpoofRawAction`.
+zonemd-verify-file *ZONE* *FILE*  
+    Validate ZONEMD for *ZONE* read from *FILE*.
 
 DEBUGGING TOOLS
 ---------------

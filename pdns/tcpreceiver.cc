@@ -221,7 +221,7 @@ void TCPNameserver::doConnection(int fd)
 {
   setThreadName("pdns/tcpConnect");
   std::unique_ptr<DNSPacket> packet;
-  ComboAddress remote;
+  ComboAddress remote, accountremote;
   socklen_t remotelen=sizeof(remote);
   size_t transactions = 0;
   time_t start = 0;
@@ -296,6 +296,10 @@ void TCPNameserver::doConnection(int fd)
       }
       inner_remote = psource;
       inner_tcp = tcp;
+      accountremote = psource;
+    }
+    else {
+      accountremote = remote;
     }
 
     for(;;) {
@@ -334,8 +338,8 @@ void TCPNameserver::doConnection(int fd)
       }
 
       getQuestion(fd, mesg.get(), pktlen, remote, remainingTime);
-      S.inc("tcp-queries");      
-      if(remote.sin4.sin_family == AF_INET6)
+      S.inc("tcp-queries");
+      if (accountremote.sin4.sin_family == AF_INET6)
         S.inc("tcp6-queries");
       else
         S.inc("tcp4-queries");
@@ -376,6 +380,7 @@ void TCPNameserver::doConnection(int fd)
           if(logDNSQueries)
             g_log<<": packetcache HIT"<<endl;
           cached->setRemote(&packet->d_remote);
+          cached->d_inner_remote = packet->d_inner_remote;
           cached->d.id=packet->d.id;
           cached->d.rd=packet->d.rd; // copy in recursion desired bit
           cached->commitD(); // commit d to the packet                        inlined
@@ -693,11 +698,11 @@ int TCPNameserver::doAXFR(const DNSName &target, std::unique_ptr<DNSPacket>& q, 
         }
 
         if(doCDS && !publishCDS.empty()){
-          doCDS = false;
           zrr.dr.d_type=QType::CDS;
           vector<string> digestAlgos;
           stringtok(digestAlgos, publishCDS, ", ");
           if(std::find(digestAlgos.begin(), digestAlgos.end(), "0") != digestAlgos.end()) {
+            doCDS = false;
             zrr.dr.d_content=PacketHandler::s_deleteCDSContent;
             zrrs.push_back(zrr);
           } else {
@@ -828,7 +833,7 @@ int TCPNameserver::doAXFR(const DNSName &target, std::unique_ptr<DNSPacket>& q, 
   // Group records by name and type, signpipe stumbles over interrupted rrsets
   if(securedZone && !presignedZone) {
     sort(zrrs.begin(), zrrs.end(), [](const DNSZoneRecord& a, const DNSZoneRecord& b) {
-      return tie(a.dr.d_name, a.dr.d_type) < tie(b.dr.d_name, b.dr.d_type);
+      return std::tie(a.dr.d_name, a.dr.d_type) < std::tie(b.dr.d_name, b.dr.d_type);
     });
   }
 

@@ -36,6 +36,7 @@
 #include "syncres.hh"
 #include "dnsseckeeper.hh"
 #include "validate-recursor.hh"
+#include "rec-taskqueue.hh"
 
 thread_local SyncRes::ThreadLocalStorage SyncRes::t_sstorage;
 thread_local std::unique_ptr<addrringbuf_t> t_timeouts;
@@ -48,6 +49,8 @@ EDNSSubnetOpts SyncRes::s_ecsScopeZero;
 string SyncRes::s_serverID;
 SyncRes::LogMode SyncRes::s_lm;
 const std::unordered_set<QType> SyncRes::s_redirectionQTypes = {QType::CNAME, QType::DNAME};
+LockGuarded<fails_t<ComboAddress>> SyncRes::s_fails;
+LockGuarded<fails_t<DNSName>> SyncRes::s_nonresolving;
 
 unsigned int SyncRes::s_maxnegttl;
 unsigned int SyncRes::s_maxbogusttl;
@@ -138,6 +141,159 @@ SyncRes::SyncRes(const struct timeval& now) :  d_authzonequeries(0), d_outquerie
 {
 }
 
+static void allowAdditionalEntry(std::unordered_set<DNSName>& allowedAdditionals, const DNSRecord& rec);
+
+void SyncRes::resolveAdditionals(const DNSName& qname, QType qtype, AdditionalMode mode, std::vector<DNSRecord>& additionals, unsigned int depth)
+{
+  vector<DNSRecord> addRecords;
+
+  vState state = vState::Indeterminate;
+  switch (mode) {
+  case AdditionalMode::ResolveImmediately: {
+    set<GetBestNSAnswer> beenthere;
+    int res = doResolve(qname, qtype, addRecords, depth, beenthere, state);
+    if (res != 0) {
+      return;
+    }
+    // We're conservative here. We do not add Bogus records in any circumstance, we add Indeterminates only if no
+    // validation is required.
+    if (vStateIsBogus(state)) {
+      return;
+    }
+    if (shouldValidate() && state != vState::Secure && state != vState::Insecure) {
+      return;
+    }
+    for (auto& rec : addRecords) {
+      if (rec.d_place == DNSResourceRecord::ANSWER) {
+        additionals.push_back(std::move(rec));
+      }
+    }
+    break;
+  }
+  case AdditionalMode::CacheOnly:
+  case AdditionalMode::CacheOnlyRequireAuth: {
+    // Peek into cache
+    if (g_recCache->get(d_now.tv_sec, qname, qtype, mode == AdditionalMode::CacheOnlyRequireAuth, &addRecords, d_cacheRemote, false, d_routingTag, nullptr, nullptr, nullptr, &state) <= 0) {
+      return;
+    }
+    // See the comment for the ResolveImmediately case
+    if (vStateIsBogus(state)) {
+      return;
+    }
+    if (shouldValidate() && state != vState::Secure && state != vState::Insecure) {
+      return;
+    }
+    for (auto& rec : addRecords) {
+      if (rec.d_place == DNSResourceRecord::ANSWER) {
+        rec.d_ttl -= d_now.tv_sec ;
+        additionals.push_back(std::move(rec));
+      }
+    }
+    break;
+  }
+  case AdditionalMode::ResolveDeferred:
+    // FIXME: Not yet implemented
+    // Look in cache for authoritative answer, if available return it
+    // If not, look in nergache and submit if not there as well. The logic should be the same as
+    // #11294, which is in review atm.
+    break;
+  case AdditionalMode::Ignore:
+    break;
+  }
+}
+
+// The main (recursive) function to add additionals
+// qtype: the original query type to expand
+// start: records to start from
+// This function uses to state sets to avoid infinite recursion and allow depulication
+// depth is the main recursion depth
+// additionaldepth is the depth for addAdditionals itself
+void SyncRes::addAdditionals(QType qtype, const vector<DNSRecord>&start, vector<DNSRecord>&additionals, std::set<std::pair<DNSName, QType>>& uniqueCalls, std::set<std::tuple<DNSName, QType, QType>>& uniqueResults, unsigned int depth, unsigned additionaldepth)
+{
+  if (additionaldepth >= 5 || start.empty()) {
+    return;
+  }
+
+  auto luaLocal = g_luaconfs.getLocal();
+  const auto it = luaLocal->allowAdditionalQTypes.find(qtype);
+  if (it == luaLocal->allowAdditionalQTypes.end()) {
+    return;
+  }
+  std::unordered_set<DNSName> addnames;
+  for (const auto& rec : start) {
+    if (rec.d_place == DNSResourceRecord::ANSWER) {
+      // currently, this function only knows about names, we could also take the target types that are dependent on
+      // record contents into account
+      // e.g. for NAPTR records, go only for SRV for flag value "s", or A/AAAA for flag value "a"
+      allowAdditionalEntry(addnames, rec);
+    }
+  }
+
+  // We maintain two sets for deduplication:
+  // - uniqueCalls makes sure we never resolve a qname/qtype twice
+  // - uniqueResults makes sure we never add the same qname/qytype RRSet to the result twice,
+  //   but note that that set might contain multiple elements.
+
+  auto mode = it->second.second;
+  for (const auto& targettype : it->second.first) {
+    for (const auto& addname : addnames) {
+      std::vector<DNSRecord> records;
+      bool inserted = uniqueCalls.emplace(addname, targettype).second;
+      if (inserted) {
+        resolveAdditionals(addname, targettype, mode, records, depth);
+      }
+      if (!records.empty()) {
+        for (auto r = records.begin(); r != records.end(); ) {
+          QType covered = QType::ENT;
+          if (r->d_type == QType::RRSIG) {
+            if (auto rsig = getRR<RRSIGRecordContent>(*r); rsig != nullptr) {
+              covered = rsig->d_type;
+            }
+          }
+          if (uniqueResults.count(std::tuple(r->d_name, QType(r->d_type), covered)) > 0) {
+            // A bit expensive for vectors, but they are small
+            r = records.erase(r);
+          } else {
+            ++r;
+          }
+        }
+        for (const auto& r : records) {
+          additionals.push_back(r);
+          QType covered = QType::ENT;
+          if (r.d_type == QType::RRSIG) {
+            if (auto rsig = getRR<RRSIGRecordContent>(r); rsig != nullptr) {
+              covered = rsig->d_type;
+            }
+          }
+          uniqueResults.emplace(r.d_name, r.d_type, covered);
+        }
+        addAdditionals(targettype, records, additionals, uniqueCalls, uniqueResults, depth, additionaldepth + 1);
+      }
+    }
+  }
+}
+
+// The entry point for other code
+void SyncRes::addAdditionals(QType qtype, vector<DNSRecord>&ret, unsigned int depth)
+{
+  // The additional records of interest
+  std::vector<DNSRecord> additionals;
+
+  // We only call resolve for a specific name/type combo once
+  std::set<std::pair<DNSName, QType>> uniqueCalls;
+
+  // Collect multiple name/qtype from a single resolve but do not add a new set from new resolve calls
+  // For RRSIGs, the type covered is stored in the second Qtype
+  std::set<std::tuple<DNSName, QType, QType>> uniqueResults;
+
+  addAdditionals(qtype, ret, additionals, uniqueCalls, uniqueResults, depth, 0);
+
+  for (auto& rec : additionals) {
+    rec.d_place = DNSResourceRecord::ADDITIONAL;
+    ret.push_back(std::move(rec));
+  }
+}
+
 /** everything begins here - this is the entry point just after receiving a packet */
 int SyncRes::beginResolve(const DNSName &qname, const QType qtype, QClass qclass, vector<DNSRecord>&ret, unsigned int depth)
 {
@@ -187,6 +343,11 @@ int SyncRes::beginResolve(const DNSName &qname, const QType qtype, QClass qclass
     }
   }
 
+  // Avoid calling addAdditionals() if we know we won't find anything
+  auto luaLocal = g_luaconfs.getLocal();
+  if (res == 0 && qclass == QClass::IN && luaLocal->allowAdditionalQTypes.find(qtype) != luaLocal->allowAdditionalQTypes.end()) {
+    addAdditionals(qtype, ret, depth);
+  }
   d_eventTrace.add(RecEventTrace::SyncRes, res, false);
   return res;
 }
@@ -301,7 +462,7 @@ bool SyncRes::doSpecialNamesResolve(const DNSName &qname, const QType qtype, con
 //! This is the 'out of band resolver', in other words, the authoritative server
 void SyncRes::AuthDomain::addSOA(std::vector<DNSRecord>& records) const
 {
-  SyncRes::AuthDomain::records_t::const_iterator ziter = d_records.find(boost::make_tuple(getName(), QType::SOA));
+  SyncRes::AuthDomain::records_t::const_iterator ziter = d_records.find(std::make_tuple(getName(), QType::SOA));
   if (ziter != d_records.end()) {
     DNSRecord dr = *ziter;
     dr.d_place = DNSResourceRecord::AUTHORITY;
@@ -318,7 +479,7 @@ int SyncRes::AuthDomain::getRecords(const DNSName& qname, const QType qtype, std
   records.clear();
 
   // partial lookup
-  std::pair<records_t::const_iterator,records_t::const_iterator> range = d_records.equal_range(tie(qname));
+  std::pair<records_t::const_iterator,records_t::const_iterator> range = d_records.equal_range(std::tie(qname));
 
   SyncRes::AuthDomain::records_t::const_iterator ziter;
   bool somedata = false;
@@ -356,7 +517,7 @@ int SyncRes::AuthDomain::getRecords(const DNSName& qname, const QType qtype, std
   DNSName wcarddomain(qname);
   while(wcarddomain != getName() && wcarddomain.chopOff()) {
     // cerr<<qname<<": trying '*."<<wcarddomain<<"' in "<<getName()<<endl;
-    range = d_records.equal_range(boost::make_tuple(g_wildcarddnsname + wcarddomain));
+    range = d_records.equal_range(std::make_tuple(g_wildcarddnsname + wcarddomain));
     if (range.first==range.second)
       continue;
 
@@ -381,7 +542,7 @@ int SyncRes::AuthDomain::getRecords(const DNSName& qname, const QType qtype, std
   /* Nothing for this name, no wildcard, let's see if there is some NS */
   DNSName nsdomain(qname);
   while (nsdomain.chopOff() && nsdomain != getName()) {
-    range = d_records.equal_range(boost::make_tuple(nsdomain,QType::NS));
+    range = d_records.equal_range(std::make_tuple(nsdomain,QType::NS));
     if(range.first == range.second)
       continue;
 
@@ -514,7 +675,7 @@ uint64_t SyncRes::doDumpThrottleMap(int fd)
     count++;
     char tmp[26];
     // remote IP, dns name, qtype, count, ttd
-    fprintf(fp.get(), "%s\t%s\t%d\t%u\t%s", i.thing.get<0>().toString().c_str(), i.thing.get<1>().toLogString().c_str(), i.thing.get<2>(), i.count, ctime_r(&i.ttd, tmp));
+    fprintf(fp.get(), "%s\t%s\t%d\t%u\t%s", std::get<0>(i.thing).toString().c_str(), std::get<1>(i.thing).toLogString().c_str(), std::get<2>(i.thing), i.count, ctime_r(&i.ttd, tmp));
   }
 
   return count;
@@ -535,7 +696,8 @@ uint64_t SyncRes::doDumpFailedServers(int fd)
   fprintf(fp.get(), "; remote IP\tcount\ttimestamp\n");
   uint64_t count=0;
 
-  for(const auto& i : t_sstorage.fails.getMap())
+  // We get a copy, so the I/O does not need to happen while holding the lock
+  for (const auto& i : s_fails.lock()->getMapCopy())
   {
     count++;
     char tmp[26];
@@ -561,7 +723,8 @@ uint64_t SyncRes::doDumpNonResolvingNS(int fd)
   fprintf(fp.get(), "; name\tcount\ttimestamp\n");
   uint64_t count=0;
 
-  for(const auto& i : t_sstorage.nonresolving.getMap())
+  // We get a copy, so the I/O does not need to happen while holding the lock
+  for (const auto& i : s_nonresolving.lock()->getMapCopy())
   {
     count++;
     char tmp[26];
@@ -593,7 +756,7 @@ uint64_t SyncRes::doDumpNonResolvingNS(int fd)
    For now this means we can't be clever, but will turn off DNSSEC if you reply with FormError or gibberish.
 */
 
-LWResult::Result SyncRes::asyncresolveWrapper(const ComboAddress& ip, bool ednsMANDATORY, const DNSName& domain, const DNSName& auth, int type, bool doTCP, bool sendRDQuery, struct timeval* now, boost::optional<Netmask>& srcmask, LWResult* res, bool* chained) const
+LWResult::Result SyncRes::asyncresolveWrapper(const ComboAddress& ip, bool ednsMANDATORY, const DNSName& domain, const DNSName& auth, int type, bool doTCP, bool sendRDQuery, struct timeval* now, boost::optional<Netmask>& srcmask, LWResult* res, bool* chained, const DNSName& nsName) const
 {
   /* what is your QUEST?
      the goal is to get as many remotes as possible on the highest level of EDNS support
@@ -628,6 +791,7 @@ LWResult::Result SyncRes::asyncresolveWrapper(const ComboAddress& ip, bool ednsM
   auto luaconfsLocal = g_luaconfs.getLocal();
   ResolveContext ctx;
   ctx.d_initialRequestId = d_initialRequestId;
+  ctx.d_nsName = nsName;
 #ifdef HAVE_FSTRM
   ctx.d_auth = auth;
 #endif
@@ -939,7 +1103,8 @@ int SyncRes::doResolveNoQNameMinimization(const DNSName &qname, const QType qtyp
 
           boost::optional<Netmask> nm;
           bool chained = false;
-          auto resolveRet = asyncresolveWrapper(remoteIP, d_doDNSSEC, qname, authname, qtype.getCode(), false, false, &d_now, nm, &lwr, &chained);
+          // forwardes are "anonymous", so plug in an empty name; some day we might have a fancier config language...
+          auto resolveRet = asyncresolveWrapper(remoteIP, d_doDNSSEC, qname, authname, qtype.getCode(), false, false, &d_now, nm, &lwr, &chained, DNSName());
 
           d_totUsec += lwr.d_usec;
           accountAuthLatency(lwr.d_usec, remoteIP.sin4.sin_family);
@@ -1130,13 +1295,14 @@ vector<ComboAddress> SyncRes::getAddrs(const DNSName &qname, unsigned int depth,
   bool oldRequireAuthData = d_requireAuthData;
   bool oldValidationRequested = d_DNSSECValidationRequested;
   bool oldFollowCNAME = d_followCNAME;
+  bool seenV6 = false;
   const unsigned int startqueries = d_outqueries;
   d_requireAuthData = false;
   d_DNSSECValidationRequested = false;
   d_followCNAME = true;
 
   try {
-    // First look for both A and AAAA in the cache and be satisfied if we find anything
+    // First look for both A and AAAA in the cache
     res_t cset;
     if (s_doIPv4 && g_recCache->get(d_now.tv_sec, qname, QType::A, false, &cset, d_cacheRemote, d_refresh, d_routingTag) > 0) {
       for (const auto &i : cset) {
@@ -1148,14 +1314,16 @@ vector<ComboAddress> SyncRes::getAddrs(const DNSName &qname, unsigned int depth,
     if (s_doIPv6 && g_recCache->get(d_now.tv_sec, qname, QType::AAAA, false, &cset, d_cacheRemote, d_refresh, d_routingTag) > 0) {
       for (const auto &i : cset) {
         if (auto rec = getRR<AAAARecordContent>(i)) {
+          seenV6 = true;
           ret.push_back(rec->getCA(53));
         }
       }
     }
     if (ret.empty()) {
-      // Nothing in the cache...
+      // Neither A nor AAAA in the cache...
       vState newState = vState::Indeterminate;
       cset.clear();
+      // Go out to get A's
       if (s_doIPv4 && doResolve(qname, QType::A, cset, depth+1, beenthere, newState) == 0) {  // this consults cache, OR goes out
         for (auto const &i : cset) {
           if (i.d_type == QType::A) {
@@ -1167,25 +1335,26 @@ vector<ComboAddress> SyncRes::getAddrs(const DNSName &qname, unsigned int depth,
       }
       if (s_doIPv6) { // s_doIPv6 **IMPLIES** pdns::isQueryLocalAddressFamilyEnabled(AF_INET6) returned true
         if (ret.empty()) {
-          // We only go out to find IPv6 records if we did not find any IPv4 ones.
-          // Once IPv6 adoption matters, this needs to be revisited
+          // We only go out immediately to find IPv6 records if we did not find any IPv4 ones.
           newState = vState::Indeterminate;
           cset.clear();
           if (doResolve(qname, QType::AAAA, cset, depth+1, beenthere, newState) == 0) {  // this consults cache, OR goes out
             for (const auto &i : cset) {
               if (i.d_type == QType::AAAA) {
-                if (auto rec = getRR<AAAARecordContent>(i))
+                if (auto rec = getRR<AAAARecordContent>(i)) {
+                  seenV6 = true;
                   ret.push_back(rec->getCA(53));
+                }
               }
             }
           }
         } else {
-          // We have some IPv4 records, don't bother with going out to get IPv6, but do consult the cache, we might have
-          // encountered some IPv6 glue
+          // We have some IPv4 records, consult the cache, we might have encountered some IPv6 glue
           cset.clear();
           if (g_recCache->get(d_now.tv_sec, qname, QType::AAAA, false, &cset, d_cacheRemote, d_refresh, d_routingTag) > 0) {
             for (const auto &i : cset) {
               if (auto rec = getRR<AAAARecordContent>(i)) {
+                seenV6 = true;
                 ret.push_back(rec->getCA(53));
               }
             }
@@ -1193,10 +1362,19 @@ vector<ComboAddress> SyncRes::getAddrs(const DNSName &qname, unsigned int depth,
         }
       }
     }
+    if (s_doIPv6 && !seenV6 && !cacheOnly) {
+      // No IPv6 records in cache, check negcache and submit async task if negache does not have the data
+      // so that the next time the cache or the negcache will have data
+      NegCache::NegCacheEntry ne;
+      bool inNegCache = g_negCache->get(qname, QType::AAAA, d_now, ne, true);
+      if (!inNegCache) {
+        pushResolveTask(qname, QType::AAAA, d_now.tv_sec, d_now.tv_sec + 60);
+      }
+    }
   }
-  catch (const PolicyHitException& e) {
-    /* we ignore a policy hit while trying to retrieve the addresses
-       of a NS and keep processing the current query */
+  catch (const PolicyHitException&) {
+    // We ignore a policy hit while trying to retrieve the addresses
+    // of a NS and keep processing the current query
   }
 
   if (ret.empty() && d_outqueries > startqueries) {
@@ -1336,7 +1514,7 @@ void SyncRes::getBestNSFromCache(const DNSName &qname, const QType qtype, vector
       LOG(prefix<<qname<<": reprimed the root"<<endl);
       /* let's prevent an infinite loop */
       if (!d_updatingRootNS) {
-        primeRootNSZones(g_dnssecmode != DNSSECMode::Off, depth);
+        primeRootNSZones(g_dnssecmode, depth);
         getRootNS(d_now, d_asyncResolve, depth);
       }
     }
@@ -1671,7 +1849,7 @@ struct CacheKey
   QType type;
   DNSResourceRecord::Place place;
   bool operator<(const CacheKey& rhs) const {
-    return tie(type, place, name) < tie(rhs.type, rhs.place, rhs.name);
+    return std::tie(type, place, name) < std::tie(rhs.type, rhs.place, rhs.name);
   }
 };
 typedef map<CacheKey, CacheEntry> tcache_t;
@@ -2357,7 +2535,7 @@ vector<ComboAddress> SyncRes::retrieveAddressesForNS(const std::string& prefix, 
   size_t nonresolvingfails = 0;
   if (!tns->first.empty()) {
     if (s_nonresolvingnsmaxfails > 0) {
-      nonresolvingfails = t_sstorage.nonresolving.value(tns->first);
+      nonresolvingfails = s_nonresolving.lock()->value(tns->first);
       if (nonresolvingfails >= s_nonresolvingnsmaxfails) {
         LOG(prefix<<qname<<": NS "<<tns->first<< " in non-resolving map, skipping"<<endl);
         return result;
@@ -2374,7 +2552,7 @@ vector<ComboAddress> SyncRes::retrieveAddressesForNS(const std::string& prefix, 
       if (s_nonresolvingnsmaxfails > 0 && d_outqueries > oldOutQueries) {
         auto dontThrottleNames = g_dontThrottleNames.getLocal();
         if (!dontThrottleNames->check(tns->first)) {
-          t_sstorage.nonresolving.incr(tns->first, d_now);
+          s_nonresolving.lock()->incr(tns->first, d_now);
         }
       }
       throw ex;
@@ -2383,12 +2561,12 @@ vector<ComboAddress> SyncRes::retrieveAddressesForNS(const std::string& prefix, 
       if (result.empty()) {
         auto dontThrottleNames = g_dontThrottleNames.getLocal();
         if (!dontThrottleNames->check(tns->first)) {
-          t_sstorage.nonresolving.incr(tns->first, d_now);
+          s_nonresolving.lock()->incr(tns->first, d_now);
         }
       }
       else if (nonresolvingfails > 0) {
         // Succeeding resolve, clear memory of recent failures
-        t_sstorage.nonresolving.clear(tns->first);
+        s_nonresolving.lock()->clear(tns->first);
       }
     }
     pierceDontQuery=false;
@@ -2410,12 +2588,12 @@ vector<ComboAddress> SyncRes::retrieveAddressesForNS(const std::string& prefix, 
 
 bool SyncRes::throttledOrBlocked(const std::string& prefix, const ComboAddress& remoteIP, const DNSName& qname, const QType qtype, bool pierceDontQuery)
 {
-  if(t_sstorage.throttle.shouldThrottle(d_now.tv_sec, boost::make_tuple(remoteIP, "", 0))) {
+  if(t_sstorage.throttle.shouldThrottle(d_now.tv_sec, std::make_tuple(remoteIP, g_rootdnsname, 0))) {
     LOG(prefix<<qname<<": server throttled "<<endl);
     s_throttledqueries++; d_throttledqueries++;
     return true;
   }
-  else if(t_sstorage.throttle.shouldThrottle(d_now.tv_sec, boost::make_tuple(remoteIP, qname, qtype.getCode()))) {
+  else if(t_sstorage.throttle.shouldThrottle(d_now.tv_sec, std::make_tuple(remoteIP, qname, qtype.getCode()))) {
     LOG(prefix<<qname<<": query throttled "<<remoteIP.toString()<<", "<<qname<<"; "<<qtype<<endl);
     s_throttledqueries++; d_throttledqueries++;
     return true;
@@ -2904,12 +3082,18 @@ vState SyncRes::validateRecordsWithSigs(unsigned int depth, const DNSName& qname
         state = vState::BogusSelfSignedDS;
         dsFailed = true;
       }
-      else if (qtype == QType::DS && signer == qname && !signer.isRoot() && (type == QType::SOA || type == QType::NSEC || type == QType::NSEC3)) {
+      else if (qtype == QType::DS && signer == qname && !signer.isRoot()) {
+        if (type == QType::SOA || type == QType::NSEC || type == QType::NSEC3) {
         /* if we are trying to validate the DS or more likely NSEC(3)s proving that it does not exist, we have a problem.
            In that case let's go Bogus (we will check later if we missed a cut)
         */
-        state = vState::BogusSelfSignedDS;
-        dsFailed = true;
+          state = vState::BogusSelfSignedDS;
+          dsFailed = true;
+        }
+        else if (type == QType::CNAME) {
+          state = vState::BogusUnableToGetDSs;
+          dsFailed = true;
+        }
       }
       else if (qtype == QType::DNSKEY && signer == qname) {
         /* that actually does happen when a server returns NS records in authority
@@ -3032,32 +3216,50 @@ void SyncRes::fixupAnswer(const std::string& prefix, LWResult& lwr, const DNSNam
   }
 }
 
-static bool allowAdditionalEntry(std::unordered_set<DNSName>& allowedAdditionals, const DNSRecord& rec)
+static void allowAdditionalEntry(std::unordered_set<DNSName>& allowedAdditionals, const DNSRecord& rec)
 {
   switch(rec.d_type) {
   case QType::MX:
-  {
     if (auto mxContent = getRR<MXRecordContent>(rec)) {
       allowedAdditionals.insert(mxContent->d_mxname);
     }
-    return true;
-  }
+    break;
   case QType::NS:
-  {
     if (auto nsContent = getRR<NSRecordContent>(rec)) {
       allowedAdditionals.insert(nsContent->getNS());
     }
-    return true;
-  }
+    break;
   case QType::SRV:
-  {
     if (auto srvContent = getRR<SRVRecordContent>(rec)) {
       allowedAdditionals.insert(srvContent->d_target);
     }
-    return true;
-  }
+    break;
+  case QType::SVCB: /* fall-through */
+  case QType::HTTPS:
+    if (auto svcbContent = getRR<SVCBBaseRecordContent>(rec)) {
+      if (svcbContent->getPriority() > 0) {
+        DNSName target = svcbContent->getTarget();
+        if (target.isRoot()) {
+          target = rec.d_name;
+        }
+        allowedAdditionals.insert(target);
+      }
+      else {
+        // FIXME: Alias mode not implemented yet
+      }
+    }
+    break;
+  case QType::NAPTR:
+    if (auto naptrContent = getRR<NAPTRRecordContent>(rec)) {
+      auto flags = naptrContent->getFlags();
+      toLowerInPlace(flags);
+      if (flags.find('a') != string::npos || flags.find('s') != string::npos) {
+        allowedAdditionals.insert(naptrContent->getReplacement());
+      }
+    }
+    break;
   default:
-    return false;
+    break;
   }
 }
 
@@ -3987,7 +4189,7 @@ bool SyncRes::doResolveAtThisIP(const std::string& prefix, const DNSName& qname,
       s_ecsqueries++;
     }
     resolveret = asyncresolveWrapper(remoteIP, d_doDNSSEC, qname, auth, qtype.getCode(),
-                                     doTCP, sendRDQuery, &d_now, ednsmask, &lwr, &chained);    // <- we go out on the wire!
+                                     doTCP, sendRDQuery, &d_now, ednsmask, &lwr, &chained, nsName);    // <- we go out on the wire!
     if(ednsmask) {
       s_ecsresponses++;
       LOG(prefix<<qname<<": Received EDNS Client Subnet Mask "<<ednsmask->toString()<<" on response"<<endl);
@@ -4056,18 +4258,18 @@ bool SyncRes::doResolveAtThisIP(const std::string& prefix, const DNSName& qname,
       t_sstorage.nsSpeeds[nsName.empty()? DNSName(remoteIP.toStringWithPort()) : nsName].submit(remoteIP, 1000000, d_now); // 1 sec
 
       // code below makes sure we don't filter COM or the root
-      if (s_serverdownmaxfails > 0 && (auth != g_rootdnsname) && t_sstorage.fails.incr(remoteIP, d_now) >= s_serverdownmaxfails) {
+      if (s_serverdownmaxfails > 0 && (auth != g_rootdnsname) && s_fails.lock()->incr(remoteIP, d_now) >= s_serverdownmaxfails) {
         LOG(prefix<<qname<<": Max fails reached resolving on "<< remoteIP.toString() <<". Going full throttle for "<< s_serverdownthrottletime <<" seconds" <<endl);
         // mark server as down
-        t_sstorage.throttle.throttle(d_now.tv_sec, boost::make_tuple(remoteIP, "", 0), s_serverdownthrottletime, 10000);
+        t_sstorage.throttle.throttle(d_now.tv_sec, std::make_tuple(remoteIP, g_rootdnsname, 0), s_serverdownthrottletime, 10000);
       }
       else if (resolveret == LWResult::Result::Timeout) {
         // unreachable, 1 minute or 100 queries
-        t_sstorage.throttle.throttle(d_now.tv_sec, boost::make_tuple(remoteIP, qname, qtype.getCode()), 60, 100);
+        t_sstorage.throttle.throttle(d_now.tv_sec, std::make_tuple(remoteIP, qname, qtype.getCode()), 60, 100);
       }
       else {
         // timeout, 10 seconds or 5 queries
-        t_sstorage.throttle.throttle(d_now.tv_sec, boost::make_tuple(remoteIP, qname, qtype.getCode()), 10, 5);
+        t_sstorage.throttle.throttle(d_now.tv_sec, std::make_tuple(remoteIP, qname, qtype.getCode()), 10, 5);
       }
     }
 
@@ -4083,10 +4285,10 @@ bool SyncRes::doResolveAtThisIP(const std::string& prefix, const DNSName& qname,
 
       if (doTCP) {
         // we can be more heavy-handed over TCP
-        t_sstorage.throttle.throttle(d_now.tv_sec, boost::make_tuple(remoteIP, qname, qtype.getCode()), 60, 10);
+        t_sstorage.throttle.throttle(d_now.tv_sec, std::make_tuple(remoteIP, qname, qtype.getCode()), 60, 10);
       }
       else {
-        t_sstorage.throttle.throttle(d_now.tv_sec, boost::make_tuple(remoteIP, qname, qtype.getCode()), 10, 2);
+        t_sstorage.throttle.throttle(d_now.tv_sec, std::make_tuple(remoteIP, qname, qtype.getCode()), 10, 2);
       }
     }
     return false;
@@ -4103,7 +4305,7 @@ bool SyncRes::doResolveAtThisIP(const std::string& prefix, const DNSName& qname,
           t_sstorage.nsSpeeds[nsName.empty()? DNSName(remoteIP.toStringWithPort()) : nsName].submit(remoteIP, 1000000, d_now); // 1 sec
         }
         else {
-          t_sstorage.throttle.throttle(d_now.tv_sec, boost::make_tuple(remoteIP, qname, qtype.getCode()), 60, 3);
+          t_sstorage.throttle.throttle(d_now.tv_sec, std::make_tuple(remoteIP, qname, qtype.getCode()), 60, 3);
         }
       }
       return false;
@@ -4112,7 +4314,7 @@ bool SyncRes::doResolveAtThisIP(const std::string& prefix, const DNSName& qname,
 
   /* this server sent a valid answer, mark it backup up if it was down */
   if(s_serverdownmaxfails > 0) {
-    t_sstorage.fails.clear(remoteIP);
+    s_fails.lock()->clear(remoteIP);
   }
 
   if (lwr.d_tcbit) {
@@ -4122,7 +4324,7 @@ bool SyncRes::doResolveAtThisIP(const std::string& prefix, const DNSName& qname,
       LOG(prefix<<qname<<": truncated bit set, over TCP?"<<endl);
       if (!dontThrottle) {
         /* let's treat that as a ServFail answer from this server */
-        t_sstorage.throttle.throttle(d_now.tv_sec, boost::make_tuple(remoteIP, qname, qtype.getCode()), 60, 3);
+        t_sstorage.throttle.throttle(d_now.tv_sec, std::make_tuple(remoteIP, qname, qtype.getCode()), 60, 3);
       }
       return false;
     }
@@ -4517,7 +4719,7 @@ int SyncRes::doResolveAt(NsSet &nameservers, DNSName auth, bool flawedNSSet, con
             break;
           }
           /* was lame */
-          t_sstorage.throttle.throttle(d_now.tv_sec, boost::make_tuple(*remoteIP, qname, qtype.getCode()), 60, 100);
+          t_sstorage.throttle.throttle(d_now.tv_sec, std::make_tuple(*remoteIP, qname, qtype.getCode()), 60, 100);
         }
 
         if (gotNewServers) {
@@ -4660,9 +4862,9 @@ int SyncRes::getRootNS(struct timeval now, asyncresolve_t asyncCallback, unsigne
   sr.setAsyncCallback(asyncCallback);
 
   vector<DNSRecord> ret;
-  int res=-1;
+  int res = -1;
   try {
-    res=sr.beginResolve(g_rootdnsname, QType::NS, 1, ret, depth + 1);
+    res = sr.beginResolve(g_rootdnsname, QType::NS, 1, ret, depth + 1);
     if (g_dnssecmode != DNSSECMode::Off && g_dnssecmode != DNSSECMode::ProcessNoValidate) {
       auto state = sr.getValidationState();
       if (vStateIsBogus(state)) {
@@ -4687,11 +4889,11 @@ int SyncRes::getRootNS(struct timeval now, asyncresolve_t asyncCallback, unsigne
     g_log<<Logger::Error<<"Failed to update . records, got an exception"<<endl;
   }
 
-  if(!res) {
-    g_log<<Logger::Notice<<"Refreshed . records"<<endl;
+  if (res == 0) {
+    g_log<<Logger::Debug<<"Refreshed . records"<<endl;
   }
-  else
-    g_log<<Logger::Warning<<"Failed to update . records, RCODE="<<res<<endl;
-
+  else {
+    g_log<<Logger::Warning<<"Failed to update root NS records, RCODE="<<res<<endl;
+  }
   return res;
 }

@@ -102,7 +102,7 @@ std::unique_ptr<DNSCryptoKeyEngine> DNSCryptoKeyEngine::makeFromISCString(DNSKEY
   map<string, string> stormap;
 
   while (std::getline(str, sline)) {
-    tie(key,value) = splitField(sline, ':');
+    std::tie(key,value) = splitField(sline, ':');
     boost::trim(value);
 
     toLowerInPlace(key);
@@ -276,10 +276,10 @@ void DNSCryptoKeyEngine::testMakers(unsigned int algo, maker_t* creator, maker_t
   auto dckeSign = signer(algo);
   auto dckeVerify = verifier(algo);
 
-  cerr<<"Testing algorithm "<<algo<<": '"<<dckeCreate->getName()<<"' ->'"<<dckeSign->getName()<<"' -> '"<<dckeVerify->getName()<<"' ";
+  cout<<"Testing algorithm "<<algo<<"("<<DNSSECKeeper::algorithm2name(algo)<<"): '"<<dckeCreate->getName()<<"' ->'"<<dckeSign->getName()<<"' -> '"<<dckeVerify->getName()<<"' ";
   unsigned int bits;
   if(algo <= 10)
-    bits=1024;
+    bits=2048;
   else if(algo == DNSSECKeeper::ECCGOST || algo == DNSSECKeeper::ECDSA256 || algo == DNSSECKeeper::ED25519)
     bits = 256;
   else if(algo == DNSSECKeeper::ECDSA384)
@@ -294,9 +294,7 @@ void DNSCryptoKeyEngine::testMakers(unsigned int algo, maker_t* creator, maker_t
   DTime dt; dt.set();
   for(unsigned int n = 0; n < 100; ++n) {
     dckeCreate->create(bits);
-    //cout << " PublicKey is : " << Base64Encode(dckeCreate->getPublicKeyString()) << "\n";
-  }
-  cerr<<"("<<dckeCreate->getBits()<<" bits) ";
+  cout<<"("<<dckeCreate->getBits()<<" bits) ";
   unsigned int udiffCreate = dt.udiff() / 100;
 
   { // FIXME: this block copy/pasted from makeFromISCString
@@ -307,7 +305,7 @@ void DNSCryptoKeyEngine::testMakers(unsigned int algo, maker_t* creator, maker_t
     map<string, string> stormap;
 
     while(std::getline(str, sline)) {
-      tie(key,value)=splitField(sline, ':');
+      std::tie(key,value)=splitField(sline, ':');
       boost::trim(value);
       if(pdns_iequals(key,"algorithm")) {
         algorithm = pdns_stou(value);
@@ -352,12 +350,13 @@ void DNSCryptoKeyEngine::testMakers(unsigned int algo, maker_t* creator, maker_t
   string signature;
   
   dt.set();
-  for(unsigned int n = 0; n < 100; ++n) {
-    signature = dckeSign->sign(message);
-    bool verified = dckeVerify->verify(message, signature);
-    if(!verified) {
-      throw runtime_error("Verification of creator "+dckeCreate->getName()+" with signer "+dckeSign->getName()+" and verifier "+dckeVerify->getName()+" failed");
-    }
+  bool verified;
+  for(unsigned int n = 0; n < 100; ++n)
+    verified = dckeVerify->verify(message, signature);
+
+  if(verified) {
+    udiffVerify = dt.udiff() / 100;
+    cout<<"Signature & verify ok, create "<<udiffCreate<<"usec, signature "<<udiffSign<<"usec, verify "<<udiffVerify<<"usec"<<endl;
   }
 
   string falseMessage = "Nothing to see";
@@ -410,12 +409,21 @@ std::unique_ptr<DNSCryptoKeyEngine> DNSCryptoKeyEngine::makeFromPEMString(DNSKEY
  *                            purposes, as the authoritative server correctly
  *                            sets qname to the wildcard.
  */
-string getMessageForRRSET(const DNSName& qname, const RRSIGRecordContent& rrc, const sortedRecords_t& signRecords, bool processRRSIGLabels)
+string getMessageForRRSET(const DNSName& qname, const RRSIGRecordContent& rrc, const sortedRecords_t& signRecords, bool processRRSIGLabels, bool includeRRSIG_RDATA)
 {
   string toHash;
-  toHash.append(const_cast<RRSIGRecordContent&>(rrc).serialize(g_rootdnsname, true, true));
-  toHash.resize(toHash.size() - rrc.d_signature.length()); // chop off the end, don't sign the signature!
 
+  // dnssec: signature = sign(RRSIG_RDATA | RR(1) | RR(2)... )
+  // From RFC 4034
+  // RRSIG_RDATA is the wire format of the RRSIG RDATA fields
+  //             with the Signer's Name field in canonical form and
+  //             the Signature field excluded;
+  // zonemd: digest = hash( RR(1) | RR(2) | RR(3) | ... ), so skip RRSIG_RDATA
+
+  if (includeRRSIG_RDATA) {
+    toHash.append(const_cast<RRSIGRecordContent&>(rrc).serialize(g_rootdnsname, true, true));
+    toHash.resize(toHash.size() - rrc.d_signature.length()); // chop off the end, don't sign the signature!
+  }
   string nameToHash(qname.toDNSStringLC());
 
   if (processRRSIGLabels) {

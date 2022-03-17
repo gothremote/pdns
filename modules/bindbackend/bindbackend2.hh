@@ -29,8 +29,6 @@
 #include <mutex>
 #include <boost/utility.hpp>
 
-#include <boost/tuple/tuple.hpp>
-#include <boost/tuple/tuple_comparison.hpp>
 #include <boost/multi_index_container.hpp>
 #include <boost/multi_index/hashed_index.hpp>
 #include <boost/multi_index/ordered_index.hpp>
@@ -69,7 +67,7 @@ struct Bind2DNSRecord
       return false;
     if (qtype == QType::SOA && rhs.qtype != QType::SOA)
       return true;
-    return tie(qtype, content, ttl) < tie(rhs.qtype, rhs.content, rhs.ttl);
+    return std::tie(qtype, content, ttl) < std::tie(rhs.qtype, rhs.content, rhs.ttl);
   }
 };
 
@@ -236,7 +234,8 @@ public:
   void parseZoneFile(BB2DomainInfo* bbd);
   void rediscover(string* status = nullptr) override;
 
-  // for supermaster support
+  // for autoprimary support
+  bool autoPrimariesList(std::vector<AutoPrimary>& primaries) override;
   bool superMasterBackend(const string& ip, const DNSName& domain, const vector<DNSResourceRecord>& nsset, string* nameserver, string* account, DNSBackend** db) override;
   static std::mutex s_supermaster_config_lock;
   bool createSlaveDomain(const string& ip, const DNSName& domain, const string& nameserver, const string& account) override;

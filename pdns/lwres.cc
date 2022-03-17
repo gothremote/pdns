@@ -248,7 +248,7 @@ static void logIncomingResponse(const std::shared_ptr<std::vector<std::unique_pt
   }
 }
 
-static bool tcpconnect(const struct timeval& now, const ComboAddress& ip, TCPOutConnectionManager::Connection& connection, bool& dnsOverTLS)
+static bool tcpconnect(const struct timeval& now, const ComboAddress& ip, TCPOutConnectionManager::Connection& connection, bool& dnsOverTLS, const std::string& nsName)
 {
   dnsOverTLS = SyncRes::s_dot_to_port_853 && ip.getPort() == 853;
 
@@ -275,7 +275,7 @@ static bool tcpconnect(const struct timeval& now, const ComboAddress& ip, TCPOut
       dnsOverTLS = false;
     }
   }
-  connection.d_handler = std::make_shared<TCPIOHandler>("", s.releaseHandle(), timeout, tlsCtx, now.tv_sec);
+  connection.d_handler = std::make_shared<TCPIOHandler>(nsName, false, s.releaseHandle(), timeout, tlsCtx, now.tv_sec);
   // Returned state ignored
   // This can throw an exception, retry will need to happen at higher level
   connection.d_handler->tryConnect(SyncRes::s_tcp_fast_open_connect, ip);
@@ -434,32 +434,37 @@ static LWResult::Result asyncresolve(const ComboAddress& ip, const DNSName& doma
     ret = arecvfrom(buf, 0, ip, &len, qid, domain, type, queryfd, now);
   }
   else {
-      bool isNew;
-      do {
-        try {
-          // If we get a new (not re-used) TCP connection that does not
-          // work, we give up. For reused connections, we assume the
-          // peer has closed it on error, so we retry. At some point we
-          // *will* get a new connection, so this loop is not endless.
-          isNew = tcpconnect(*now, ip, connection, dnsOverTLS);
-          ret = tcpsendrecv(ip, connection, localip, vpacket, len, buf);
+    bool isNew;
+    do {
+      try {
+        // If we get a new (not re-used) TCP connection that does not
+        // work, we give up. For reused connections, we assume the
+        // peer has closed it on error, so we retry. At some point we
+        // *will* get a new connection, so this loop is not endless.
+        isNew = true; // tcpconnect() might throw for new connections. In that case, we want to break the loop
+        std::string nsName;
+        if (context && !context->d_nsName.empty()) {
+          nsName = context->d_nsName.toStringNoDot();
+        }
+        isNew = tcpconnect(*now, ip, connection, dnsOverTLS, nsName);
+        ret = tcpsendrecv(ip, connection, localip, vpacket, len, buf);
 #ifdef HAVE_FSTRM
-          if (fstrmQEnabled) {
-            logFstreamQuery(fstrmLoggers, queryTime, localip, ip, !dnsOverTLS ? DnstapMessage::ProtocolType::DoTCP : DnstapMessage::ProtocolType::DoT, context ? context->d_auth : boost::none, vpacket);
-          }
+        if (fstrmQEnabled) {
+          logFstreamQuery(fstrmLoggers, queryTime, localip, ip, !dnsOverTLS ? DnstapMessage::ProtocolType::DoTCP : DnstapMessage::ProtocolType::DoT, context ? context->d_auth : boost::none, vpacket);
+        }
 #endif /* HAVE_FSTRM */
-          if (ret == LWResult::Result::Success) {
-            break;
-          }
-          connection.d_handler->close();
+        if (ret == LWResult::Result::Success) {
+          break;
         }
-        catch (const NetworkError&) {
-          ret = LWResult::Result::OSLimitError; // OS limits error
-        }
-        catch (const runtime_error&) {
-          ret = LWResult::Result::OSLimitError; // OS limits error (PermanentError is transport related)
-        }
-      } while (!isNew);
+        connection.d_handler->close();
+      }
+      catch (const NetworkError&) {
+        ret = LWResult::Result::OSLimitError; // OS limits error
+      }
+      catch (const runtime_error&) {
+        ret = LWResult::Result::OSLimitError; // OS limits error (PermanentError is transport related)
+      }
+    } while (!isNew);
   }
 
   lwr->d_usec=dt.udiff();
