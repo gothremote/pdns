@@ -17,9 +17,9 @@
 #endif
 #include <openssl/err.h>
 #include <openssl/ocsp.h>
+#include <openssl/pkcs12.h>
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
-#include <openssl/pkcs12.h>
 #include <fcntl.h>
 
 #ifdef HAVE_LIBSODIUM
@@ -80,12 +80,17 @@ void registerOpenSSLUser()
   if (s_users.fetch_add(1) == 0) {
 #ifdef HAVE_OPENSSL_INIT_CRYPTO
     /* load the default configuration file (or one specified via OPENSSL_CONF),
-       which can then be used to load engines */
-    OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CONFIG, nullptr);
+       which can then be used to load engines.
+       Do not load all ciphers and digests, we only need a few of them and these
+       will be loaded by OPENSSL_init_ssl(). */
+    OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CONFIG|OPENSSL_INIT_NO_ADD_ALL_CIPHERS|OPENSSL_INIT_NO_ADD_ALL_DIGESTS, nullptr);
+    OPENSSL_init_ssl(0, nullptr);
 #endif
 
 #if (OPENSSL_VERSION_NUMBER < 0x1010000fL || (defined LIBRESSL_VERSION_NUMBER && LIBRESSL_VERSION_NUMBER < 0x2090100fL))
+    /* load error strings for both libcrypto and libssl */
     SSL_load_error_strings();
+    /* load all ciphers and digests needed for TLS support */
     OpenSSL_add_ssl_algorithms();
     openssl_thread_setup();
 #endif
@@ -807,7 +812,7 @@ std::unique_ptr<SSL_CTX, void(*)(SSL_CTX*)> libssl_init_server_context(const TLS
       }
       auto key = std::unique_ptr<EVP_PKEY, void(*)(EVP_PKEY*)>(keyptr, EVP_PKEY_free);
       auto cert = std::unique_ptr<X509, void(*)(X509*)>(certptr, X509_free);
-      auto ca = std::unique_ptr<STACK_OF(X509), void(*)(STACK_OF(X509)*)>(captr, sk_X509_free);
+      auto ca = std::unique_ptr<STACK_OF(X509), void(*)(STACK_OF(X509)*)>(captr, [](STACK_OF(X509)* st){ sk_X509_free(st); });
 
       if (SSL_CTX_use_cert_and_key(ctx.get(), cert.get(), key.get(), ca.get(), 1) != 1) {
         ERR_print_errors_fp(stderr);

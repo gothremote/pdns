@@ -5,6 +5,7 @@
 #include <thread>
 #include "namespaces.hh"
 #include "logger.hh"
+#include "lua-base4.hh"
 #include "rec-lua-conf.hh"
 #include "sortlist.hh"
 #include "filterpo.hh"
@@ -150,20 +151,19 @@ static void parseProtobufOptions(boost::optional<protobufOptions_t> vars, Protob
 
     auto types = boost::get<std::vector<std::pair<int, std::string>>>((*vars)["exportTypes"]);
     for (const auto& pair : types) {
-      const auto type = pair.second;
-      bool found = false;
+      const auto& type = pair.second;
 
-      for (const auto& entry : QType::names) {
-        if (entry.first == type) {
-          found = true;
-          config.exportTypes.insert(entry.second);
-          break;
+      QType qtype;
+      try {
+        qtype = std::stoul(type);
+      }
+      catch (const std::exception& ex) {
+        qtype = QType::chartocode(type.c_str());
+        if (qtype == 0) {
+          throw std::runtime_error("Unknown QType '" + type + "' in protobuf's export types");
         }
       }
-
-      if (!found) {
-        throw std::runtime_error("Unknown QType '" + type + "' in protobuf's export types");
-      }
+      config.exportTypes.insert(qtype);
     }
   }
 }
@@ -322,11 +322,40 @@ static void rpzPrimary(LuaConfigItems& lci, luaConfigDelayedThreads& delayedThre
   delayedThreads.rpzPrimaryThreads.push_back(std::make_tuple(primaries, defpol, defpolOverrideLocal, maxTTL, zoneIdx, tt, maxReceivedXFRMBytes, localAddress, axfrTimeout, refresh, sr, dumpFile));
 }
 
+// A wrapper class that loads the standard Lua defintions into the context, so that we can use things like pdns.A
+class RecLuaConfigContext : public BaseLua4
+{
+public:
+  RecLuaConfigContext()
+  {
+    prepareContext();
+  }
+  void postPrepareContext() override
+  {
+    // clang-format off
+    d_pd.push_back({"AdditionalMode", in_t{
+          {"Ignore", static_cast<int>(AdditionalMode::Ignore)},
+          {"CacheOnly", static_cast<int>(AdditionalMode::CacheOnly)},
+          {"CacheOnlyRequireAuth", static_cast<int>(AdditionalMode::CacheOnlyRequireAuth)},
+          {"ResolveImmediately", static_cast<int>(AdditionalMode::ResolveImmediately)},
+          {"ResolveDeferred", static_cast<int>(AdditionalMode::ResolveDeferred)}
+        }});
+  }
+  void postLoad() override
+  {
+  }
+  LuaContext* operator->()
+  {
+    return d_lw.get();
+  }
+};
+
 void loadRecursorLuaConfig(const std::string& fname, luaConfigDelayedThreads& delayedThreads)
 {
   LuaConfigItems lci;
 
-  LuaContext Lua;
+  RecLuaConfigContext Lua;
+
   if (fname.empty())
     return;
   ifstream ifs(fname);
@@ -336,25 +365,11 @@ void loadRecursorLuaConfig(const std::string& fname, luaConfigDelayedThreads& de
   auto luaconfsLocal = g_luaconfs.getLocal();
   lci.generation = luaconfsLocal->generation + 1;
 
-  // pdnslog here is compatible with pdnslog in lua-base4.cc.
-  Lua.writeFunction("pdnslog", [](const std::string& msg, boost::optional<int> loglevel) { g_log << (Logger::Urgency)loglevel.get_value_or(Logger::Warning) << msg << endl; });
-  std::unordered_map<string, std::unordered_map<string, int>> pdns_table;
-  pdns_table["loglevels"] = std::unordered_map<string, int>{
-    {"Alert", LOG_ALERT},
-    {"Critical", LOG_CRIT},
-    {"Debug", LOG_DEBUG},
-    {"Emergency", LOG_EMERG},
-    {"Info", LOG_INFO},
-    {"Notice", LOG_NOTICE},
-    {"Warning", LOG_WARNING},
-    {"Error", LOG_ERR}};
-  Lua.writeVariable("pdns", pdns_table);
-
-  Lua.writeFunction("clearSortlist", [&lci]() { lci.sortlist.clear(); });
+  Lua->writeFunction("clearSortlist", [&lci]() { lci.sortlist.clear(); });
 
   /* we can get: "1.2.3.4"
                  {"1.2.3.4", "4.5.6.7"}
-		 {"1.2.3.4", {"4.5.6.7", "8.9.10.11"}}
+                 {"1.2.3.4", {"4.5.6.7", "8.9.10.11"}}
   */
 
   map<string, DNSFilterEngine::PolicyKind> pmap{
@@ -364,9 +379,9 @@ void loadRecursorLuaConfig(const std::string& fname, luaConfigDelayedThreads& de
     {"NODATA", DNSFilterEngine::PolicyKind::NODATA},
     {"Truncate", DNSFilterEngine::PolicyKind::Truncate},
     {"Custom", DNSFilterEngine::PolicyKind::Custom}};
-  Lua.writeVariable("Policy", pmap);
+  Lua->writeVariable("Policy", pmap);
 
-  Lua.writeFunction("rpzFile", [&lci](const string& filename, boost::optional<rpzOptions_t> options) {
+  Lua->writeFunction("rpzFile", [&lci](const string& filename, boost::optional<rpzOptions_t> options) {
     try {
       boost::optional<DNSFilterEngine::Policy> defpol;
       bool defpolOverrideLocal = true;
@@ -388,17 +403,17 @@ void loadRecursorLuaConfig(const std::string& fname, luaConfigDelayedThreads& de
     }
   });
 
-  Lua.writeFunction("rpzMaster", [&lci, &delayedThreads](const boost::variant<string, std::vector<std::pair<int, string>>>& primaries_, const string& zoneName, boost::optional<rpzOptions_t> options) {
+  Lua->writeFunction("rpzMaster", [&lci, &delayedThreads](const boost::variant<string, std::vector<std::pair<int, string>>>& primaries_, const string& zoneName, boost::optional<rpzOptions_t> options) {
     g_log << Logger::Warning << "'rpzMaster' is deprecated and will be removed in a future release, use 'rpzPrimary' instead" << endl;
     rpzPrimary(lci, delayedThreads, primaries_, zoneName, options);
   });
-  Lua.writeFunction("rpzPrimary", [&lci, &delayedThreads](const boost::variant<string, std::vector<std::pair<int, string>>>& primaries_, const string& zoneName, boost::optional<rpzOptions_t> options) {
+  Lua->writeFunction("rpzPrimary", [&lci, &delayedThreads](const boost::variant<string, std::vector<std::pair<int, string>>>& primaries_, const string& zoneName, boost::optional<rpzOptions_t> options) {
     rpzPrimary(lci, delayedThreads, primaries_, zoneName, options);
   });
 
   typedef std::unordered_map<std::string, boost::variant<uint32_t, std::string>> zoneToCacheOptions_t;
 
-  Lua.writeFunction("zoneToCache", [&delayedThreads](const string& zoneName, const string& method, const boost::variant<string, std::vector<std::pair<int, string>>>& srcs, boost::optional<zoneToCacheOptions_t> options) {
+  Lua->writeFunction("zoneToCache", [&lci](const string& zoneName, const string& method, const boost::variant<string, std::vector<std::pair<int, string>>>& srcs, boost::optional<zoneToCacheOptions_t> options) {
     try {
       RecZoneToCache::Config conf;
       DNSName validZoneName(zoneName);
@@ -444,9 +459,34 @@ void loadRecursorLuaConfig(const std::string& fname, luaConfigDelayedThreads& de
         if (have.count("retryOnErrorPeriod")) {
           conf.d_retryOnError = boost::get<uint32_t>(have.at("retryOnErrorPeriod"));
         }
+        const map<string, pdns::ZoneMD::Config> nameToVal = {
+          {"ignore", pdns::ZoneMD::Config::Ignore},
+          {"validate", pdns::ZoneMD::Config::Validate},
+          {"require", pdns::ZoneMD::Config::Require},
+        };
+        if (have.count("zonemd")) {
+          string zonemdValidation = boost::get<string>(have.at("zonemd"));
+          auto it = nameToVal.find(zonemdValidation);
+          if (it == nameToVal.end()) {
+            throw std::runtime_error(zonemdValidation + " is not a valid value for `zonemd`");
+          }
+          else {
+            conf.d_zonemd = it->second;
+          }
+        }
+        if (have.count("dnssec")) {
+          string dnssec = boost::get<string>(have.at("dnssec"));
+          auto it = nameToVal.find(dnssec);
+          if (it == nameToVal.end()) {
+            throw std::runtime_error(dnssec + " is not a valid value for `dnssec`");
+          }
+          else {
+            conf.d_dnssec = it->second;
+          }
+        }
       }
 
-      delayedThreads.ztcConfigs.push_back(conf);
+      lci.ztcConfigs[validZoneName] = conf;
     }
     catch (const std::exception& e) {
       g_log << Logger::Error << "Problem configuring zoneToCache for zone '" << zoneName << "': " << e.what() << endl;
@@ -454,44 +494,44 @@ void loadRecursorLuaConfig(const std::string& fname, luaConfigDelayedThreads& de
   });
 
   typedef vector<pair<int, boost::variant<string, vector<pair<int, string>>>>> argvec_t;
-  Lua.writeFunction("addSortList",
-                    [&lci](const std::string& formask_,
-                           const boost::variant<string, argvec_t>& masks,
-                           boost::optional<int> order_) {
-                      try {
-                        Netmask formask(formask_);
-                        int order = order_ ? (*order_) : lci.sortlist.getMaxOrder(formask) + 1;
-                        if (auto str = boost::get<string>(&masks))
-                          lci.sortlist.addEntry(formask, Netmask(*str), order);
-                        else {
+  Lua->writeFunction("addSortList",
+                     [&lci](const std::string& formask_,
+                            const boost::variant<string, argvec_t>& masks,
+                            boost::optional<int> order_) {
+                       try {
+                         Netmask formask(formask_);
+                         int order = order_ ? (*order_) : lci.sortlist.getMaxOrder(formask) + 1;
+                         if (auto str = boost::get<string>(&masks))
+                           lci.sortlist.addEntry(formask, Netmask(*str), order);
+                         else {
 
-                          auto vec = boost::get<argvec_t>(&masks);
-                          for (const auto& e : *vec) {
-                            if (auto s = boost::get<string>(&e.second)) {
-                              lci.sortlist.addEntry(formask, Netmask(*s), order);
-                            }
-                            else {
-                              const auto& v = boost::get<vector<pair<int, string>>>(e.second);
-                              for (const auto& entry : v)
-                                lci.sortlist.addEntry(formask, Netmask(entry.second), order);
-                            }
-                            ++order;
-                          }
-                        }
-                      }
-                      catch (std::exception& e) {
-                        g_log << Logger::Error << "Error in addSortList: " << e.what() << endl;
-                      }
-                    });
+                           auto vec = boost::get<argvec_t>(&masks);
+                           for (const auto& e : *vec) {
+                             if (auto s = boost::get<string>(&e.second)) {
+                               lci.sortlist.addEntry(formask, Netmask(*s), order);
+                             }
+                             else {
+                               const auto& v = boost::get<vector<pair<int, string>>>(e.second);
+                               for (const auto& entry : v)
+                                 lci.sortlist.addEntry(formask, Netmask(entry.second), order);
+                             }
+                             ++order;
+                           }
+                         }
+                       }
+                       catch (std::exception& e) {
+                         g_log << Logger::Error << "Error in addSortList: " << e.what() << endl;
+                       }
+                     });
 
-  Lua.writeFunction("addTA", [&lci](const std::string& who, const std::string& what) {
+  Lua->writeFunction("addTA", [&lci](const std::string& who, const std::string& what) {
     warnIfDNSSECDisabled("Warning: adding Trust Anchor for DNSSEC (addTA), but dnssec is set to 'off'!");
     DNSName zone(who);
     auto ds = std::dynamic_pointer_cast<DSRecordContent>(DSRecordContent::make(what));
     lci.dsAnchors[zone].insert(*ds);
   });
 
-  Lua.writeFunction("clearTA", [&lci](boost::optional<string> who) {
+  Lua->writeFunction("clearTA", [&lci](boost::optional<string> who) {
     warnIfDNSSECDisabled("Warning: removing Trust Anchor for DNSSEC (clearTA), but dnssec is set to 'off'!");
     if (who)
       lci.dsAnchors.erase(DNSName(*who));
@@ -500,7 +540,7 @@ void loadRecursorLuaConfig(const std::string& fname, luaConfigDelayedThreads& de
   });
 
   /* Remove in 4.3 */
-  Lua.writeFunction("addDS", [&lci](const std::string& who, const std::string& what) {
+  Lua->writeFunction("addDS", [&lci](const std::string& who, const std::string& what) {
     warnIfDNSSECDisabled("Warning: adding Trust Anchor for DNSSEC (addDS), but dnssec is set to 'off'!");
     g_log << Logger::Warning << "addDS is deprecated and will be removed in the future, switch to addTA" << endl;
     DNSName zone(who);
@@ -509,7 +549,7 @@ void loadRecursorLuaConfig(const std::string& fname, luaConfigDelayedThreads& de
   });
 
   /* Remove in 4.3 */
-  Lua.writeFunction("clearDS", [&lci](boost::optional<string> who) {
+  Lua->writeFunction("clearDS", [&lci](boost::optional<string> who) {
     g_log << Logger::Warning << "clearDS is deprecated and will be removed in the future, switch to clearTA" << endl;
     warnIfDNSSECDisabled("Warning: removing Trust Anchor for DNSSEC (clearDS), but dnssec is set to 'off'!");
     if (who)
@@ -518,7 +558,7 @@ void loadRecursorLuaConfig(const std::string& fname, luaConfigDelayedThreads& de
       lci.dsAnchors.clear();
   });
 
-  Lua.writeFunction("addNTA", [&lci](const std::string& who, const boost::optional<std::string> why) {
+  Lua->writeFunction("addNTA", [&lci](const std::string& who, const boost::optional<std::string> why) {
     warnIfDNSSECDisabled("Warning: adding Negative Trust Anchor for DNSSEC (addNTA), but dnssec is set to 'off'!");
     if (why)
       lci.negAnchors[DNSName(who)] = static_cast<string>(*why);
@@ -526,7 +566,7 @@ void loadRecursorLuaConfig(const std::string& fname, luaConfigDelayedThreads& de
       lci.negAnchors[DNSName(who)] = "";
   });
 
-  Lua.writeFunction("clearNTA", [&lci](boost::optional<string> who) {
+  Lua->writeFunction("clearNTA", [&lci](boost::optional<string> who) {
     warnIfDNSSECDisabled("Warning: removing Negative Trust Anchor for DNSSEC (clearNTA), but dnssec is set to 'off'!");
     if (who)
       lci.negAnchors.erase(DNSName(*who));
@@ -534,7 +574,7 @@ void loadRecursorLuaConfig(const std::string& fname, luaConfigDelayedThreads& de
       lci.negAnchors.clear();
   });
 
-  Lua.writeFunction("readTrustAnchorsFromFile", [&lci](const std::string& fnamearg, const boost::optional<uint32_t> interval) {
+  Lua->writeFunction("readTrustAnchorsFromFile", [&lci](const std::string& fnamearg, const boost::optional<uint32_t> interval) {
     uint32_t realInterval = 24;
     if (interval) {
       realInterval = static_cast<uint32_t>(*interval);
@@ -545,12 +585,12 @@ void loadRecursorLuaConfig(const std::string& fname, luaConfigDelayedThreads& de
     updateTrustAnchorsFromFile(fnamearg, lci.dsAnchors);
   });
 
-  Lua.writeFunction("setProtobufMasks", [&lci](const uint8_t maskV4, uint8_t maskV6) {
+  Lua->writeFunction("setProtobufMasks", [&lci](const uint8_t maskV4, uint8_t maskV6) {
     lci.protobufMaskV4 = maskV4;
     lci.protobufMaskV6 = maskV6;
   });
 
-  Lua.writeFunction("protobufServer", [&lci](boost::variant<const std::string, const std::unordered_map<int, std::string>> servers, boost::optional<protobufOptions_t> vars) {
+  Lua->writeFunction("protobufServer", [&lci](boost::variant<const std::string, const std::unordered_map<int, std::string>> servers, boost::optional<protobufOptions_t> vars) {
     if (!lci.protobufExportConfig.enabled) {
 
       lci.protobufExportConfig.enabled = true;
@@ -582,7 +622,7 @@ void loadRecursorLuaConfig(const std::string& fname, luaConfigDelayedThreads& de
     }
   });
 
-  Lua.writeFunction("outgoingProtobufServer", [&lci](boost::variant<const std::string, const std::unordered_map<int, std::string>> servers, boost::optional<protobufOptions_t> vars) {
+  Lua->writeFunction("outgoingProtobufServer", [&lci](boost::variant<const std::string, const std::unordered_map<int, std::string>> servers, boost::optional<protobufOptions_t> vars) {
     if (!lci.outgoingProtobufExportConfig.enabled) {
 
       lci.outgoingProtobufExportConfig.enabled = true;
@@ -615,7 +655,7 @@ void loadRecursorLuaConfig(const std::string& fname, luaConfigDelayedThreads& de
   });
 
 #ifdef HAVE_FSTRM
-  Lua.writeFunction("dnstapFrameStreamServer", [&lci](boost::variant<const std::string, const std::unordered_map<int, std::string>> servers, boost::optional<frameStreamOptions_t> vars) {
+  Lua->writeFunction("dnstapFrameStreamServer", [&lci](boost::variant<const std::string, const std::unordered_map<int, std::string>> servers, boost::optional<frameStreamOptions_t> vars) {
     if (!lci.frameStreamExportConfig.enabled) {
 
       lci.frameStreamExportConfig.enabled = true;
@@ -650,8 +690,39 @@ void loadRecursorLuaConfig(const std::string& fname, luaConfigDelayedThreads& de
   });
 #endif /* HAVE_FSTRM */
 
+  Lua->writeFunction("addAllowedAdditionalQType", [&lci](int qtype, std::unordered_map<int, int> targetqtypes, boost::optional<std::map<std::string, int>> options) {
+    switch (qtype) {
+    case QType::MX:
+    case QType::SRV:
+    case QType::SVCB:
+    case QType::HTTPS:
+    case QType::NAPTR:
+      break;
+    default:
+      g_log << Logger::Error << "addAllowedAdditionalQType does not support " << QType(qtype).toString() << endl;
+      return;
+    }
+
+    std::set<QType> targets;
+    for (const auto& t : targetqtypes) {
+      targets.emplace(QType(t.second));
+    }
+
+    AdditionalMode mode = AdditionalMode::CacheOnlyRequireAuth; // Always cheap and should be safe
+
+    if (options) {
+      if (const auto it = options->find("mode"); it != options->end()) {
+        mode = static_cast<AdditionalMode>(it->second);
+        if (mode > AdditionalMode::ResolveDeferred) {
+          g_log << Logger::Error << "addAllowedAdditionalQType: unknown mode " << it->second << endl;
+        }
+      }
+    }
+    lci.allowAdditionalQTypes.insert_or_assign(qtype, pair(targets, mode));
+  });
+
   try {
-    Lua.executeCode(ifs);
+    Lua->executeCode(ifs);
     g_luaconfs.setState(std::move(lci));
   }
   catch (const LuaContext::ExecutionErrorException& e) {
@@ -690,21 +761,6 @@ void startLuaConfigDelayedThreads(const luaConfigDelayedThreads& delayedThreads,
     }
     catch (const PDNSException& e) {
       g_log << Logger::Error << "Problem starting RPZIXFRTracker thread: " << e.reason << endl;
-      exit(1);
-    }
-  }
-
-  for (const auto& ztcConfig : delayedThreads.ztcConfigs) {
-    try {
-      std::thread t(RecZoneToCache::ZoneToCache, ztcConfig, generation);
-      t.detach();
-    }
-    catch (const std::exception& e) {
-      g_log << Logger::Error << "Problem starting zoneToCache thread: " << e.what() << endl;
-      exit(1);
-    }
-    catch (const PDNSException& e) {
-      g_log << Logger::Error << "Problem starting zoneToCache thread: " << e.reason << endl;
       exit(1);
     }
   }

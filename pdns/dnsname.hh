@@ -24,7 +24,6 @@
 #include <string>
 #include <vector>
 #include <set>
-#include <deque>
 #include <strings.h>
 #include <stdexcept>
 #include <sstream>
@@ -237,7 +236,7 @@ inline bool DNSName::canonCompare(const DNSName& rhs) const
 }
 
 
-struct CanonDNSNameCompare: public std::binary_function<DNSName, DNSName, bool>
+struct CanonDNSNameCompare
 {
   bool operator()(const DNSName&a, const DNSName& b) const
   {

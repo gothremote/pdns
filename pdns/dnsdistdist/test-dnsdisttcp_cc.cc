@@ -58,11 +58,6 @@ uint64_t uptimeOfProcess(const std::string& str)
   return 0;
 }
 
-uint64_t getLatencyCount(const std::string&)
-{
-  return 0;
-}
-
 void handleResponseSent(const IDState& ids, double udiff, const ComboAddress& client, const ComboAddress& backend, unsigned int size, const dnsheader& cleartextDH, dnsdist::Protocol protocol)
 {
 }
@@ -311,7 +306,7 @@ public:
     return std::make_unique<MockupTLSConnection>(socket);
   }
 
-  std::unique_ptr<TLSConnection> getClientConnection(const std::string& host, int socket, const struct timeval& timeout) override
+  std::unique_ptr<TLSConnection> getClientConnection(const std::string& host, bool hostIsAddr, int socket, const struct timeval& timeout) override
   {
     return std::make_unique<MockupTLSConnection>(socket, true);
   }
@@ -1270,7 +1265,7 @@ BOOST_AUTO_TEST_CASE(test_IncomingConnection_BackendNoOOOR)
     auto state = std::make_shared<IncomingTCPConnectionState>(ConnectionInfo(&localCS, getBackendAddress("84", 4242)), threadData, now);
     IncomingTCPConnectionState::handleIO(state, now);
     struct timeval later = now;
-    later.tv_sec += backend->tcpSendTimeout + 1;
+    later.tv_sec += backend->d_config.tcpSendTimeout + 1;
     auto expiredWriteConns = threadData.mplexer->getTimeouts(later, true);
     BOOST_CHECK_EQUAL(expiredWriteConns.size(), 1U);
     for (const auto& cbData : expiredWriteConns) {
@@ -1316,7 +1311,7 @@ BOOST_AUTO_TEST_CASE(test_IncomingConnection_BackendNoOOOR)
     auto state = std::make_shared<IncomingTCPConnectionState>(ConnectionInfo(&localCS, getBackendAddress("84", 4242)), threadData, now);
     IncomingTCPConnectionState::handleIO(state, now);
     struct timeval later = now;
-    later.tv_sec += backend->tcpRecvTimeout + 1;
+    later.tv_sec += backend->d_config.tcpRecvTimeout + 1;
     auto expiredConns = threadData.mplexer->getTimeouts(later, false);
     BOOST_CHECK_EQUAL(expiredConns.size(), 1U);
     for (const auto& cbData : expiredConns) {
@@ -1540,7 +1535,7 @@ BOOST_AUTO_TEST_CASE(test_IncomingConnection_BackendNoOOOR)
     auto state = std::make_shared<IncomingTCPConnectionState>(ConnectionInfo(&localCS, getBackendAddress("84", 4242)), threadData, now);
     IncomingTCPConnectionState::handleIO(state, now);
     BOOST_CHECK_EQUAL(s_writeBuffer.size(), 0U);
-    BOOST_CHECK_EQUAL(s_backendWriteBuffer.size(), query.size() * backend->d_retries);
+    BOOST_CHECK_EQUAL(s_backendWriteBuffer.size(), query.size() * backend->d_config.d_retries);
     BOOST_CHECK_EQUAL(backend->outstanding.load(), 0U);
 
     /* we need to clear them now, otherwise we end up with dangling pointers to the steps via the TLS context, etc */
@@ -1601,7 +1596,7 @@ BOOST_AUTO_TEST_CASE(test_IncomingConnection_BackendNoOOOR)
     IncomingTCPConnectionState::handleIO(state, now);
     BOOST_CHECK_EQUAL(s_writeBuffer.size(), query.size());
     BOOST_CHECK(s_writeBuffer == query);
-    BOOST_CHECK_EQUAL(s_backendWriteBuffer.size(), query.size() * backend->d_retries);
+    BOOST_CHECK_EQUAL(s_backendWriteBuffer.size(), query.size() * backend->d_config.d_retries);
     BOOST_CHECK_EQUAL(backend->outstanding.load(), 0U);
 
     /* we need to clear them now, otherwise we end up with dangling pointers to the steps via the TLS context, etc */
@@ -1730,9 +1725,9 @@ BOOST_AUTO_TEST_CASE(test_IncomingConnectionOOOR_BackendOOOR)
   auto backend = std::make_shared<DownstreamState>(getBackendAddress("42", 53));
   backend->d_tlsCtx = tlsCtx;
   /* enable out-of-order on the backend side as well */
-  backend->d_maxInFlightQueriesPerConn = 65536;
+  backend->d_config.d_maxInFlightQueriesPerConn = 65536;
   /* shorter than the client one */
-  backend->tcpRecvTimeout = 1;
+  backend->d_config.tcpRecvTimeout = 1;
 
   TCPClientThreadData threadData;
   threadData.mplexer = std::make_unique<MockupFDMultiplexer>();
@@ -2029,7 +2024,7 @@ BOOST_AUTO_TEST_CASE(test_IncomingConnectionOOOR_BackendOOOR)
     }
 
     struct timeval later = now;
-    later.tv_sec += backend->tcpRecvTimeout + 1;
+    later.tv_sec += backend->d_config.tcpRecvTimeout + 1;
     auto expiredConns = threadData.mplexer->getTimeouts(later, false);
     BOOST_CHECK_EQUAL(expiredConns.size(), 1U);
     for (const auto& cbData : expiredConns) {
@@ -2284,7 +2279,7 @@ BOOST_AUTO_TEST_CASE(test_IncomingConnectionOOOR_BackendOOOR)
     }
 
     struct timeval later = now;
-    later.tv_sec += backend->tcpRecvTimeout + 1;
+    later.tv_sec += backend->d_config.tcpRecvTimeout + 1;
     auto expiredConns = threadData.mplexer->getTimeouts(later, false);
     BOOST_CHECK_EQUAL(expiredConns.size(), 1U);
     for (const auto& cbData : expiredConns) {
@@ -2400,7 +2395,7 @@ BOOST_AUTO_TEST_CASE(test_IncomingConnectionOOOR_BackendOOOR)
     appendPayloadEditingID(expectedWriteBuffer, responses.at(4), 4);
 
     /* make sure that the backend's timeout is longer than the client's */
-    backend->tcpRecvTimeout = 30;
+    backend->d_config.tcpRecvTimeout = 30;
 
     bool timeout = false;
     int backendDescriptor = -1;
@@ -2852,6 +2847,180 @@ BOOST_AUTO_TEST_CASE(test_IncomingConnectionOOOR_BackendOOOR)
   }
 
   {
+    TEST_INIT("=> Interrupted AXFR");
+
+    PacketBuffer axfrQuery;
+    PacketBuffer secondQuery;
+    std::vector<PacketBuffer> axfrResponses(3);
+    PacketBuffer secondResponse;
+
+    auto proxyPayload = makeProxyHeader(true, getBackendAddress("84", 4242), local, {});
+    BOOST_REQUIRE_GT(proxyPayload.size(), s_proxyProtocolMinimumHeaderSize);
+
+    auto proxyEnabledBackend = std::make_shared<DownstreamState>(getBackendAddress("42", 53));
+    proxyEnabledBackend->d_tlsCtx = tlsCtx;
+    proxyEnabledBackend->d_config.useProxyProtocol = true;
+
+    GenericDNSPacketWriter<PacketBuffer> pwAXFRQuery(axfrQuery, DNSName("powerdns.com."), QType::AXFR, QClass::IN, 0);
+    pwAXFRQuery.getHeader()->rd = 0;
+    pwAXFRQuery.getHeader()->id = 42;
+    uint16_t axfrQuerySize = static_cast<uint16_t>(axfrQuery.size());
+    const uint8_t axfrQuerySizeBytes[] = { static_cast<uint8_t>(axfrQuerySize / 256), static_cast<uint8_t>(axfrQuerySize % 256) };
+    axfrQuery.insert(axfrQuery.begin(), axfrQuerySizeBytes, axfrQuerySizeBytes + 2);
+
+    const DNSName name("powerdns.com.");
+    {
+      /* first message */
+      auto& response = axfrResponses.at(0);
+      GenericDNSPacketWriter<PacketBuffer> pwR(response, name, QType::A, QClass::IN, 0);
+      pwR.getHeader()->qr = 1;
+      pwR.getHeader()->id = 42;
+
+      /* insert SOA */
+      pwR.startRecord(name, QType::SOA, 3600, QClass::IN, DNSResourceRecord::ANSWER);
+      pwR.xfrName(g_rootdnsname, true);
+      pwR.xfrName(g_rootdnsname, true);
+      pwR.xfr32BitInt(1 /* serial */);
+      pwR.xfr32BitInt(0);
+      pwR.xfr32BitInt(0);
+      pwR.xfr32BitInt(0);
+      pwR.xfr32BitInt(0);
+      pwR.commit();
+
+      /* A record */
+      pwR.startRecord(name, QType::A, 7200, QClass::IN, DNSResourceRecord::ANSWER);
+      pwR.xfr32BitInt(0x01020304);
+      pwR.commit();
+
+      uint16_t responseSize = static_cast<uint16_t>(response.size());
+      const uint8_t sizeBytes[] = { static_cast<uint8_t>(responseSize / 256), static_cast<uint8_t>(responseSize % 256) };
+      response.insert(response.begin(), sizeBytes, sizeBytes + 2);
+    }
+    {
+      /* second message */
+      auto& response = axfrResponses.at(1);
+      GenericDNSPacketWriter<PacketBuffer> pwR(response, name, QType::A, QClass::IN, 0);
+      pwR.getHeader()->qr = 1;
+      pwR.getHeader()->id = 42;
+
+      /* A record */
+      pwR.startRecord(name, QType::A, 7200, QClass::IN, DNSResourceRecord::ANSWER);
+      pwR.xfr32BitInt(0x01020304);
+      pwR.commit();
+
+      uint16_t responseSize = static_cast<uint16_t>(response.size());
+      const uint8_t sizeBytes[] = { static_cast<uint8_t>(responseSize / 256), static_cast<uint8_t>(responseSize % 256) };
+      response.insert(response.begin(), sizeBytes, sizeBytes + 2);
+    }
+    {
+      /* third message */
+      auto& response = axfrResponses.at(2);
+      GenericDNSPacketWriter<PacketBuffer> pwR(response, name, QType::A, QClass::IN, 0);
+      pwR.getHeader()->qr = 1;
+      pwR.getHeader()->id = 42;
+
+      /* A record */
+      pwR.startRecord(name, QType::A, 7200, QClass::IN, DNSResourceRecord::ANSWER);
+      pwR.xfr32BitInt(0x01020304);
+      pwR.commit();
+
+      /* final SOA */
+      pwR.startRecord(name, QType::SOA, 3600, QClass::IN, DNSResourceRecord::ANSWER);
+      pwR.xfrName(g_rootdnsname, true);
+      pwR.xfrName(g_rootdnsname, true);
+      pwR.xfr32BitInt(1 /* serial */);
+      pwR.xfr32BitInt(0);
+      pwR.xfr32BitInt(0);
+      pwR.xfr32BitInt(0);
+      pwR.xfr32BitInt(0);
+      pwR.commit();
+
+      uint16_t responseSize = static_cast<uint16_t>(response.size());
+      const uint8_t sizeBytes[] = { static_cast<uint8_t>(responseSize / 256), static_cast<uint8_t>(responseSize % 256) };
+      response.insert(response.begin(), sizeBytes, sizeBytes + 2);
+    }
+
+    PacketBuffer expectedWriteBuffer;
+    PacketBuffer expectedBackendWriteBuffer;
+
+    s_readBuffer = axfrQuery;
+
+    uint16_t backendCounter = 0;
+    expectedBackendWriteBuffer.insert(expectedBackendWriteBuffer.end(), proxyPayload.begin(), proxyPayload.end());
+    appendPayloadEditingID(expectedBackendWriteBuffer, axfrQuery, backendCounter++);
+
+    for (const auto& response : axfrResponses) {
+      appendPayloadEditingID(s_backendReadBuffer, response, 0);
+    }
+    expectedWriteBuffer.insert(expectedWriteBuffer.end(), axfrResponses.at(0).begin(), axfrResponses.at(0).end());
+    expectedWriteBuffer.insert(expectedWriteBuffer.end(), axfrResponses.at(1).begin(), axfrResponses.at(1).end());
+
+    bool timeout = false;
+    s_steps = {
+      { ExpectedStep::ExpectedRequest::handshakeClient, IOState::Done },
+      /* reading a query from the client (1) */
+      { ExpectedStep::ExpectedRequest::readFromClient, IOState::Done, 2 },
+      { ExpectedStep::ExpectedRequest::readFromClient, IOState::Done, axfrQuery.size() - 2 },
+      /* opening a connection to the backend */
+      { ExpectedStep::ExpectedRequest::connectToBackend, IOState::Done },
+      /* sending query (1) to the backend */
+      { ExpectedStep::ExpectedRequest::writeToBackend, IOState::Done, proxyPayload.size() + axfrQuery.size() },
+      /* no response ready yet, but setting the backend descriptor readable */
+      { ExpectedStep::ExpectedRequest::readFromBackend, IOState::NeedRead, 0, [&threadData](int desc) {
+        /* the backend descriptor becomes ready */
+        dynamic_cast<MockupFDMultiplexer*>(threadData.mplexer.get())->setReady(desc);
+      } },
+      /* no more query from the client for now */
+      { ExpectedStep::ExpectedRequest::readFromClient, IOState::NeedRead, 0 , [&threadData](int desc) {
+        /* the client descriptor becomes NOT ready */
+        dynamic_cast<MockupFDMultiplexer*>(threadData.mplexer.get())->setNotReady(-1);
+      } },
+      /* read the response (1) from the backend  */
+      { ExpectedStep::ExpectedRequest::readFromBackend, IOState::Done, 2 },
+      { ExpectedStep::ExpectedRequest::readFromBackend, IOState::Done, axfrResponses.at(0).size() - 2 },
+      /* sending response (1) to the client */
+      { ExpectedStep::ExpectedRequest::writeToClient, IOState::Done, axfrResponses.at(0).size() },
+      /* reading the response (2) from the backend */
+      { ExpectedStep::ExpectedRequest::readFromBackend, IOState::Done, 2 },
+      { ExpectedStep::ExpectedRequest::readFromBackend, IOState::Done, axfrResponses.at(1).size() - 2 },
+      /* sending response (2) to the client */
+      { ExpectedStep::ExpectedRequest::writeToClient, IOState::Done, axfrResponses.at(1).size() },
+      /* reading the response (3) from the backend, get EOF!! */
+      { ExpectedStep::ExpectedRequest::readFromBackend, IOState::Done, 0 },
+      /* closing the backend connection */
+      { ExpectedStep::ExpectedRequest::closeBackend, IOState::Done },
+      /* opening a connection to the backend */
+      { ExpectedStep::ExpectedRequest::connectToBackend, IOState::Done },
+      /* closing the client connection */
+      { ExpectedStep::ExpectedRequest::closeClient, IOState::Done },
+      /* closing the backend connection */
+      { ExpectedStep::ExpectedRequest::closeBackend, IOState::Done },
+    };
+
+    s_processQuery = [proxyEnabledBackend](DNSQuestion& dq, ClientState& cs, LocalHolders& holders, std::shared_ptr<DownstreamState>& selectedBackend) -> ProcessQueryResult {
+      selectedBackend = proxyEnabledBackend;
+      return ProcessQueryResult::PassToBackend;
+    };
+    s_processResponse = [](PacketBuffer& response, LocalStateHolder<vector<DNSDistResponseRuleAction> >& localRespRuleActions, DNSResponse& dr, bool muted) -> bool {
+      return true;
+    };
+
+    auto state = std::make_shared<IncomingTCPConnectionState>(ConnectionInfo(&localCS, getBackendAddress("84", 4242)), threadData, now);
+    IncomingTCPConnectionState::handleIO(state, now);
+    while (!timeout && (threadData.mplexer->getWatchedFDCount(false) != 0 || threadData.mplexer->getWatchedFDCount(true) != 0)) {
+      threadData.mplexer->run(&now);
+    }
+
+    BOOST_CHECK_EQUAL(s_writeBuffer.size(), expectedWriteBuffer.size());
+    BOOST_CHECK(s_writeBuffer == expectedWriteBuffer);
+    BOOST_CHECK_EQUAL(s_backendWriteBuffer.size(), expectedBackendWriteBuffer.size());
+    BOOST_CHECK(s_backendWriteBuffer == expectedBackendWriteBuffer);
+
+    /* we need to clear them now, otherwise we end up with dangling pointers to the steps via the TLS context, etc */
+    IncomingTCPConnectionState::clearAllDownstreamConnections();
+  }
+
+  {
     TEST_INIT("=> IXFR");
 
     PacketBuffer firstQuery;
@@ -3132,8 +3301,8 @@ BOOST_AUTO_TEST_CASE(test_IncomingConnectionOOOR_BackendOOOR)
     auto proxyEnabledBackend = std::make_shared<DownstreamState>(getBackendAddress("42", 53));
     proxyEnabledBackend->d_tlsCtx = tlsCtx;
     /* enable out-of-order on the backend side as well */
-    proxyEnabledBackend->d_maxInFlightQueriesPerConn = 65536;
-    proxyEnabledBackend->useProxyProtocol = true;
+    proxyEnabledBackend->d_config.d_maxInFlightQueriesPerConn = 65536;
+    proxyEnabledBackend->d_config.useProxyProtocol = true;
 
     expectedBackendWriteBuffer.insert(expectedBackendWriteBuffer.end(), proxyPayload.begin(), proxyPayload.end());
     appendPayloadEditingID(expectedBackendWriteBuffer, queries.at(0), 0);
@@ -3259,8 +3428,8 @@ BOOST_AUTO_TEST_CASE(test_IncomingConnectionOOOR_BackendOOOR)
     auto proxyEnabledBackend = std::make_shared<DownstreamState>(getBackendAddress("42", 53));
     proxyEnabledBackend->d_tlsCtx = tlsCtx;
     /* enable out-of-order on the backend side as well */
-    proxyEnabledBackend->d_maxInFlightQueriesPerConn = 65536;
-    proxyEnabledBackend->useProxyProtocol = true;
+    proxyEnabledBackend->d_config.d_maxInFlightQueriesPerConn = 65536;
+    proxyEnabledBackend->d_config.useProxyProtocol = true;
 
     expectedBackendWriteBuffer.insert(expectedBackendWriteBuffer.end(), proxyPayload.begin(), proxyPayload.end());
     appendPayloadEditingID(expectedBackendWriteBuffer, queries.at(0), 0);
@@ -3339,7 +3508,7 @@ BOOST_AUTO_TEST_CASE(test_IncomingConnectionOOOR_BackendOOOR)
     s_readBuffer.insert(s_readBuffer.end(), queries.at(2).begin(), queries.at(2).end());
 
     /* make sure that the backend's timeout is shorter than the client's */
-    backend->tcpConnectTimeout = 1;
+    backend->d_config.tcpConnectTimeout = 1;
     g_tcpRecvTimeout = 5;
 
     bool timeout = false;
@@ -3383,7 +3552,7 @@ BOOST_AUTO_TEST_CASE(test_IncomingConnectionOOOR_BackendOOOR)
     }
 
     struct timeval later = now;
-    later.tv_sec += backend->tcpConnectTimeout + 1;
+    later.tv_sec += backend->d_config.tcpConnectTimeout + 1;
     auto expiredConns = threadData.mplexer->getTimeouts(later, true);
     BOOST_CHECK_EQUAL(expiredConns.size(), 1U);
     for (const auto& cbData : expiredConns) {
@@ -3398,7 +3567,7 @@ BOOST_AUTO_TEST_CASE(test_IncomingConnectionOOOR_BackendOOOR)
     BOOST_CHECK_EQUAL(backend->outstanding.load(), 0U);
 
     /* restore */
-    backend->tcpSendTimeout = 30;
+    backend->d_config.tcpSendTimeout = 30;
     g_tcpRecvTimeout = 2;
 
     /* we need to clear them now, otherwise we end up with dangling pointers to the steps via the TLS context, etc */
@@ -3441,7 +3610,7 @@ BOOST_AUTO_TEST_CASE(test_IncomingConnectionOOOR_BackendOOOR)
     auto backend1 = std::make_shared<DownstreamState>(getBackendAddress("42", 53));
     backend1->d_tlsCtx = tlsCtx;
     /* only two queries in flight! */
-    backend1->d_maxInFlightQueriesPerConn = 2;
+    backend1->d_config.d_maxInFlightQueriesPerConn = 2;
 
     int backend1Desc = -1;
     int backend2Desc = -1;
@@ -3693,7 +3862,7 @@ BOOST_AUTO_TEST_CASE(test_IncomingConnectionOOOR_BackendNotOOOR)
   auto backend = std::make_shared<DownstreamState>(getBackendAddress("42", 53));
   backend->d_tlsCtx = tlsCtx;
   /* shorter than the client one */
-  backend->tcpRecvTimeout = 1;
+  backend->d_config.tcpRecvTimeout = 1;
 
   TCPClientThreadData threadData;
   threadData.mplexer = std::make_unique<MockupFDMultiplexer>();

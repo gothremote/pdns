@@ -27,6 +27,7 @@
 #include "dns_random.hh"
 #include "ipcipher.hh"
 #include "misc.hh"
+#include "zonemd.hh"
 #include <fstream>
 #include <utility>
 #include <termios.h>            //termios, TCSANOW, ECHO, ICANON
@@ -43,6 +44,7 @@ StatBag S;
 AuthPacketCache PC;
 AuthQueryCache QC;
 AuthZoneCache g_zoneCache;
+uint16_t g_maxNSEC3Iterations{0};
 
 namespace po = boost::program_options;
 po::variables_map g_vm;
@@ -1359,6 +1361,40 @@ static int xcryptIP(const std::string& cmd, const std::string& ip, const std::st
 }
 #endif /* HAVE_IPCIPHER */
 
+static int zonemdVerifyFile(const DNSName& zone, const string& fname) {
+  ZoneParserTNG zpt(fname, zone);
+  zpt.setMaxGenerateSteps(::arg().asNum("max-generate-steps"));
+
+  bool validationDone, validationOK;
+
+  try {
+    auto zoneMD = pdns::ZoneMD(zone);
+    zoneMD.readRecords(zpt);
+    zoneMD.verify(validationDone, validationOK);
+  }
+  catch (const PDNSException& ex) {
+    cerr << "zonemd-verify-file: " << ex.reason << endl;
+    return EXIT_FAILURE;
+  }
+  catch (const std::exception& ex) {
+    cerr << "zonemd-verify-file: " << ex.what() << endl;
+    return EXIT_FAILURE;
+  }
+
+  if (validationDone) {
+    if (validationOK) {
+      cout << "zonemd-verify-file: Verification of ZONEMD record succeeded" << endl;
+      return EXIT_SUCCESS;
+    } else {
+      cerr << "zonemd-verify-file: Verification of ZONEMD record(s) failed" << endl;
+    }
+  }
+  else {
+    cerr << "zonemd-verify-file: No suitable ZONEMD record found to verify against" << endl;
+  }
+  return EXIT_FAILURE;
+}
+
 static int loadZone(const DNSName& zone, const string& fname) {
   UeberBackend B;
   DomainInfo di;
@@ -1606,16 +1642,43 @@ static int addOrReplaceRecord(bool addOrReplace, const vector<string>& cmds) {
   return EXIT_SUCCESS;
 }
 
-// addSuperMaster add anew super primary
+// addSuperMaster add a new autoprimary
 static int addSuperMaster(const std::string &IP, const std::string &nameserver, const std::string &account)
 {
   UeberBackend B("default");
-
-  if ( B.superMasterAdd(IP, nameserver, account) ){ 
+  const AutoPrimary primary(IP, nameserver, account);
+  if ( B.superMasterAdd(primary) ){
     return EXIT_SUCCESS; 
   }
   cerr<<"could not find a backend with autosecondary support"<<endl;
   return EXIT_FAILURE;
+}
+
+static int removeAutoPrimary(const std::string &IP, const std::string &nameserver)
+{
+  UeberBackend B("default");
+  const AutoPrimary primary(IP, nameserver, "");
+  if ( B.autoPrimaryRemove(primary) ){
+    return EXIT_SUCCESS;
+  }
+  cerr<<"could not find a backend with autosecondary support"<<endl;
+  return EXIT_FAILURE;
+}
+
+static int listAutoPrimaries()
+{
+  UeberBackend B("default");
+  vector<AutoPrimary> primaries;
+  if ( !B.autoPrimariesList(primaries) ){
+    cerr<<"could not find a backend with autosecondary support"<<endl;
+    return EXIT_FAILURE;
+  }
+
+  for(const auto& primary: primaries) {
+    cout<<"IP="<<primary.ip<<", NS="<<primary.nameserver<<", account="<<primary.account<<endl;
+  }
+
+  return EXIT_SUCCESS;
 }
 
 // delete-rrset zone name type
@@ -2323,6 +2386,8 @@ try
     cout<<"             [content..]           Add one or more records to ZONE"<<endl;
     cout << "add-autoprimary IP NAMESERVER [account]" << endl;
     cout << "                                   Add a new autoprimary " << endl;
+    cout<<"remove-autoprimary IP NAMESERVER   Remove an autoprimary" << endl;
+    cout<<"list-autoprimaries                 List all autoprimaries" << endl;
     cout<<"add-zone-key ZONE {zsk|ksk} [BITS] [active|inactive] [published|unpublished]"<<endl;
     cout<<"             [rsasha1|rsasha1-nsec3-sha1|rsasha256|rsasha512|ecdsa256|ecdsa384";
 #if defined(HAVE_LIBSODIUM) || defined(HAVE_LIBDECAF) || defined(HAVE_LIBCRYPTO_ED25519)
@@ -2416,6 +2481,7 @@ try
     cout<<"unset-publish-cds ZONE             Disable sending CDS responses for ZONE"<<endl;
     cout<<"test-schema ZONE                   Test DB schema - will create ZONE"<<endl;
     cout<<"raw-lua-from-content TYPE CONTENT  Display record contents in a form suitable for dnsdist's `SpoofRawAction`"<<endl;
+    cout<<"zonemd-verify-file ZONE FILE       Validate ZONEMD for ZONE"<<endl;
     cout<<desc<<endl;
     return 0;
   }
@@ -2542,6 +2608,18 @@ try
       cerr<<"Error while hashing the supplied password: "<<e.what()<<endl;
       return 1;
     }
+  }
+
+  if(cmds[0] == "zonemd-verify-file") {
+    if(cmds.size() < 3) {
+      cerr<<"Syntax: pdnsutil zonemd-verify-file ZONE FILENAME"<<endl;
+      return 1;
+    }
+    if(cmds[1]==".")
+      cmds[1].clear();
+
+    auto ret = zonemdVerifyFile(DNSName(cmds[1]), cmds[2]);
+    return ret;
   }
 
   DNSSECKeeper dk;
@@ -2884,6 +2962,16 @@ try
     }
     exit(addSuperMaster(cmds.at(1), cmds.at(2), cmds.size() > 3 ? cmds.at(3) : ""));
   }
+  else if (cmds.at(0) == "remove-autoprimary") {
+    if(cmds.size() < 3) {
+      cerr << "Syntax: pdnsutil remove-autoprimary IP NAMESERVER" << endl;
+      return 0;
+    }
+    exit(removeAutoPrimary(cmds.at(1), cmds.at(2)));
+  }
+  else if (cmds.at(0) == "list-autoprimaries") {
+    exit(listAutoPrimaries());
+  }
   else if (cmds.at(0) == "replace-rrset") {
     if(cmds.size() < 5) {
       cerr<<R"(Syntax: pdnsutil replace-rrset ZONE name type [ttl] "content" ["content"...])"<<endl;
@@ -3214,6 +3302,10 @@ try
     DNSSECPrivateKey dpk;
     DNSKEYRecordContent drc;
     shared_ptr<DNSCryptoKeyEngine> key(DNSCryptoKeyEngine::makeFromPEMString(drc, raw));
+    if (!key) {
+      cerr << "Could not convert key from PEM to internal format" << endl;
+      return 1;
+    }
     dpk.setKey(key);
 
     dpk.d_algorithm = pdns_stou(cmds.at(3));

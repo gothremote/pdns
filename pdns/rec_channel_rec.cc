@@ -12,9 +12,6 @@
 #include "recursor_cache.hh"
 #include "syncres.hh"
 #include "negcache.hh"
-#include <boost/function.hpp>
-#include <boost/optional.hpp>
-#include <boost/tuple/tuple.hpp>
 #include <boost/format.hpp>
 #include <boost/algorithm/string.hpp>
 
@@ -40,6 +37,7 @@
 #include "namespaces.hh"
 #include "rec-taskqueue.hh"
 #include "rec-tcpout.hh"
+#include "rec-main.hh"
 
 std::pair<std::string, std::string> PrefixDashNumberCompare::prefixAndTrailingNum(const std::string& a)
 {
@@ -157,9 +155,9 @@ std::atomic<unsigned long>* getDynMetric(const std::string& str, const std::stri
   return ret.d_ptr;
 }
 
-static boost::optional<uint64_t> get(const string& name)
+static std::optional<uint64_t> get(const string& name)
 {
-  boost::optional<uint64_t> ret;
+  std::optional<uint64_t> ret;
 
   if (d_get32bitpointers.count(name))
     return *d_get32bitpointers.find(name)->second;
@@ -187,7 +185,7 @@ static boost::optional<uint64_t> get(const string& name)
   return ret;
 }
 
-boost::optional<uint64_t> getStatByName(const std::string& name)
+std::optional<uint64_t> getStatByName(const std::string& name)
 {
   return get(name);
 }
@@ -247,7 +245,7 @@ static string doGet(T begin, T end)
   string ret;
 
   for (T i = begin; i != end; ++i) {
-    boost::optional<uint64_t> num = get(*i);
+    std::optional<uint64_t> num = get(*i);
     if (num)
       ret += std::to_string(*num) + "\n";
     else
@@ -385,7 +383,7 @@ static uint64_t* pleaseDumpNonResolvingNS(int fd)
 }
 
 // Generic dump to file command
-static RecursorControlChannel::Answer doDumpToFile(int s, uint64_t* (*function)(int s), const string& name)
+static RecursorControlChannel::Answer doDumpToFile(int s, uint64_t* (*function)(int s), const string& name, bool threads = true)
 {
   auto fdw = getfd(s);
 
@@ -395,8 +393,15 @@ static RecursorControlChannel::Answer doDumpToFile(int s, uint64_t* (*function)(
 
   uint64_t total = 0;
   try {
-    int fd = fdw;
-    total = broadcastAccFunction<uint64_t>([function, fd] { return function(fd); });
+    if (threads) {
+      int fd = fdw;
+      total = broadcastAccFunction<uint64_t>([function, fd] { return function(fd); });
+    }
+    else {
+      auto ret = function(fdw);
+      total = *ret;
+      delete ret;
+    }
   }
   catch (std::exception& e) {
     return {1, name + ": error dumping data: " + string(e.what()) + "\n"};
@@ -963,17 +968,6 @@ static uint64_t getNegCacheSize()
   return g_negCache->size();
 }
 
-static uint64_t* pleaseGetFailedHostsSize()
-{
-  uint64_t tmp = (SyncRes::getThrottledServersSize());
-  return new uint64_t(tmp);
-}
-
-static uint64_t getFailedHostsSize()
-{
-  return broadcastAccFunction<uint64_t>(pleaseGetFailedHostsSize);
-}
-
 uint64_t* pleaseGetNsSpeedsSize()
 {
   return new uint64_t(SyncRes::getNSSpeedsSize());
@@ -982,11 +976,6 @@ uint64_t* pleaseGetNsSpeedsSize()
 static uint64_t getNsSpeedsSize()
 {
   return broadcastAccFunction<uint64_t>(pleaseGetNsSpeedsSize);
-}
-
-uint64_t* pleaseGetFailedServersSize()
-{
-  return new uint64_t(SyncRes::getFailedServersSize());
 }
 
 uint64_t* pleaseGetEDNSStatusesSize()
@@ -1126,7 +1115,9 @@ static StatsMap toCPUStatsMap(const string& name)
 {
   const string pbasename = getPrometheusName(name);
   StatsMap entries;
-  for (unsigned int n = 0; n < g_numThreads; ++n) {
+  // Only distr and worker threads, I think we should revisit this as we now not only have the handler thread but also
+  // taskThread(s).
+  for (unsigned int n = 0; n < RecThreadInfo::numDistributors() + RecThreadInfo::numWorkers(); ++n) {
     uint64_t tm = doGetThreadCPUMsec(n);
     std::string pname = pbasename + "{thread=\"" + std::to_string(n) + "\"}";
     entries.emplace(name + "-thread-" + std::to_string(n), StatsMapEntry{pname, std::to_string(tm)});
@@ -1158,8 +1149,6 @@ static StatsMap toRPZStatsMap(const string& name, LockGuarded<std::unordered_map
   entries.emplace(name, StatsMapEntry{pbasename, std::to_string(total)});
   return entries;
 }
-
-extern ResponseStats g_rs;
 
 static void registerAllStats1()
 {
@@ -1251,7 +1240,8 @@ static void registerAllStats1()
   addGetStat("throttle-entries", getThrottleSize);
 
   addGetStat("nsspeeds-entries", getNsSpeedsSize);
-  addGetStat("failed-host-entries", getFailedHostsSize);
+  addGetStat("failed-host-entries", SyncRes::getFailedServersSize);
+  addGetStat("non-resolving-nameserver-entries", SyncRes::getNonResolvingNSSize);
 
   addGetStat("concurrent-queries", getConcurrentQueries);
   addGetStat("security-status", &g_security_status);
@@ -1444,12 +1434,10 @@ void registerAllStats()
 void doExitGeneric(bool nicely)
 {
   g_log << Logger::Error << "Exiting on user request" << endl;
-  extern RecursorControlChannel s_rcc;
-  s_rcc.~RecursorControlChannel();
+  g_rcc.~RecursorControlChannel();
 
-  extern string s_pidfname;
-  if (!s_pidfname.empty())
-    unlink(s_pidfname.c_str()); // we can at least try..
+  if (!g_pidfname.empty())
+    unlink(g_pidfname.c_str()); // we can at least try..
   if (nicely) {
     RecursorControlChannel::stop = true;
   }
@@ -1506,8 +1494,8 @@ vector<pair<DNSName, uint16_t>>* pleaseGetBogusQueryRing()
   return ret;
 }
 
-typedef boost::function<vector<ComboAddress>*()> pleaseremotefunc_t;
-typedef boost::function<vector<pair<DNSName, uint16_t>>*()> pleasequeryfunc_t;
+typedef std::function<vector<ComboAddress>*()> pleaseremotefunc_t;
+typedef std::function<vector<pair<DNSName, uint16_t>>*()> pleasequeryfunc_t;
 
 vector<ComboAddress>* pleaseGetRemotes()
 {
@@ -1641,7 +1629,7 @@ static DNSName nopFilter(const DNSName& name)
   return name;
 }
 
-static string doGenericTopQueries(pleasequeryfunc_t func, boost::function<DNSName(const DNSName&)> filter = nopFilter)
+static string doGenericTopQueries(pleasequeryfunc_t func, std::function<DNSName(const DNSName&)> filter = nopFilter)
 {
   typedef pair<DNSName, uint16_t> query_t;
   typedef map<query_t, int> counts_t;
@@ -1678,7 +1666,7 @@ static string doGenericTopQueries(pleasequeryfunc_t func, boost::function<DNSNam
 
 static string* nopFunction()
 {
-  return new string("pong\n");
+  return new string("pong " + RecThreadInfo::self().getName() + '\n');
 }
 
 static string getDontThrottleNames()
@@ -1990,7 +1978,7 @@ RecursorControlChannel::Answer RecursorControlParser::getAnswer(int s, const str
     return doDumpToFile(s, pleaseDumpNSSpeeds, cmd);
   }
   if (cmd == "dump-failedservers") {
-    return doDumpToFile(s, pleaseDumpFailedServers, cmd);
+    return doDumpToFile(s, pleaseDumpFailedServers, cmd, false);
   }
   if (cmd == "dump-rpz") {
     return doDumpRPZ(s, begin, end);
@@ -1999,7 +1987,7 @@ RecursorControlChannel::Answer RecursorControlParser::getAnswer(int s, const str
     return doDumpToFile(s, pleaseDumpThrottleMap, cmd);
   }
   if (cmd == "dump-non-resolving") {
-    return doDumpToFile(s, pleaseDumpNonResolvingNS, cmd);
+    return doDumpToFile(s, pleaseDumpNonResolvingNS, cmd, false);
   }
   if (cmd == "wipe-cache" || cmd == "flushname") {
     return {0, doWipeCache(begin, end, 0xffff)};

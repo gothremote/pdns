@@ -36,6 +36,7 @@
 #include "sstuff.hh"
 
 #include "dnsdist.hh"
+#include "dnsdist-random.hh"
 
 #ifndef PACKAGEVERSION
 #define PACKAGEVERSION PACKAGE_VERSION
@@ -89,10 +90,10 @@ static std::string getFirstTXTAnswer(const std::string& answer)
 
 static std::string getSecPollStatus(const std::string& queriedName, int timeout=2)
 {
-  const DNSName& sentName = DNSName(queriedName);
+  const DNSName sentName(queriedName);
   std::vector<uint8_t> packet;
   DNSPacketWriter pw(packet, sentName, QType::TXT);
-  pw.getHeader()->id = getRandomDNSID();
+  pw.getHeader()->id = dnsdist::getRandomDNSID();
   pw.getHeader()->rd = 1;
 
   const auto& resolversForStub = getResolvers("/etc/resolv.conf");

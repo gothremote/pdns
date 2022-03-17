@@ -51,6 +51,14 @@ public:
 
   includeboilerplate(NAPTR)
   template<class Convertor> void xfrRecordContent(Convertor& conv);
+  const string& getFlags() const
+  {
+    return d_flags;
+  }
+  const DNSName& getReplacement() const
+  {
+    return d_replacement;
+  }
 private:
   uint16_t d_order, d_preference;
   string d_flags, d_services, d_regexp;
@@ -258,6 +266,7 @@ private:
   DNSName d_content;
 };
 
+#if !defined(RECURSOR)
 class ALIASRecordContent : public DNSRecordContent
 {
 public:
@@ -265,7 +274,7 @@ public:
 
   DNSName d_content;
 };
-
+#endif
 
 class DNAMERecordContent : public DNSRecordContent
 {
@@ -359,8 +368,8 @@ public:
   string d_key;
   bool operator<(const DNSKEYRecordContent& rhs) const
   {
-    return tie(d_flags, d_protocol, d_algorithm, d_key) < 
-      tie(rhs.d_flags, rhs.d_protocol, rhs.d_algorithm, rhs.d_key);
+    return std::tie(d_flags, d_protocol, d_algorithm, d_key) < 
+      std::tie(rhs.d_flags, rhs.d_protocol, rhs.d_algorithm, rhs.d_key);
   }
 };
 
@@ -386,13 +395,13 @@ public:
     if(typeid(*this) != typeid(rhs))
       return false;
     auto rrhs =dynamic_cast<const decltype(this)>(&rhs);
-    return tie(d_tag, d_algorithm, d_digesttype, d_digest) ==
-      tie(rrhs->d_tag, rrhs->d_algorithm, rrhs->d_digesttype, rrhs->d_digest);
+    return std::tie(d_tag, d_algorithm, d_digesttype, d_digest) ==
+      std::tie(rrhs->d_tag, rrhs->d_algorithm, rrhs->d_digesttype, rrhs->d_digest);
   }
   bool operator<(const DSRecordContent& rhs) const
   {
-    return tie(d_tag, d_algorithm, d_digesttype, d_digest) <
-      tie(rhs.d_tag, rhs.d_algorithm, rhs.d_digesttype, rhs.d_digest);
+    return std::tie(d_tag, d_algorithm, d_digesttype, d_digest) <
+      std::tie(rhs.d_tag, rhs.d_algorithm, rhs.d_digesttype, rhs.d_digest);
   }
 
   includeboilerplate(DS)
@@ -584,6 +593,18 @@ public:
   DNSName d_mname;
   DNSName d_rname;
   struct soatimes d_st;
+};
+
+class ZONEMDRecordContent : public DNSRecordContent
+{
+public:
+  includeboilerplate(ZONEMD)
+  //ZONEMDRecordContent(uint32_t serial, uint8_t scheme, uint8_t hashalgo, string digest);
+
+  uint32_t d_serial;
+  uint8_t d_scheme;
+  uint8_t d_hashalgo;
+  string d_digest;
 };
 
 class NSECBitmap

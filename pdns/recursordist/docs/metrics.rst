@@ -265,6 +265,8 @@ client-parse-errors
 ^^^^^^^^^^^^^^^^^^^
 counts number of client packets that could   not be parsed
 
+.. _stat-concurrent-queries:
+
 concurrent-queries
 ^^^^^^^^^^^^^^^^^^
 shows the number of MThreads currently   running
@@ -489,7 +491,7 @@ number of servers that sent an invalid EDNS   PING response
 
 failed-host-entries
 ^^^^^^^^^^^^^^^^^^^
-number of servers that failed to resolve
+number of addresses in the failed NS cache.
 
 .. _stat-fd-usage:
 
@@ -546,6 +548,10 @@ noerror-answers
 ^^^^^^^^^^^^^^^
 counts the number of times it answered NOERROR   since starting
 
+non-resolving-nameserver-entries
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+number of entries in the non-resolving NS name cache
+
 noping-outqueries
 ^^^^^^^^^^^^^^^^^
 number of queries sent out without ENDS PING
@@ -573,6 +579,8 @@ counts the number of timeouts on outgoing UDP   IPv4 queries since starting (sin
 outgoing6-timeouts
 ^^^^^^^^^^^^^^^^^^
 counts the number of timeouts on outgoing UDP   IPv6 queries since starting (since 4.0)
+
+.. _stat-over-capacity-drops:
 
 over-capacity-drops
 ^^^^^^^^^^^^^^^^^^^
@@ -711,9 +719,13 @@ taskqueue-size
 
 number of tasks currently in the taskqueues
 
+.. _stat-tcp-client-overflow:
+
 tcp-client-overflow
 ^^^^^^^^^^^^^^^^^^^
 number of times an IP address was denied TCP   access because it already had too many connections
+
+.. _stat-tcp-clients:
 
 tcp-clients
 ^^^^^^^^^^^

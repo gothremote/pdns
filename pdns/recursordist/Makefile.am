@@ -161,9 +161,11 @@ pdns_recursor_SOURCES = \
 	rec-carbon.cc \
 	rec-eventtrace.cc rec-eventtrace.hh \
 	rec-lua-conf.hh rec-lua-conf.cc \
+	rec-main.hh rec-main.cc \
 	rec-protozero.cc rec-protozero.hh \
 	rec-snmp.hh rec-snmp.cc \
 	rec-taskqueue.cc rec-taskqueue.hh \
+	rec-tcp.cc \
         rec-tcpout.cc rec-tcpout.hh \
         rec-zonetocache.cc rec-zonetocache.hh \
 	rec_channel.cc rec_channel.hh rec_metrics.hh \
@@ -180,6 +182,7 @@ pdns_recursor_SOURCES = \
 	rpzloader.cc rpzloader.hh \
 	secpoll-recursor.cc secpoll-recursor.hh \
 	secpoll.cc secpoll.hh \
+	sha.hh \
 	sholder.hh \
 	shuffle.cc shuffle.hh \
 	sillyrecords.cc \
@@ -204,6 +207,7 @@ pdns_recursor_SOURCES = \
 	ws-api.cc ws-api.hh \
 	ws-recursor.cc ws-recursor.hh \
 	xpf.cc xpf.hh \
+	zonemd.cc zonemd.hh \
 	zoneparser-tng.cc zoneparser-tng.hh
 
 if !HAVE_LUA_HPP
@@ -279,6 +283,7 @@ testrunner_SOURCES = \
 	query-local-address.hh query-local-address.cc \
 	rcpgenerator.cc \
 	rec-eventtrace.cc rec-eventtrace.hh \
+	rec-taskqueue.cc rec-taskqueue.hh \
 	rec-zonetocache.cc rec-zonetocache.hh \
 	recpacketcache.cc recpacketcache.hh \
 	recursor_cache.cc recursor_cache.hh \
@@ -317,6 +322,7 @@ testrunner_SOURCES = \
 	test-negcache_cc.cc \
 	test-packetcache_hh.cc \
 	test-rcpgenerator_cc.cc \
+	test-rec-taskqueue.cc \
 	test-rec-zonetocache.cc \
 	test-recpacketcache_cc.cc \
 	test-recursorcache_cc.cc \
@@ -344,6 +350,7 @@ testrunner_SOURCES = \
 	validate-recursor.cc validate-recursor.hh \
 	validate.cc validate.hh \
 	xpf.cc xpf.hh \
+	zonemd.cc zonemd.hh \
 	zoneparser-tng.cc zoneparser-tng.hh
 
 testrunner_LDFLAGS = \

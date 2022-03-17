@@ -44,53 +44,78 @@ Record creation functions
 .. function:: ifportup(portnum, addresses[, options])
 
   Simplistic test to see if an IP address listens on a certain port. This will
-  attempt a TCP connection on port ``portnum`` and consider it UP if the
-  connection establishes, no data will be sent or read on that connection. Note
+  attempt a TCP connection on port ``portnum`` and consider it available if the
+  connection establishes. No data will be sent or read on that connection. Note
   that both IPv4 and IPv6 addresses can be tested, but that it is an error to
   list IPv4 addresses on an AAAA record, or IPv6 addresses on an A record.
 
-  Will return a single IP address from the set of available IP addresses. If
-  no IP address is available, will return a random element of the set of
+  Will return a single address from the set of available addresses. If
+  no address is available, will return a random element of the set of
   addresses supplied for testing.
 
   :param int portnum: The port number to test connections to.
-  :param {str} addresses: The list of IP addresses to check connectivity for.
+  :param {str} addresses: The list of addresses to check connectivity for.
   :param options: Table of options for this specific check, see below.
 
   Various options can be set in the ``options`` parameter:
 
-  - ``selector``: used to pick the IP address from list of viable candidates. Choices include 'pickclosest', 'random', 'hashed', 'all' (default to 'random').
-  - ``backupSelector``: used to pick the IP address from list of all candidates if all addresses are down. Choices include 'pickclosest', 'random', 'hashed', 'all' (default to 'random').
-  - ``source``: Source IP address to check from
+  - ``selector``: used to pick the address(es) from the list of available addresses. Choices include 'pickclosest', 'random', 'hashed', 'all' (default 'random').
+  - ``backupSelector``: used to pick the address(es) from all addresses if all addresses are down. Choices include 'pickclosest', 'random', 'hashed', 'all' (default 'random').
+  - ``source``: Source address to check from
   - ``timeout``: Maximum time in seconds that you allow the check to take (default 2)
 
 
 .. function:: ifurlup(url, addresses[, options])
 
   More sophisticated test that attempts an actual http(s) connection to
-  ``url``. In addition, multiple groups of IP addresses can be supplied. The
-  first set with a working (available) IP address is used. URL is considered up if
-  HTTP response code is 200 and optionally if the content matches ``stringmatch``
-  option.
+  ``url``. In addition, a list of sets of IP addresses can be supplied. The
+  first set with at least one available address is selected. The ``selector`` then
+  selects from the subset of available addresses of the selected set.
+  An URL is considered available if the HTTP response code is 200 and optionally if
+  the content matches the ``stringmatch`` option.
 
   :param string url: The url to retrieve.
-  :param addresses: List of lists of IP addresses to check the URL on.
+  :param addresses: List of sets of addresses to check the URL on.
   :param options: Table of options for this specific check, see below.
 
   Various options can be set in the ``options`` parameter:
 
-  - ``selector``: used to pick the IP address from list of viable candidates. Choices include 'pickclosest', 'random', 'hashed', 'all' (default to 'random').
-  - ``backupSelector``: used to pick the IP address from list of all candidates if all addresses are down. Choices include 'pickclosest', 'random', 'hashed', 'all' (default to 'random').
-  - ``source``: Source IP address to check from
+  - ``selector``: used to pick the address(es) from the subset of available addresses of the selected set. Choices include 'pickclosest', 'random', 'hashed', 'all' (default 'random').
+  - ``backupSelector``: used to pick the address from all addresses if all addresses are down. Choices include 'pickclosest', 'random', 'hashed', 'all' (default 'random').
+  - ``source``: Source address to check from
   - ``timeout``: Maximum time in seconds that you allow the check to take (default 2)
   - ``stringmatch``: check ``url`` for this string, only declare 'up' if found
   - ``useragent``: Set the HTTP "User-Agent" header in the requests. By default it is set to "PowerDNS Authoritative Server"
 
-  An example of IP address sets:
+  An example of a list of address sets:
 
   .. code-block:: lua
 
-    ifurlup("example.com", { {"192.0.2.20", "203.0.113.4"}, {"203.0.113.2"} })
+    ifurlup("https://example.com/", { {"192.0.2.20", "203.0.113.4"}, {"203.0.113.2"} })
+
+.. function:: ifurlextup(groups-of-address-url-pairs[, options])
+
+  Very similar to ``ifurlup``, but the returned IPs are decoupled from their external health check URLs.
+  This is useful when health checking already happens elsewhere, and that state is exposed over HTTP(S).
+  Health checks are considered positive if the HTTP response code is 200 and optionally if the content matches the ``stringmatch`` option.
+
+  Options are identical to those for ``ifurlup``.
+
+  Example:
+
+  .. code-block:: lua
+
+    ifurlextup({{['192.168.0.1']='https://example.com/',['192.168.0.2']='https://example.com/404'}})
+
+  Example with two groups:
+
+  .. code-block:: lua
+
+    ifurlextup({{['192.168.0.1']='https://example.net/404',['192.168.0.2']='https://example.com/404'}, {['192.168.0.3']='https://example.net/'}})"
+
+  The health checker will look up the first two URLs (using normal DNS resolution to find them - whenever possible, use URLs with IPs in them).
+  The 404s will cause the first group of IPs to get marked as down, after which the URL in the second group is tested.
+  The third IP will get marked up assuming ``https://example.net/`` responds with HTTP response code 200.
 
 .. function:: pickrandom(addresses)
 
@@ -320,6 +345,8 @@ Reverse DNS functions
 
 .. function:: filterForward(address, masks[, fallback])
 
+  .. versionadded:: 4.5.0
+
   Used for limiting the output of :func:`createForward` and :func:`createForward6` to a set of netmasks.
 
   :param address: A string containing an address, usually taken directly from :func:`createForward: or :func:`createForward6`.
@@ -328,7 +355,7 @@ Reverse DNS functions
 
   Example::
 
-    *.static4.example.com IN LUA A "filterForward(createForward(), newNMG():addMasks{'192.0.2.0/24', '10.0.0.0/8'})"
+    *.static4.example.com IN LUA A "filterForward(createForward(), newNMG({'192.0.2.0/24', '10.0.0.0/8'}))"
 
 Helper functions
 ~~~~~~~~~~~~~~~~

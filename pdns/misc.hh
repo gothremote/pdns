@@ -26,14 +26,8 @@
 #include <regex.h>
 #include <limits.h>
 #include <type_traits>
-#include <boost/algorithm/string.hpp>
-#include <boost/multi_index_container.hpp>
-#include <boost/multi_index/ordered_index.hpp>
-#include <boost/tuple/tuple_comparison.hpp>
-#include <boost/multi_index/key_extractors.hpp>
-#include <boost/multi_index/sequenced_index.hpp>
 
-using namespace ::boost::multi_index;
+#include <boost/algorithm/string.hpp>
 
 #include "dns.hh"
 #include <atomic>
@@ -42,7 +36,6 @@ using namespace ::boost::multi_index;
 #include <sys/socket.h>
 #include <time.h>
 #include <syslog.h>
-#include <deque>
 #include <stdexcept>
 #include <string>
 #include <ctype.h>
@@ -321,16 +314,16 @@ inline uint64_t uSec(const struct timeval& tv)
 
 inline bool operator<(const struct timeval& lhs, const struct timeval& rhs)
 {
-  return tie(lhs.tv_sec, lhs.tv_usec) < tie(rhs.tv_sec, rhs.tv_usec);
+  return std::tie(lhs.tv_sec, lhs.tv_usec) < std::tie(rhs.tv_sec, rhs.tv_usec);
 }
 inline bool operator<=(const struct timeval& lhs, const struct timeval& rhs)
 {
-  return tie(lhs.tv_sec, lhs.tv_usec) <= tie(rhs.tv_sec, rhs.tv_usec);
+  return std::tie(lhs.tv_sec, lhs.tv_usec) <= std::tie(rhs.tv_sec, rhs.tv_usec);
 }
 
 inline bool operator<(const struct timespec& lhs, const struct timespec& rhs)
 {
-  return tie(lhs.tv_sec, lhs.tv_nsec) < tie(rhs.tv_sec, rhs.tv_nsec);
+  return std::tie(lhs.tv_sec, lhs.tv_nsec) < std::tie(rhs.tv_sec, rhs.tv_nsec);
 }
 
 
@@ -381,7 +374,7 @@ typedef unsigned long AtomicCounterInner;
 typedef std::atomic<AtomicCounterInner> AtomicCounter ;
 
 // FIXME400 this should probably go? 
-struct CIStringCompare: public std::binary_function<string, string, bool>
+struct CIStringCompare
 {
   bool operator()(const string& a, const string& b) const
   {
@@ -405,7 +398,7 @@ struct CIStringComparePOSIX
    }
 };
 
-struct CIStringPairCompare: public std::binary_function<pair<string, uint16_t>, pair<string,uint16_t>, bool>
+struct CIStringPairCompare
 {
   bool operator()(const pair<string, uint16_t>& a, const pair<string, uint16_t>& b) const
   {
@@ -577,6 +570,7 @@ uint64_t getCPUTimeSystem(const std::string&);
 uint64_t getCPUIOWait(const std::string&);
 uint64_t getCPUSteal(const std::string&);
 std::string getMACAddress(const ComboAddress& ca);
+int getMACAddress(const ComboAddress& ca, char* dest, size_t len);
 
 template<typename T>
 const T& defTer(const T& a, const T& b)

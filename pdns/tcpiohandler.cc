@@ -102,7 +102,7 @@ public:
   }
 
   /* client-side connection */
-  OpenSSLTLSConnection(const std::string& hostname, int socket, const struct timeval& timeout, std::shared_ptr<SSL_CTX>& tlsCtx): d_tlsCtx(tlsCtx), d_conn(std::unique_ptr<SSL, void(*)(SSL*)>(SSL_new(tlsCtx.get()), SSL_free)), d_hostname(hostname), d_timeout(timeout)
+  OpenSSLTLSConnection(const std::string& hostname, bool hostIsAddr, int socket, const struct timeval& timeout, std::shared_ptr<SSL_CTX>& tlsCtx): d_tlsCtx(tlsCtx), d_conn(std::unique_ptr<SSL, void(*)(SSL*)>(SSL_new(tlsCtx.get()), SSL_free)), d_hostname(hostname), d_timeout(timeout)
   {
     d_socket = socket;
 
@@ -126,21 +126,41 @@ public:
       throw std::runtime_error("Error assigning socket");
     }
 
-#if (OPENSSL_VERSION_NUMBER >= 0x1010000fL) && HAVE_SSL_SET_HOSTFLAGS // grrr libressl
-    SSL_set_hostflags(d_conn.get(), X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-    if (SSL_set1_host(d_conn.get(), d_hostname.c_str()) != 1) {
-      throw std::runtime_error("Error setting TLS hostname for certificate validation");
+    /* set outgoing Server Name Indication */
+    if (!d_hostname.empty() && SSL_set_tlsext_host_name(d_conn.get(), d_hostname.c_str()) != 1) {
+      throw std::runtime_error("Error setting TLS SNI to " + d_hostname);
     }
-#elif (OPENSSL_VERSION_NUMBER >= 0x10002000L)
-    X509_VERIFY_PARAM *param = SSL_get0_param(d_conn.get());
-    /* Enable automatic hostname checks */
-    X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-    if (X509_VERIFY_PARAM_set1_host(param, d_hostname.c_str(), d_hostname.size()) != 1) {
-      throw std::runtime_error("Error setting TLS hostname for certificate validation");
-    }
+
+    if (hostIsAddr) {
+#if (OPENSSL_VERSION_NUMBER >= 0x10002000L)
+      X509_VERIFY_PARAM *param = SSL_get0_param(d_conn.get());
+      /* Enable automatic IP checks */
+      X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+      if (X509_VERIFY_PARAM_set1_ip_asc(param, d_hostname.c_str()) != 1) {
+        throw std::runtime_error("Error setting TLS IP for certificate validation");
+      }
 #else
-    /* no hostname validation for you, see https://wiki.openssl.org/index.php/Hostname_validation */
+      /* no validation for you, see https://wiki.openssl.org/index.php/Hostname_validation */
 #endif
+    }
+    else {
+#if (OPENSSL_VERSION_NUMBER >= 0x1010000fL) && HAVE_SSL_SET_HOSTFLAGS // grrr libressl
+      SSL_set_hostflags(d_conn.get(), X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+      if (SSL_set1_host(d_conn.get(), d_hostname.c_str()) != 1) {
+        throw std::runtime_error("Error setting TLS hostname for certificate validation");
+      }
+#elif (OPENSSL_VERSION_NUMBER >= 0x10002000L)
+      X509_VERIFY_PARAM *param = SSL_get0_param(d_conn.get());
+      /* Enable automatic hostname checks */
+      X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+      if (X509_VERIFY_PARAM_set1_host(param, d_hostname.c_str(), d_hostname.size()) != 1) {
+        throw std::runtime_error("Error setting TLS hostname for certificate validation");
+      }
+#else
+      /* no hostname validation for you, see https://wiki.openssl.org/index.php/Hostname_validation */
+#endif
+    }
+
     SSL_set_ex_data(d_conn.get(), s_tlsConnIndex, this);
   }
 
@@ -729,9 +749,9 @@ public:
     return std::make_unique<OpenSSLTLSConnection>(socket, timeout, d_feContext);
   }
 
-  std::unique_ptr<TLSConnection> getClientConnection(const std::string& host, int socket, const struct timeval& timeout) override
+  std::unique_ptr<TLSConnection> getClientConnection(const std::string& host, bool hostIsAddr, int socket, const struct timeval& timeout) override
   {
-    return std::make_unique<OpenSSLTLSConnection>(host, socket, timeout, d_tlsCtx);
+    return std::make_unique<OpenSSLTLSConnection>(host, hostIsAddr, socket, timeout, d_tlsCtx);
   }
 
   void rotateTicketsKey(time_t now) override
@@ -1569,9 +1589,10 @@ public:
 
     if (params.d_validateCertificates) {
       if (params.d_caStore.empty()) {
-#if GNUTLS_VERSION_NUMBER >= 0x030700
-        std::cerr<<"Warning: GnuTLS >= 3.7.0 has a known memory leak when validating server certificates in some configurations (PKCS11 support enabled, and a default PKCS11 trust store), please consider using the OpenSSL provider for outgoing connections instead, or explicitely setting a CA store"<<std::endl;
-#endif /* GNUTLS_VERSION_NUMBER >= 0x030700 */
+#if GNUTLS_VERSION_NUMBER >= 0x030700 && GNUTLS_VERSION_NUMBER < 0x030703
+        /* see https://gitlab.com/gnutls/gnutls/-/issues/1277 */
+        std::cerr<<"Warning: GnuTLS 3.7.0 - 3.7.2 have a memory leak when validating server certificates in some configurations (PKCS11 support enabled, and a default PKCS11 trust store), please consider upgrading GnuTLS, using the OpenSSL provider for outgoing connections, or explicitly setting a CA store"<<std::endl;
+#endif /* GNUTLS_VERSION_NUMBER >= 0x030700 && GNUTLS_VERSION_NUMBER < 0x030703 */
         rc = gnutls_certificate_set_x509_system_trust(d_creds.get());
         if (rc < 0) {
           throw std::runtime_error("Error adding the system's default trusted CAs: " + std::string(gnutls_strerror(rc)));
@@ -1648,7 +1669,7 @@ public:
     return entry;
   }
 
-  std::unique_ptr<TLSConnection> getClientConnection(const std::string& host, int socket, const struct timeval& timeout) override
+  std::unique_ptr<TLSConnection> getClientConnection(const std::string& host, bool, int socket, const struct timeval& timeout) override
   {
     auto creds = getPerThreadCredentials(d_contextParameters->d_validateCertificates, d_contextParameters->d_caStore);
     auto connection = std::make_unique<GnuTLSConnection>(host, socket, timeout, creds, d_priorityCache, d_validateCerts);
@@ -1790,13 +1811,14 @@ std::shared_ptr<TLSCtx> getTLSContext(const TLSContextParameters& params)
     }
 #endif /* HAVE_LIBSSL */
   }
-#ifdef HAVE_GNUTLS
-  return std::make_shared<GnuTLSIOCtx>(params);
-#else /* HAVE_GNUTLS */
+
 #ifdef HAVE_LIBSSL
   return std::make_shared<OpenSSLTLSIOCtx>(params);
-#endif /* HAVE_LIBSSL */
+#else /* HAVE_LIBSSL */
+#ifdef HAVE_GNUTLS
+  return std::make_shared<GnuTLSIOCtx>(params);
 #endif /* HAVE_GNUTLS */
+#endif /* HAVE_LIBSSL */
 
 #endif /* HAVE_DNS_OVER_TLS */
   return nullptr;

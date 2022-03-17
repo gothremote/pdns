@@ -192,19 +192,6 @@ Disallow data modification through the REST API when set.
 
 Location of the server logfile (used by the REST API).
 
-.. _setting-auth-can-lower-ttl:
-
-``auth-can-lower-ttl``
-----------------------
--  Boolean
--  Default: no
-
-Authoritative zones can transmit a TTL value that is lower than that specified in the parent zone.
-This is called a 'delegation inconsistency'.
-To follow :rfc:`RFC 2181 section 5.2<2181#section-5.2>` and :rfc:`5.4 <2181#section-5.4>` to the letter, enable this feature.
-This will mean a slight deterioration of performance, and it will not solve any problems, but does make the recursor more standards compliant.
-Not recommended unless you have to tick an 'RFC 2181 compliant' box.
-
 .. _setting-auth-zones:
 
 ``auth-zones``
@@ -319,26 +306,25 @@ When running multiple recursors on the same server, read settings from :file:`re
 
 ``cpu-map``
 -----------
-.. versionadded:: 4.1.0
 
 - String
 - Default: unset
 
-Set CPU affinity for worker threads, asking the scheduler to run those threads on a single CPU, or a set of CPUs.
+Set CPU affinity for threads, asking the scheduler to run those threads on a single CPU, or a set of CPUs.
 This parameter accepts a space separated list of thread-id=cpu-id, or thread-id=cpu-id-1,cpu-id-2,...,cpu-id-N.
 For example, to make the worker thread 0 run on CPU id 0 and the worker thread 1 on CPUs 1 and 2::
 
   cpu-map=0=0 1=1,2
 
-The number of worker threads is determined by the :ref:`setting-threads` setting.
-If :ref:`setting-pdns-distributes-queries` is set, an additional thread is started, assigned the id 0,
-and is the only one listening on client sockets and accepting queries, distributing them to the other worker threads afterwards.
+The thread handling the control channel, the webserver and other internal stuff has been assigned id 0, the distributor
+threads if any are assigned id 1 and counting, and the worker threads follow behind.
+The number of distributor threads is determined by :ref:`setting-distributor-threads`, the number of worker threads is determined by the :ref:`setting-threads` setting.
 
-Starting with version 4.2.0, the thread handling the control channel, the webserver and other internal stuff has been assigned
-id 0 and more than one distributor thread can be started using the :ref:`setting-distributor-threads` setting, so the distributor
-threads if any are assigned id 1 and counting, and the other threads follow behind.
+This parameter is only available if the OS provides the ``pthread_setaffinity_np()`` function.
 
-This parameter is only available on OS that provides the `pthread_setaffinity_np()` function.
+Note that depending on the configuration the Recursor can start more threads.
+Typically these threads will sleep most of the time.
+These threads cannot be specified in this setting as their thread-ids are left unspecified.
 
 .. _setting-daemon:
 
@@ -892,8 +878,16 @@ If set, EDNS options in incoming queries are extracted and passed to the :func:`
 ``hint-file``
 -------------
 -  Path
+-  Default: empty
 
-If set, the root-hints are read from this file. If unset, default root hints are used.
+.. versionchanged:: 4.7.0
+
+  Introduced the value ``no`` to disable root-hints processing.
+
+If set, the root-hints are read from this file. If empty, the default built-in root hints are used.
+
+In some special cases, processing the root hints is not needed, for example when forwarding all queries to another recursor.
+For these special cases, it is possible to disable the processing of root hints by setting the value to ``no``.
 
 .. _setting-ignore-unknown-settings:
 
@@ -2270,7 +2264,7 @@ of /32 or /128.
 
 ``webserver-hash-plaintext-credentials``
 ----------------------------------------
-..versionadded:: 4.6.0
+.. versionadded:: 4.6.0
 
 -  Boolean
 -  Default: no
@@ -2360,6 +2354,7 @@ If a PID file should be written to `socket-dir`_
 
 .. note::
   This is an experimental implementation of `draft-bellis-dnsop-xpf <https://datatracker.ietf.org/doc/draft-bellis-dnsop-xpf/>`_.
+  This is a deprecated feature that will be removed in the near future.
 
 The server will trust XPF records found in queries sent from those netmasks (both IPv4 and IPv6),
 and will adjust queries' source and destination accordingly. This is especially useful when the recursor
@@ -2378,6 +2373,7 @@ should be done on the proxy.
 
 .. note::
   This is an experimental implementation of `draft-bellis-dnsop-xpf <https://datatracker.ietf.org/doc/draft-bellis-dnsop-xpf/>`_.
+  This is a deprecated feature that will be removed in the near future.
 
 This option sets the resource record code to use for XPF records, as long as an official code has not been assigned to it.
 0 means that XPF is disabled.
