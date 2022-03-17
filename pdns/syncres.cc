@@ -702,7 +702,7 @@ uint64_t SyncRes::doDumpFailedServers(int fd)
     count++;
     char tmp[26];
     ctime_r(&i.last, tmp);
-    fprintf(fp.get(), "%s\t%llu\t%s", i.key.toString().c_str(), i.value, tmp);
+    fprintf(fp.get(), "%s\t%" PRIu64 "\t%s", i.key.toString().c_str(), i.value, tmp);
   }
 
   return count;
@@ -729,7 +729,7 @@ uint64_t SyncRes::doDumpNonResolvingNS(int fd)
     count++;
     char tmp[26];
     ctime_r(&i.last, tmp);
-    fprintf(fp.get(), "%s\t%llu\t%s", i.key.toString().c_str(), i.value, tmp);
+    fprintf(fp.get(), "%s\t%" PRIu64 "\t%s", i.key.toString().c_str(), i.value, tmp);
   }
 
   return count;
@@ -748,10 +748,10 @@ uint64_t SyncRes::doDumpNonResolvingNS(int fd)
    Another cause of "No answer" may simply be a network condition.
    Nonsense answers are a clearer indication this host won't be able to do DNSSEC evah.
 
-   Previous implementations have suffered from turning off DNSSEC questions for an authoritative server based on timeouts. 
+   Previous implementations have suffered from turning off DNSSEC questions for an authoritative server based on timeouts.
    A clever idea is to only turn off DNSSEC if we know a domain isn't signed anyhow. The problem with that really
-   clever idea however is that at this point in PowerDNS, we may simply not know that yet. All the DNSSEC thinking happens 
-   elsewhere. It may not have happened yet. 
+   clever idea however is that at this point in PowerDNS, we may simply not know that yet. All the DNSSEC thinking happens
+   elsewhere. It may not have happened yet.
 
    For now this means we can't be clever, but will turn off DNSSEC if you reply with FormError or gibberish.
 */
@@ -762,19 +762,19 @@ LWResult::Result SyncRes::asyncresolveWrapper(const ComboAddress& ip, bool ednsM
      the goal is to get as many remotes as possible on the highest level of EDNS support
      The levels are:
 
-     0) UNKNOWN Unknown state 
+     0) UNKNOWN Unknown state
      1) EDNS: Honors EDNS0
      2) EDNSIGNORANT: Ignores EDNS0, gives replies without EDNS0
      3) NOEDNS: Generates FORMERR on EDNS queries
 
      Everybody starts out assumed to be '0'.
      If '0', send out EDNS0
-        If you FORMERR us, go to '3', 
+        If you FORMERR us, go to '3',
         If no EDNS in response, go to '2'
      If '1', send out EDNS0
         If FORMERR, downgrade to 3
      If '2', keep on including EDNS0, see what happens
-        Same behaviour as 0 
+        Same behaviour as 0
      If '3', send bare queries
   */
 
@@ -799,7 +799,7 @@ LWResult::Result SyncRes::asyncresolveWrapper(const ComboAddress& ip, bool ednsM
   LWResult::Result ret;
   for(int tries = 0; tries < 3; ++tries) {
     //    cerr<<"Remote '"<<ip.toString()<<"' currently in mode "<<mode<<endl;
-    
+
     if (*mode == EDNSStatus::NOEDNS) {
       g_stats.noEdnsOutQueries++;
       EDNSLevel = 0; // level != mode
@@ -848,7 +848,7 @@ LWResult::Result SyncRes::asyncresolveWrapper(const ComboAddress& ip, bool ednsM
     if (oldmode != *mode || !ednsstatus->modeSetAt) {
       t_sstorage.ednsstatus.setTS(ind, ednsstatus, d_now.tv_sec);
     }
-    //    cerr<<"Result: ret="<<ret<<", EDNS-level: "<<EDNSLevel<<", haveEDNS: "<<res->d_haveEDNS<<", new mode: "<<mode<<endl;  
+    //    cerr<<"Result: ret="<<ret<<", EDNS-level: "<<EDNSLevel<<", haveEDNS: "<<res->d_haveEDNS<<", new mode: "<<mode<<endl;
     return LWResult::Result::Success;
   }
   return ret;
@@ -1304,14 +1304,14 @@ vector<ComboAddress> SyncRes::getAddrs(const DNSName &qname, unsigned int depth,
   try {
     // First look for both A and AAAA in the cache
     res_t cset;
-    if (s_doIPv4 && g_recCache->get(d_now.tv_sec, qname, QType::A, false, &cset, d_cacheRemote, d_refresh, d_routingTag) > 0) {
+    if (s_doIPv4 && g_recCache->get(d_now.tv_sec, qname, QType::A, false, &cset, d_cacheRemote, false, d_routingTag) > 0) {
       for (const auto &i : cset) {
         if (auto rec = getRR<ARecordContent>(i)) {
           ret.push_back(rec->getCA(53));
         }
       }
     }
-    if (s_doIPv6 && g_recCache->get(d_now.tv_sec, qname, QType::AAAA, false, &cset, d_cacheRemote, d_refresh, d_routingTag) > 0) {
+    if (s_doIPv6 && g_recCache->get(d_now.tv_sec, qname, QType::AAAA, false, &cset, d_cacheRemote, false, d_routingTag) > 0) {
       for (const auto &i : cset) {
         if (auto rec = getRR<AAAARecordContent>(i)) {
           seenV6 = true;
@@ -1351,7 +1351,7 @@ vector<ComboAddress> SyncRes::getAddrs(const DNSName &qname, unsigned int depth,
         } else {
           // We have some IPv4 records, consult the cache, we might have encountered some IPv6 glue
           cset.clear();
-          if (g_recCache->get(d_now.tv_sec, qname, QType::AAAA, false, &cset, d_cacheRemote, d_refresh, d_routingTag) > 0) {
+          if (g_recCache->get(d_now.tv_sec, qname, QType::AAAA, false, &cset, d_cacheRemote, false, d_routingTag) > 0) {
             for (const auto &i : cset) {
               if (auto rec = getRR<AAAARecordContent>(i)) {
                 seenV6 = true;
@@ -1444,7 +1444,7 @@ void SyncRes::getBestNSFromCache(const DNSName &qname, const QType qtype, vector
     vector<DNSRecord> ns;
     *flawedNSSet = false;
 
-    if(g_recCache->get(d_now.tv_sec, subdomain, QType::NS, false, &ns, d_cacheRemote, d_refresh, d_routingTag) > 0) {
+    if(g_recCache->get(d_now.tv_sec, subdomain, QType::NS, false, &ns, d_cacheRemote, false, d_routingTag) > 0) {
       bestns.reserve(ns.size());
 
       for(auto k=ns.cbegin();k!=ns.cend(); ++k) {
@@ -1460,7 +1460,7 @@ void SyncRes::getBestNSFromCache(const DNSName &qname, const QType qtype, vector
           const DNSRecord& dr=*k;
 	  auto nrr = getRR<NSRecordContent>(dr);
           if(nrr && (!nrr->getNS().isPartOf(subdomain) || g_recCache->get(d_now.tv_sec, nrr->getNS(), nsqt,
-                                                                          false, doLog() ? &aset : 0, d_cacheRemote, d_refresh, d_routingTag) > 5)) {
+                                                                          false, doLog() ? &aset : 0, d_cacheRemote, false, d_routingTag) > 5)) {
             bestns.push_back(dr);
             LOG(prefix<<qname<<": NS (with ip, or non-glue) in cache for '"<<subdomain<<"' -> '"<<nrr->getNS()<<"'"<<endl);
             LOG(prefix<<qname<<": within bailiwick: "<< nrr->getNS().isPartOf(subdomain));
@@ -2143,7 +2143,7 @@ bool SyncRes::doCacheCheck(const DNSName &qname, const DNSName& authname, bool w
       DNSRecord dr;
       dr.d_type=QType::RRSIG;
       dr.d_name=sqname;
-      dr.d_ttl=ttl; 
+      dr.d_ttl=ttl;
       dr.d_content=signature;
       dr.d_place = DNSResourceRecord::ANSWER;
       dr.d_class=QClass::IN;
@@ -4245,7 +4245,7 @@ bool SyncRes::doResolveAtThisIP(const std::string& prefix, const DNSName& qname,
       spoofed = true;
     }
     else {
-      /* -1 means server unreachable */
+      /* LWResult::Result::PermanentError */
       s_unreachables++;
       d_unreachables++;
       // XXX questionable use of errno
@@ -4263,7 +4263,7 @@ bool SyncRes::doResolveAtThisIP(const std::string& prefix, const DNSName& qname,
         // mark server as down
         t_sstorage.throttle.throttle(d_now.tv_sec, std::make_tuple(remoteIP, g_rootdnsname, 0), s_serverdownthrottletime, 10000);
       }
-      else if (resolveret == LWResult::Result::Timeout) {
+      else if (resolveret == LWResult::Result::PermanentError) {
         // unreachable, 1 minute or 100 queries
         t_sstorage.throttle.throttle(d_now.tv_sec, std::make_tuple(remoteIP, qname, qtype.getCode()), 60, 100);
       }
@@ -4849,7 +4849,7 @@ int directResolve(const DNSName& qname, const QType qtype, const QClass qclass, 
     g_log<<Logger::Error<<"Failed to resolve "<<qname<<", got an exception"<<endl;
     ret.clear();
   }
-  
+
   return res;
 }
 
