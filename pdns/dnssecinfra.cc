@@ -294,13 +294,7 @@ void DNSCryptoKeyEngine::testMakers(unsigned int algo, maker_t* creator, maker_t
   DTime dt; dt.set();
   for(unsigned int n = 0; n < 100; ++n) {
     dckeCreate->create(bits);
-<<<<<<< HEAD
-    //cout << " PublicKey is : " << Base64Encode(dckeCreate->getPublicKeyString()) << "\n";
-  }
-  cerr<<"("<<dckeCreate->getBits()<<" bits) ";
-=======
   cout<<"("<<dckeCreate->getBits()<<" bits) ";
->>>>>>> cc835c1280c7e7fc61e1ae80f5ee1447f7d26b9f
   unsigned int udiffCreate = dt.udiff() / 100;
 
   { // FIXME: this block copy/pasted from makeFromISCString
@@ -356,14 +350,6 @@ void DNSCryptoKeyEngine::testMakers(unsigned int algo, maker_t* creator, maker_t
   string signature;
   
   dt.set();
-<<<<<<< HEAD
-  for(unsigned int n = 0; n < 100; ++n) {
-    signature = dckeSign->sign(message);
-    bool verified = dckeVerify->verify(message, signature);
-    if(!verified) {
-      throw runtime_error("Verification of creator "+dckeCreate->getName()+" with signer "+dckeSign->getName()+" and verifier "+dckeVerify->getName()+" failed");
-    }
-=======
   bool verified;
   for(unsigned int n = 0; n < 100; ++n)
     verified = dckeVerify->verify(message, signature);
@@ -371,7 +357,6 @@ void DNSCryptoKeyEngine::testMakers(unsigned int algo, maker_t* creator, maker_t
   if(verified) {
     udiffVerify = dt.udiff() / 100;
     cout<<"Signature & verify ok, create "<<udiffCreate<<"usec, signature "<<udiffSign<<"usec, verify "<<udiffVerify<<"usec"<<endl;
->>>>>>> cc835c1280c7e7fc61e1ae80f5ee1447f7d26b9f
   }
 
   string falseMessage = "Nothing to see";
