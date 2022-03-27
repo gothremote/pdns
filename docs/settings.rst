@@ -358,6 +358,8 @@ to enable DNSSEC. Must be one of:
 * ed25519
 * ed448
 * falcon (falcon 512)
+* dilithium2 (Dilithium 2)
+* rainbowIclassic (Rainbow I Classic)
 
 .. note::
   Actual supported algorithms depend on the crypto-libraries
@@ -491,6 +493,8 @@ to enable DNSSEC. Must be one of:
 * ed25519
 * ed448
 * falcon (falcon 512)
+* dilithium2 (Dilithium 2)
+* rainbowIclassic (Rainbow I Classic)
 
 .. note::
   Actual supported algorithms depend on the crypto-libraries

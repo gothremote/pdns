@@ -104,6 +104,12 @@ void showBuildConfiguration()
 #ifdef HAVE_LIBCRYPTO_FALCON
     "libcrypto-falcon " <<
 #endif
+#ifdef HAVE_LIBCRYPTO_DILITHIUM
+    "libcrypto_dilithium2 " <<
+#endif
+#ifdef HAVE_LIBCRYPTO_RAINBOW
+    "libcrypto_rainbowIclassic " <<
+#endif
 #ifdef HAVE_LIBCRYPTO_EDDSA
     "libcrypto-eddsa " <<
 #endif

@@ -2401,6 +2401,12 @@ try
 #if defined(HAVE_LIBCRYPTO_FALCON)
     cout<<"|falcon";
 #endif
+#if defined(HAVE_LIBCRYPTO_DILITHIUM)
+    cout<<"|dilithium2";
+#endif
+#if defined(HAVE_LIBCRYPTO_RAINBOW)
+    cout<<"|rainbowIclassic";
+#endif
     cout<<"]"<<endl;
     cout<<"                                   Add a ZSK or KSK to zone and specify algo&bits"<<endl;
     cout<<"backend-cmd BACKEND CMD [CMD..]    Perform one or more backend commands"<<endl;
@@ -2845,6 +2851,12 @@ try
 #endif
 #if defined(HAVE_LIBCRYPTO_FALCON)
       cerr << "|falcon";
+#endif
+#if defined(HAVE_LIBCRYPTO_DILITHIUM)
+      cerr<< "|dilithium2";
+#endif
+#if defined(HAVE_LIBCRYPTO_RAINBOW)
+      cerr<< "|rainbowIclassic";
 #endif
       cerr << "]"<<endl;
       cerr << endl;
@@ -3439,6 +3451,12 @@ try
 #if defined(HAVE_LIBCRYPTO_FALCON)
       cerr << "|falcon";
 #endif
+#if defined(HAVE_LIBCRYPTO_DILITHIUM)
+      cerr << "|dilithium2";
+#endif
+#if defined(HAVE_LIBCRYPTO_RAINBOW)
+      cerr << "|rainbowIclassic";
+#endif
       cerr << "] [bits]"<<endl;
       return 0;
     }
@@ -3480,6 +3498,10 @@ try
           bits = 456;
         else if(algorithm == DNSSECKeeper::FALCON)
           bits = 10248;
+        else if(algorithm == DNSSECKeeper::DILITHIUM)
+          bits = 20224;
+        else if(algorithm == DNSSECKeeper::RAINBOW)
+          bits = 829184;
         else {
           throw runtime_error("Can not guess key size for algorithm "+std::to_string(algorithm));
         }
