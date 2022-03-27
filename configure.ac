@@ -406,6 +406,14 @@ AS_IF([test "x$libcrypto_falcon" = "xyes"],
   [AC_MSG_NOTICE([falcon: yes])],
   [AC_MSG_NOTICE([falcon: no])]
 )
+AS_IF([test "x$libcrypto_dilithium2" = "xyes"],
+  [AC_MSG_NOTICE([Dilithium: yes])],
+  [AC_MSG_NOTICE([Dilithium: no])]
+)
+AS_IF([test "x$libcrypto_rainbowIclassic" = "xyes"],
+  [AC_MSG_NOTICE([Rainbow: yes])],
+  [AC_MSG_NOTICE([Rainbow: no])]
+)
 AS_IF([test "x$needsqlite3" != "x"],
   [AC_MSG_NOTICE([SQLite3: yes])],
   [AC_MSG_NOTICE([SQLite3: no])]

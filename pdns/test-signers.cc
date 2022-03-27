@@ -343,12 +343,28 @@ BOOST_AUTO_TEST_CASE(test_ed448_signer) {
 }
 #endif /* defined(HAVE_LIBDECAF) || defined(HAVE_LIBCRYPTO_ED448) */
 
+
+// TODO: Implement much better tests with loaded keys for all PQC Algorithms
 #if defined(HAVE_LIBCRYPTO_FALCON)
 BOOST_AUTO_TEST_CASE(test_falcon_signer) {
     //TODO implement proper testing ith default value precomputed
     BOOST_CHECK_EQUAL(true, DNSCryptoKeyEngine::testOne(17));
 }
-#endif /* defined(HAVE_LIBDECAF) || defined(HAVE_LIBCRYPTO_ED448) */
+#endif /* defined(HAVE_LIBCRYPTO_FALCON) */
+
+#if defined(HAVE_LIBCRYPTO_DILITHIUM)
+BOOST_AUTO_TEST_CASE(test_dilithium_signer) {
+    //TODO implement proper testing ith default value precomputed
+    BOOST_CHECK_EQUAL(true, DNSCryptoKeyEngine::testOne(18));
+}
+#endif /* defined(HAVE_LIBCRYPTO_DILITHIUM) */
+
+#if defined(HAVE_LIBCRYPTO_RAINBOW)
+BOOST_AUTO_TEST_CASE(test_rainbow_signer) {
+    //TODO implement proper testing ith default value precomputed
+    BOOST_CHECK_EQUAL(true, DNSCryptoKeyEngine::testOne(19));
+}
+#endif /* defined(HAVE_LIBCRYPTO_RAINBOW) */
 
 BOOST_AUTO_TEST_CASE(test_hash_qname_with_salt) {
   {

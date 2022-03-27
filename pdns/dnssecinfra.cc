@@ -88,6 +88,7 @@ std::unique_ptr<DNSCryptoKeyEngine> DNSCryptoKeyEngine::makeFromISCString(DNSKEY
     { "exponent2", KeyTypes::base64 },
     { "coefficient", KeyTypes::base64 },
     { "privatekey", KeyTypes::base64 },
+    { "publickey", KeyTypes::base64 },
     { "engine", KeyTypes::str },
     { "slot", KeyTypes::str },
     { "pin", KeyTypes::str },
@@ -296,11 +297,15 @@ void DNSCryptoKeyEngine::testMakers(unsigned int algo, maker_t* creator, maker_t
     bits = 456;
   else if(algo == DNSSECKeeper::FALCON)
     bits = 10248;
+  else if(algo == DNSSECKeeper::DILITHIUM)
+    bits = 20224;
+  else if(algo == DNSSECKeeper::RAINBOW)
+    bits = 829184;
   else
     throw runtime_error("Can't guess key size for algorithm "+std::to_string(algo));
 
   DTime dt; dt.set();
-  for(unsigned int n = 0; n < 100; ++n) {
+  for(unsigned int n = 0; n < 100; ++n) 
     dckeCreate->create(bits);
   cout<<"("<<dckeCreate->getBits()<<" bits) ";
   unsigned int udiffCreate = dt.udiff() / 100;
@@ -347,38 +352,43 @@ void DNSCryptoKeyEngine::testMakers(unsigned int algo, maker_t* creator, maker_t
 
   string message("Hi! How is life?");
 
+  //Create new keys since no public key loaded in dckeSign from ISCMap
+  std::istringstream str(dckeSign->convertToISC());
+  
+  dckeVerify->fromPublicKeyString(dckeSign->getPublicKeyString());
+  if (dckeVerify->getPublicKeyString().compare(dckeSign->getPublicKeyString())) {
+    throw runtime_error("Comparison of public key loaded into verifier produced by signer failed");
+  }
+
   string signature;
   dt.set();
   for(unsigned int n = 0; n < 100; ++n)
     signature = dckeSign->sign(message);
-  unsigned int udiffSign= dt.udiff()/100, udiffVerify;
+  unsigned int udiffSign= dt.udiff()/100;
 
   dckeVerify->fromPublicKeyString(dckeSign->getPublicKeyString());
   if (dckeVerify->getPublicKeyString().compare(dckeSign->getPublicKeyString())) {
     throw runtime_error("Comparison of public key loaded into verifier produced by signer failed");
   }
   
-  string signature;
-  
   dt.set();
-  bool verified;
-  for(unsigned int n = 0; n < 100; ++n)
-    verified = dckeVerify->verify(message, signature);
-
-  if(verified) {
-    udiffVerify = dt.udiff() / 100;
-    cout<<"Signature & verify ok, create "<<udiffCreate<<"usec, signature "<<udiffSign<<"usec, verify "<<udiffVerify<<"usec"<<endl;
+  for(unsigned int n = 0; n < 100; ++n) {
+    signature = dckeSign->sign(message);
+    bool verified = dckeVerify->verify(message, signature);
+    if(!verified) {
+      throw runtime_error("Verification of creator "+dckeCreate->getName()+" with signer "+dckeSign->getName()+" and verifier "+dckeVerify->getName()+" failed");
+    }
   }
+
+  unsigned int udiffSignAndVerify= dt.udiff()/100;
+  cerr<<"Signature & verify ok, create "<<udiffCreate<<"usec, signature & verification "<<udiffSignAndVerify<<"usec."<<endl;
 
   string falseMessage = "Nothing to see";
   signature = dckeSign->sign(falseMessage);
   bool verified = dckeVerify->verify(message, signature);
     if(verified) {
       throw runtime_error("Wrong message was verified, check the verify function");
-  }
-
-  unsigned int udiffSignAndVerify= dt.udiff()/100;
-  cerr<<"Signature & verify ok, create "<<udiffCreate<<"usec, signature & verification "<<udiffSignAndVerify<<"usec."<<endl;
+  }  
 }
 
 std::unique_ptr<DNSCryptoKeyEngine> DNSCryptoKeyEngine::makeFromPublicKeyString(unsigned int algorithm, const std::string& content)

@@ -46,6 +46,8 @@ algorithms are supported:
 -  ed25519
 -  ed448
 -  falcon
+-  dilithium2
+-  rainbowIclassic
 
 activate-zone-key *ZONE* *KEY-ID*
     Activate a key with id *KEY-ID* within a zone called *ZONE*.
