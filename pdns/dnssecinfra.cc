@@ -87,6 +87,7 @@ std::unique_ptr<DNSCryptoKeyEngine> DNSCryptoKeyEngine::makeFromISCString(DNSKEY
     { "exponent1", KeyTypes::base64 },
     { "exponent2", KeyTypes::base64 },
     { "coefficient", KeyTypes::base64 },
+    { "publickey", KeyTypes::base64 },  //Added for PQC compatibility 
     { "privatekey", KeyTypes::base64 },
     { "engine", KeyTypes::str },
     { "slot", KeyTypes::str },
